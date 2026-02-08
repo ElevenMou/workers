@@ -1,0 +1,14 @@
+redis==5.0.1
+rq==1.15.1
+python-dotenv==1.0.0
+supabase==2.3.0
+httpx==0.24.1
+yt-dlp==2023.12.30
+ffmpeg-python==0.2.0
+Pillow==12.1.0
+numpy==1.26.3
+torch
+transformers==4.45.0
+anthropic==0.39.0
+youtube-transcript-api==0.6.2
+openai-whisper @ git+https://github.com/openai/whisper.git
