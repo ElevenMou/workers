@@ -19,25 +19,16 @@ class VideoDownloader:
         output_path = os.path.join(self.temp_dir, f"{video_id}.mp4")
 
         ydl_opts = {
-            "format": (
-                "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]"
-                "/best[ext=mp4][height<=720]/best"
-            ),
+            "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best",
             "outtmpl": output_path,
             "quiet": False,
             "no_warnings": False,
             "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
             # Try multiple YouTube client profiles to avoid signature/403 issues
-            "extractor_args": {
-                "youtube": {"player_client": ["android", "ios", "web"]}
-            },
-            # Desktop UA to reduce throttling/403
+            "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
+            # Set a desktop UA to reduce throttling/403
             "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                )
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             },
             "retries": 3,
             "fragment_retries": 3,

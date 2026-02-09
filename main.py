@@ -22,6 +22,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("clipry.worker")
 
+# Prefixes used for all worker names spawned by this supervisor
+_WORKER_PREFIXES = ("video-worker-", "clip-worker-")
+
 
 # ---------------------------------------------------------------------------
 # Windows compatibility – SimpleWorker without SIGALRM
@@ -45,6 +48,39 @@ class _WindowsWorker(SimpleWorker):
 
 def _worker_cls():
     return _WindowsWorker if os.name == "nt" else Worker
+
+
+# ---------------------------------------------------------------------------
+# Stale-worker cleanup
+# ---------------------------------------------------------------------------
+def _cleanup_stale_workers(conn):
+    """Remove Clipry worker registrations left in Redis from a previous run.
+
+    RQ stores worker metadata in Redis.  If the supervisor was killed without
+    a clean shutdown the old registrations persist and new workers with the
+    same names are rejected with ``ValueError``.  This function removes any
+    registrations whose names match our known prefixes.
+    """
+    try:
+        existing = Worker.all(connection=conn)
+    except Exception as exc:
+        logger.warning("Could not list existing workers: %s", exc)
+        return
+
+    for w in existing:
+        if not any(w.name.startswith(p) for p in _WORKER_PREFIXES):
+            continue
+
+        logger.info("Deregistering stale worker: %s (pid=%s)", w.name, w.pid)
+        try:
+            pipe = conn.pipeline()
+            pipe.delete(w.key)
+            pipe.srem("rq:workers", w.key)
+            for q in w.queues:
+                pipe.srem(f"rq:workers:{q.name}", w.key)
+            pipe.execute()
+        except Exception as exc:
+            logger.warning("Failed to deregister %s: %s", w.name, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +111,11 @@ if __name__ == "__main__":
     # Import config here (not at module level) to avoid heavy transitive
     # imports in every subprocess before they actually need them.
     from config import NUM_VIDEO_WORKERS, NUM_CLIP_WORKERS
+    from utils.redis_client import get_redis_connection
+
+    # -- Clean up stale workers from a previous run -----------------------
+    _startup_conn = get_redis_connection()
+    _cleanup_stale_workers(_startup_conn)
 
     processes: list[multiprocessing.Process] = []
 
@@ -114,9 +155,14 @@ if __name__ == "__main__":
             p.join()
     except KeyboardInterrupt:
         logger.info("Shutting down workers …")
+
+        # Terminate subprocesses
         for p in processes:
             p.terminate()
         for p in processes:
             p.join(timeout=10)
+
+        # Deregister from Redis so the next startup is clean
+        _cleanup_stale_workers(_startup_conn)
         logger.info("All workers stopped.")
         sys.exit(0)
