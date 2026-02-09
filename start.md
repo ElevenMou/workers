@@ -7,17 +7,17 @@ Follow these steps to bring the worker stack up locally.
 **important: python version 3.11.x**
 
 ```bash
-python -m venv venv
+py -3.11 -m venv .venv
 # macOS/Linux
 source venv/bin/activate
 # Windows
-venv\Scripts\activate
+.venv\Scripts\activate
 ```
 
 ### 2) Install dependencies
 
 ```bash
-cd workers
+python.exe -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
