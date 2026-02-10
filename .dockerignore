@@ -1,0 +1,24 @@
+# Version control
+.git/
+.gitignore
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment / secrets
+.env
+
+# Tests
+test_*.py
+
+# IDE / editor
+.cursor/
+.vscode/
+*.swp
+
+# Docs / plans
+*.md
+*.plan.md
