@@ -40,46 +40,15 @@ class AnalyzeVideoResponse(BaseModel):
     status: str
 
 
-# -- Clip generation nested style models ------------------------------------
-class VideoLayout(BaseModel):
-    widthPct: int = Field(default=100, ge=10, le=100)
-    positionY: str = "middle"
-
-
-class TitleStyle(BaseModel):
-    show: bool = True
-    fontSize: int = Field(default=48, ge=12, le=120)
-    fontColor: str = "white"
-    fontFamily: str = ""  # empty = system default; "Arial", "Impact", etc.
-    align: str = "center"  # "left" | "center"
-    strokeWidth: int = Field(default=0, ge=0, le=20)  # 0 = no stroke
-    strokeColor: str = "black"  # ffmpeg colour, e.g. "black", "#FF0000"
-    barEnabled: bool = True
-    barColor: str = "black@0.5"  # ffmpeg color@alpha
-    paddingX: int = Field(default=16, ge=0, le=500)
-    positionY: str = "above_video"
-
-
-class CaptionStyle(BaseModel):
-    show: bool = False
-    style: str = "animated"  # "animated" (word-by-word highlight) | "static"
-    fontSize: int = Field(default=42, ge=12, le=100)
-    fontColor: str = "white"
-    fontFamily: str = ""
-    highlightColor: str = "#FFD700"  # gold -- only used in animated mode
-    position: str = "bottom"  # "bottom" (inside video) | "middle" | "below_video" | "above_video"
-    maxWordsPerLine: int = Field(default=5, ge=1, le=15)
-
-
 class GenerateClipRequest(BaseModel):
     userId: str = Field(..., description="Supabase user id")
     clipId: str = Field(..., description="Clip id to generate")
-    video: VideoLayout = Field(default_factory=VideoLayout)
-    title: TitleStyle = Field(default_factory=TitleStyle)
-    captions: CaptionStyle = Field(default_factory=CaptionStyle)
-    backgroundBlurStrength: int = Field(default=20, ge=1, le=60)
-    outputQuality: str = Field(
-        default="medium", description="'low', 'medium', or 'high'"
+    layoutId: Optional[str] = Field(
+        default=None,
+        description="UUID of a saved layout from the layouts table. "
+        "The worker loads all generation settings (background, video, "
+        "title, captions, quality) from this layout. "
+        "When omitted, built-in defaults are used.",
     )
 
 
@@ -224,16 +193,11 @@ def generate_clip(payload: GenerateClipRequest) -> GenerateClipResponse:
     )
     _raise_on_error(job_resp, "Failed to upsert job")
 
-    # Serialize nested models into job_data as plain dicts for Redis/RQ
     job_data = {
         "jobId": job_id,
         "clipId": payload.clipId,
         "userId": payload.userId,
-        "video": payload.video.model_dump(),
-        "title": payload.title.model_dump(),
-        "captions": payload.captions.model_dump(),
-        "backgroundBlurStrength": payload.backgroundBlurStrength,
-        "outputQuality": payload.outputQuality,
+        "layoutId": payload.layoutId,
     }
 
     clip_queue.enqueue(GENERATE_TASK_PATH, job_data, job_id=job_id)

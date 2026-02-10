@@ -50,18 +50,75 @@ def generate_clip_task(job_data: dict):
     clip_id = job_data["clipId"]
     user_id = job_data["userId"]
 
-    # Unpack nested style dicts (with defaults for backward compat)
-    vid_cfg = {**_DEFAULT_VIDEO, **job_data.get("video", {})}
-    title_cfg = {**_DEFAULT_TITLE, **job_data.get("title", {})}
-    cap_cfg = {**_DEFAULT_CAPTIONS, **job_data.get("captions", {})}
-    blur_strength = job_data.get("backgroundBlurStrength", 20)
-    output_quality = job_data.get("outputQuality", "medium")
+    # -- Load layout from Supabase if provided --------------------------------
+    bg_style = "blur"
+    bg_color = "#000000"
+    bg_image_storage_path: str | None = None  # path inside Supabase storage
+    layout_video: dict = {}
+    layout_title: dict = {}
+    layout_captions: dict = {}
+    blur_strength = 20
+    output_quality = "medium"
+
+    layout_id = job_data.get("layoutId")
+    if layout_id:
+        logger.info("[%s] Loading layout %s …", job_id, layout_id)
+        layout_resp = (
+            supabase.table("layouts")
+            .select("*")
+            .eq("id", layout_id)
+            .eq("user_id", user_id)
+            .single()
+            .execute()
+        )
+        layout = layout_resp.data
+        if layout:
+            bg_style = layout.get("background_style", "blur")
+            bg_color = layout.get("background_color") or "#000000"
+            bg_image_storage_path = layout.get("background_image_path")
+            blur_strength = layout.get("background_blur_strength") or 20
+            output_quality = layout.get("output_quality") or "medium"
+            layout_video = layout.get("video") or {}
+            layout_title = layout.get("title") or {}
+            layout_captions = layout.get("captions") or {}
+        else:
+            logger.warning("[%s] Layout %s not found, using defaults", job_id, layout_id)
+
+    # Unpack nested style dicts (layout values override built-in defaults)
+    vid_cfg = {**_DEFAULT_VIDEO, **layout_video}
+    title_cfg = {**_DEFAULT_TITLE, **layout_title}
+    cap_cfg = {**_DEFAULT_CAPTIONS, **layout_captions}
 
     # -- Per-clip working directory for isolation -------------------------
     work_dir = os.path.join(TEMP_DIR, f"clip_{clip_id}")
     os.makedirs(work_dir, exist_ok=True)
 
     generator = ClipGenerator(work_dir=work_dir)
+
+    # Download background image from Supabase storage if needed
+    bg_image_path: str | None = None
+    if bg_style == "image" and bg_image_storage_path:
+        bg_image_path = os.path.join(work_dir, "bg_image.jpg")
+        try:
+            # Download from Supabase storage bucket "layouts"
+            file_bytes = supabase.storage.from_("layouts").download(
+                bg_image_storage_path
+            )
+            with open(bg_image_path, "wb") as f:
+                f.write(file_bytes)
+            logger.info(
+                "[%s] Downloaded background image from storage: %s",
+                job_id,
+                bg_image_storage_path,
+            )
+        except Exception as dl_err:
+            logger.warning(
+                "[%s] Could not download background image, falling back to blur: %s",
+                job_id,
+                dl_err,
+            )
+            bg_style = "blur"
+            bg_image_path = None
 
     try:
         # Get clip and video details
@@ -141,7 +198,9 @@ def generate_clip_task(job_data: dict):
             start_time=start_time,
             end_time=end_time,
             title=clip["title"],
-            background_style=clip.get("background_style", "blur"),
+            background_style=bg_style,
+            background_color=bg_color,
+            background_image_path=bg_image_path,
             # video layout
             video_width_pct=vid_cfg["widthPct"],
             video_position_y=vid_cfg["positionY"],

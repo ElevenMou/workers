@@ -233,10 +233,10 @@ def _caption_placement(
     When *vid_y* and *vid_h* are provided the positions are relative to
     the video area on the canvas:
 
-    * ``"bottom"``      – inside the video, near its bottom edge.
-    * ``"middle"``      – vertically centred within the video.
-    * ``"below_video"`` – just below the video area.
-    * ``"above_video"`` – just above the video area.
+    * ``"bottom"``      - inside the video, near its bottom edge.
+    * ``"middle"``      - vertically centred within the video.
+    * ``"below_video"`` - just below the video area.
+    * ``"above_video"`` - just above the video area.
 
     Without video layout info, positions fall back to simple canvas-relative
     margins.
@@ -270,7 +270,7 @@ def _caption_placement(
             alignment = 2
             margin_v = 80
     else:
-        # Fallback – no video layout info; use simple canvas-relative values.
+        # Fallback - no video layout info; use simple canvas-relative values.
         alignment = {"bottom": 2, "middle": 5, "top": 8}.get(position, 2)
         margin_v = 80 if position == "bottom" else 40
 

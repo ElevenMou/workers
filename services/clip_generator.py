@@ -113,6 +113,8 @@ class ClipGenerator:
         end_time: float,
         title: str,
         background_style: str = "blur",
+        background_color: str = "#000000",
+        background_image_path: str | None = None,
         # -- video layout --
         video_width_pct: int = 100,
         video_position_y: str = "middle",
@@ -174,6 +176,8 @@ class ClipGenerator:
             layout["vid_y"],
             blur_strength,
             qp,
+            background_color=background_color,
+            background_image_path=background_image_path,
         )
         intermediates.append(bg_clip_path)
 
@@ -291,7 +295,7 @@ class ClipGenerator:
     ):
         """Extract video segment."""
         duration = end - start
-        logger.info("Extracting segment %.2f–%.2f (%.2fs)", start, end, duration)
+        logger.info("Extracting segment %.2f-%.2f (%.2fs)", start, end, duration)
 
         (
             ffmpeg.input(input_path, ss=start, t=duration)
@@ -317,10 +321,17 @@ class ClipGenerator:
         vid_y: int,
         blur_strength: int,
         qp: dict,
+        *,
+        background_color: str = "#000000",
+        background_image_path: str | None = None,
     ):
         """Create 9:16 portrait canvas with the video scaled & positioned."""
         logger.info(
-            "Creating portrait background (style=%s, blur=%d)", style, blur_strength
+            "Creating portrait background (style=%s, blur=%d, color=%s, image=%s)",
+            style,
+            blur_strength,
+            background_color,
+            bool(background_image_path),
         )
 
         if style == "blur":
@@ -358,11 +369,77 @@ class ClipGenerator:
 
             self._safe_remove(bg_temp)
 
-        else:  # solid_color / gradient
+        elif style == "solid_color":
+            # Generate a solid-colour canvas using the ffmpeg ``color`` source,
+            # then overlay the scaled video on top.
+            probe = ffmpeg.probe(input_path)
+            duration = float(probe["format"]["duration"])
+
+            bg = ffmpeg.input(
+                f"color=c={background_color}:s={CANVAS_W}x{CANVAS_H}:d={duration}",
+                f="lavfi",
+            )
+            video = ffmpeg.input(input_path).filter("scale", vid_w, vid_h)
+
+            (
+                ffmpeg.filter([bg, video], "overlay", vid_x, vid_y)
+                .output(
+                    output_path,
+                    vcodec="libx264",
+                    acodec="aac",
+                    crf=qp["crf"],
+                    preset=qp["preset"],
+                    shortest=None,
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
+
+        elif style == "image" and background_image_path:
+            # Scale / crop the background image to fill the canvas, then
+            # loop it for the clip duration and overlay the video.
+            bg_img_scaled = output_path + ".bgimg.png"
+
+            # Pre-process image: scale + crop to exact canvas size
+            (
+                ffmpeg.input(background_image_path)
+                .filter(
+                    "scale", CANVAS_W, CANVAS_H, force_original_aspect_ratio="increase"
+                )
+                .filter("crop", CANVAS_W, CANVAS_H)
+                .output(bg_img_scaled, vframes=1)
+                .overwrite_output()
+                .run(quiet=True)
+            )
+
+            probe = ffmpeg.probe(input_path)
+            duration = float(probe["format"]["duration"])
+
+            bg = ffmpeg.input(bg_img_scaled, loop=1, t=duration, framerate=30)
+            video = ffmpeg.input(input_path).filter("scale", vid_w, vid_h)
+
+            (
+                ffmpeg.filter([bg, video], "overlay", vid_x, vid_y)
+                .output(
+                    output_path,
+                    vcodec="libx264",
+                    acodec="aac",
+                    crf=qp["crf"],
+                    preset=qp["preset"],
+                    shortest=None,
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
+
+            self._safe_remove(bg_img_scaled)
+
+        else:
+            # Fallback: pad with user-supplied colour (or black)
             (
                 ffmpeg.input(input_path)
                 .filter("scale", vid_w, vid_h)
-                .filter("pad", CANVAS_W, CANVAS_H, vid_x, vid_y, "black")
+                .filter("pad", CANVAS_W, CANVAS_H, vid_x, vid_y, background_color)
                 .output(
                     output_path,
                     vcodec="libx264",
