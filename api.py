@@ -101,14 +101,29 @@ def health() -> dict:
 
 @app.post("/videos/analyze", response_model=AnalyzeVideoResponse)
 def analyze_video(payload: AnalyzeVideoRequest) -> AnalyzeVideoResponse:
-    video_id = payload.videoId or str(uuid4())
     job_id = str(uuid4())
+    url_str = str(payload.url)
+
+    # Reuse existing video for this user+url if present; otherwise use payload.videoId or new id
+    existing = (
+        supabase.table("videos")
+        .select("id")
+        .eq("url", url_str)
+        .eq("user_id", payload.userId)
+        .limit(1)
+        .execute()
+    )
+    if existing.data and len(existing.data) > 0:
+        video_id = existing.data[0]["id"]
+        logger.info("Reusing existing video %s for analyze url", video_id)
+    else:
+        video_id = payload.videoId or str(uuid4())
 
     logger.info(
         "Analyze request - user=%s  video=%s  url=%s  numClips=%d",
         payload.userId,
         video_id,
-        payload.url,
+        url_str,
         payload.numClips,
     )
 
@@ -119,7 +134,7 @@ def analyze_video(payload: AnalyzeVideoRequest) -> AnalyzeVideoResponse:
             {
                 "id": video_id,
                 "user_id": payload.userId,
-                "url": str(payload.url),
+                "url": url_str,
                 "status": "pending",
             },
             on_conflict="id",
@@ -132,7 +147,7 @@ def analyze_video(payload: AnalyzeVideoRequest) -> AnalyzeVideoResponse:
         "jobId": job_id,
         "videoId": video_id,
         "userId": payload.userId,
-        "url": str(payload.url),
+        "url": url_str,
         "numClips": payload.numClips,
     }
 
@@ -240,32 +255,45 @@ def custom_clip(payload: CustomClipRequest) -> GenerateClipResponse:
             detail="endTime must be greater than startTime",
         )
 
-    video_id = str(uuid4())
     clip_id = str(uuid4())
     job_id = str(uuid4())
+    url_str = str(payload.url)
 
     logger.info(
         "Custom clip request - user=%s  url=%s  %.2f–%.2f",
         payload.userId,
-        payload.url,
+        url_str,
         payload.startTime,
         payload.endTime,
     )
 
-    # Create video row
-    video_resp = (
+    # Reuse existing video for this user+url if present; otherwise create one
+    existing = (
         supabase.table("videos")
-        .insert(
-            {
-                "id": video_id,
-                "user_id": payload.userId,
-                "url": str(payload.url),
-                "status": "pending",
-            }
-        )
+        .select("id")
+        .eq("url", url_str)
+        .eq("user_id", payload.userId)
+        .limit(1)
         .execute()
     )
-    _raise_on_error(video_resp, "Failed to insert video")
+    if existing.data and len(existing.data) > 0:
+        video_id = existing.data[0]["id"]
+        logger.info("Reusing existing video %s for url", video_id)
+    else:
+        video_id = str(uuid4())
+        video_resp = (
+            supabase.table("videos")
+            .insert(
+                {
+                    "id": video_id,
+                    "user_id": payload.userId,
+                    "url": url_str,
+                    "status": "pending",
+                }
+            )
+            .execute()
+        )
+        _raise_on_error(video_resp, "Failed to insert video")
 
     # Create clip row
     clip_insert = {
