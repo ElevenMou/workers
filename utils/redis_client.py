@@ -3,7 +3,7 @@ from rq import Queue
 from config import REDIS_HOST, REDIS_PORT, REDIS_DB, VIDEO_JOB_TIMEOUT, CLIP_JOB_TIMEOUT
 
 # ---------------------------------------------------------------------------
-# Queue configuration – maps queue name → RQ Queue kwargs
+# Queue configuration - maps queue name → RQ Queue kwargs
 # ---------------------------------------------------------------------------
 QUEUE_CONFIG: dict[str, dict] = {
     "video-processing": {"default_timeout": VIDEO_JOB_TIMEOUT},
@@ -12,7 +12,7 @@ QUEUE_CONFIG: dict[str, dict] = {
 
 
 # ---------------------------------------------------------------------------
-# Factory helpers (safe across subprocesses – each gets its own connection)
+# Factory helpers (safe across subprocesses - each gets its own connection)
 # ---------------------------------------------------------------------------
 def get_redis_connection() -> redis.Redis:
     """Create a **new** Redis connection."""
@@ -26,16 +26,14 @@ def get_queue(name: str, connection: redis.Redis | None = None) -> Queue:
     return Queue(name, connection=conn, default_timeout=cfg.get("default_timeout", 600))
 
 
-def get_queues(
-    names: list[str], connection: redis.Redis | None = None
-) -> list[Queue]:
+def get_queues(names: list[str], connection: redis.Redis | None = None) -> list[Queue]:
     """Create multiple queues sharing one Redis connection."""
     conn = connection or get_redis_connection()
     return [get_queue(n, conn) for n in names]
 
 
 # ---------------------------------------------------------------------------
-# Module-level singletons (used by api.py – single process)
+# Module-level singletons (used by api.py - single process)
 # ---------------------------------------------------------------------------
 redis_conn = get_redis_connection()
 video_queue = get_queue("video-processing", redis_conn)

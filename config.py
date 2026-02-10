@@ -26,7 +26,7 @@ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video_clipper")
 MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", 500))
 
 # ---------------------------------------------------------------------------
-# Workers – concurrency & timeouts
+# Workers - concurrency & timeouts
 # ---------------------------------------------------------------------------
 NUM_VIDEO_WORKERS = int(os.getenv("NUM_VIDEO_WORKERS", 2))
 NUM_CLIP_WORKERS = int(os.getenv("NUM_CLIP_WORKERS", 2))
@@ -34,7 +34,7 @@ VIDEO_JOB_TIMEOUT = int(os.getenv("VIDEO_JOB_TIMEOUT", 1800))  # 30 min
 CLIP_JOB_TIMEOUT = int(os.getenv("CLIP_JOB_TIMEOUT", 1800))  # 30 min
 
 # ---------------------------------------------------------------------------
-# Credits – Dynamic pricing based on duration
+# Credits - Dynamic pricing based on duration
 # ---------------------------------------------------------------------------
 
 

@@ -7,7 +7,7 @@ from config import WHISPER_MODEL
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Whisper model singleton – loaded once per process, reused across all jobs.
+# Whisper model singleton - loaded once per process, reused across all jobs.
 # Avoids the ~30 s+ reload (and multi-GB memory churn) on every task call.
 # ---------------------------------------------------------------------------
 _model = None

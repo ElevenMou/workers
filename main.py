@@ -27,7 +27,7 @@ _WORKER_PREFIXES = ("video-worker-", "clip-worker-")
 
 
 # ---------------------------------------------------------------------------
-# Windows compatibility – SimpleWorker without SIGALRM
+# Windows compatibility - SimpleWorker without SIGALRM
 # ---------------------------------------------------------------------------
 class _NoOpDeathPenalty:
     def __init__(self, *_, **__):
@@ -99,7 +99,7 @@ def _run_worker(queue_names: list[str], worker_name: str):
     queues = get_queues(queue_names, conn)
     cls = _worker_cls()
 
-    logger.info("Worker %s starting – queues: %s", worker_name, queue_names)
+    logger.info("Worker %s starting - queues: %s", worker_name, queue_names)
     worker = cls(queues, connection=conn, name=worker_name)
     worker.work(with_scheduler=False)
 
@@ -143,7 +143,7 @@ if __name__ == "__main__":
 
     total = NUM_VIDEO_WORKERS + NUM_CLIP_WORKERS
     logger.info(
-        "Worker pool ready – %d video, %d clip  (%d total)",
+        "Worker pool ready - %d video, %d clip  (%d total)",
         NUM_VIDEO_WORKERS,
         NUM_CLIP_WORKERS,
         total,

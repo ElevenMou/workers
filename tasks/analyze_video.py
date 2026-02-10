@@ -51,7 +51,7 @@ def analyze_video_task(job_data: dict):
         credits_required = calculate_video_analysis_cost(duration_seconds)
 
         logger.info(
-            "[%s] Video duration: %ds (~%.1f min) – credits required: %d",
+            "[%s] Video duration: %ds (~%.1f min) - credits required: %d",
             job_id,
             duration_seconds,
             duration_seconds / 60,
@@ -138,7 +138,7 @@ def analyze_video_task(job_data: dict):
 
             if duration < MIN_CLIP_SECONDS or duration > MAX_CLIP_SECONDS:
                 logger.warning(
-                    "[%s] Skipping clip outside duration bounds (%.2fs): %.2f–%.2f",
+                    "[%s] Skipping clip outside duration bounds (%.2fs): %.2f-%.2f",
                     job_id,
                     duration,
                     start,
@@ -168,7 +168,7 @@ def analyze_video_task(job_data: dict):
                 "p_amount": credits_required,
                 "p_type": "video_analysis",
                 "p_description": (
-                    f'Video analysis ({duration_seconds / 60:.1f}min): '
+                    f"Video analysis ({duration_seconds / 60:.1f}min): "
                     f'{video_data["title"][:50]}'
                 ),
                 "p_video_id": video_id,
@@ -180,7 +180,9 @@ def analyze_video_task(job_data: dict):
         ).eq("id", video_id).execute()
 
         update_job_status(job_id, "completed", 100)
-        logger.info("[%s] Video analysis completed – %d clips saved", job_id, inserted_count)
+        logger.info(
+            "[%s] Video analysis completed - %d clips saved", job_id, inserted_count
+        )
 
     except Exception as e:
         error_msg = str(e)
@@ -192,7 +194,7 @@ def analyze_video_task(job_data: dict):
         raise
 
     finally:
-        # Clean up audio (video stays – needed for clip generation)
+        # Clean up audio (video stays - needed for clip generation)
         if audio_path and os.path.exists(audio_path):
             os.remove(audio_path)
             logger.debug("[%s] Removed temp audio %s", job_id, audio_path)

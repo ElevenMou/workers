@@ -3,11 +3,40 @@ import os
 import shutil
 import traceback
 
+import ffmpeg as ffmpeg_lib
+
 from config import CREDIT_COST_CLIP_GENERATION, TEMP_DIR
-from services.clip_generator import ClipGenerator
+from services.caption_renderer import extract_clip_segments, render_ass
+from services.clip_generator import ClipGenerator, compute_video_position
 from utils.supabase_client import supabase, update_job_status
 
 logger = logging.getLogger(__name__)
+
+# Defaults that match the API Pydantic models
+_DEFAULT_VIDEO = {"widthPct": 100, "positionY": "middle"}
+_DEFAULT_TITLE = {
+    "show": True,
+    "fontSize": 48,
+    "fontColor": "white",
+    "fontFamily": "",
+    "align": "left",
+    "strokeWidth": 0,
+    "strokeColor": "black",
+    "barEnabled": True,
+    "barColor": "black@0.5",
+    "paddingX": 16,
+    "positionY": "above_video",
+}
+_DEFAULT_CAPTIONS = {
+    "show": False,
+    "style": "animated",
+    "fontSize": 42,
+    "fontColor": "white",
+    "fontFamily": "",
+    "highlightColor": "#FFD700",
+    "position": "bottom",
+    "maxWordsPerLine": 5,
+}
 
 
 def generate_clip_task(job_data: dict):
@@ -20,6 +49,13 @@ def generate_clip_task(job_data: dict):
     job_id = job_data["jobId"]
     clip_id = job_data["clipId"]
     user_id = job_data["userId"]
+
+    # Unpack nested style dicts (with defaults for backward compat)
+    vid_cfg = {**_DEFAULT_VIDEO, **job_data.get("video", {})}
+    title_cfg = {**_DEFAULT_TITLE, **job_data.get("title", {})}
+    cap_cfg = {**_DEFAULT_CAPTIONS, **job_data.get("captions", {})}
+    blur_strength = job_data.get("backgroundBlurStrength", 20)
+    output_quality = job_data.get("outputQuality", "medium")
 
     # -- Per-clip working directory for isolation -------------------------
     work_dir = os.path.join(TEMP_DIR, f"clip_{clip_id}")
@@ -54,15 +90,78 @@ def generate_clip_task(job_data: dict):
             "id", clip_id
         ).execute()
 
-        # Generate clip
+        start_time = float(clip["start_time"])
+        end_time = float(clip["end_time"])
+
+        # -- Compute video position for caption placement -------------------
+        video_file = clip["videos"]["raw_video_path"]
+        probe = ffmpeg_lib.probe(video_file)
+        v_stream = next(
+            s for s in probe["streams"] if s["codec_type"] == "video"
+        )
+        src_w = int(v_stream["width"])
+        src_h = int(v_stream["height"])
+        _, vid_h, _, vid_y = compute_video_position(
+            src_w, src_h, vid_cfg["widthPct"], vid_cfg["positionY"]
+        )
+
+        # -- Build caption ASS file if requested --------------------------
+        caption_ass_path: str | None = None
+
+        if cap_cfg["show"]:
+            transcript = clip["videos"].get("transcript")
+            if transcript and transcript.get("segments"):
+                logger.info("[%s] Building %s captions …", job_id, cap_cfg["style"])
+                segments = extract_clip_segments(transcript, start_time, end_time)
+
+                if segments:
+                    caption_ass_path = render_ass(
+                        segments,
+                        style=cap_cfg["style"],
+                        font_size=cap_cfg["fontSize"],
+                        font_color=cap_cfg["fontColor"],
+                        font_family=cap_cfg["fontFamily"],
+                        highlight_color=cap_cfg["highlightColor"],
+                        position=cap_cfg["position"],
+                        max_words_per_line=cap_cfg["maxWordsPerLine"],
+                        vid_y=vid_y,
+                        vid_h=vid_h,
+                        output_path=os.path.join(work_dir, f"{clip_id}.ass"),
+                    )
+            else:
+                logger.warning(
+                    "[%s] Captions requested but no transcript available", job_id
+                )
+
+        # -- Generate clip ------------------------------------------------
         logger.info("[%s] Generating clip %s …", job_id, clip_id)
         result = generator.generate(
             video_path=clip["videos"]["raw_video_path"],
             clip_id=clip_id,
-            start_time=float(clip["start_time"]),
-            end_time=float(clip["end_time"]),
+            start_time=start_time,
+            end_time=end_time,
             title=clip["title"],
             background_style=clip.get("background_style", "blur"),
+            # video layout
+            video_width_pct=vid_cfg["widthPct"],
+            video_position_y=vid_cfg["positionY"],
+            # title style
+            title_show=title_cfg["show"],
+            title_font_size=title_cfg["fontSize"],
+            title_font_color=title_cfg["fontColor"],
+            title_font_family=title_cfg["fontFamily"],
+            title_align=title_cfg["align"],
+            title_stroke_width=title_cfg["strokeWidth"],
+            title_stroke_color=title_cfg["strokeColor"],
+            title_bar_enabled=title_cfg["barEnabled"],
+            title_bar_color=title_cfg["barColor"],
+            title_padding_x=title_cfg["paddingX"],
+            title_position_y=title_cfg["positionY"],
+            # captions
+            caption_ass_path=caption_ass_path,
+            # misc
+            blur_strength=blur_strength,
+            output_quality=output_quality,
         )
 
         update_job_status(job_id, "processing", 90)
