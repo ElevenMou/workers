@@ -125,9 +125,14 @@ def extract_clip_segments(
     clip_end: float,
 ) -> list[dict]:
     """Return only the transcript segments that overlap ``[clip_start, clip_end]``
-    with timestamps shifted so ``clip_start`` becomes ``0``."""
+    with timestamps shifted so ``clip_start`` becomes ``0``.
 
-    segments: list[dict] = []
+    YouTube transcripts often have overlapping and long segments.
+    This function de-overlaps them and splits long segments into
+    shorter sentence-level chunks so captions display cleanly.
+    """
+
+    raw: list[dict] = []
     for seg in transcript.get("segments", []):
         seg_start = float(seg["start"])
         seg_end = float(seg["end"])
@@ -163,7 +168,47 @@ def extract_clip_segments(
                 )
             new_seg["words"] = new_words
 
-        segments.append(new_seg)
+        raw.append(new_seg)
+
+    # -- De-overlap: trim each segment's end so it doesn't exceed the
+    #    next segment's start.  YouTube transcripts commonly overlap.
+    raw.sort(key=lambda s: s["start"])
+    for i in range(len(raw) - 1):
+        if raw[i]["end"] > raw[i + 1]["start"]:
+            raw[i]["end"] = raw[i + 1]["start"]
+
+    # -- Split long segments (no word-level timing) into ~8-word chunks
+    #    so captions don't show a wall of text at once.
+    segments: list[dict] = []
+    for seg in raw:
+        if "words" in seg and seg["words"]:
+            # Whisper segments already have word timing -- keep as-is
+            segments.append(seg)
+            continue
+
+        words = seg["text"].split()
+        if len(words) <= 8:
+            segments.append(seg)
+            continue
+
+        # Split into chunks of ~8 words, distributing time evenly
+        chunk_size = 8
+        seg_start = seg["start"]
+        seg_duration = seg["end"] - seg["start"]
+        total_words = len(words)
+        time_per_word = seg_duration / total_words if total_words > 0 else 0
+
+        for ci in range(0, total_words, chunk_size):
+            chunk_words = words[ci : ci + chunk_size]
+            c_start = seg_start + ci * time_per_word
+            c_end = seg_start + min(ci + chunk_size, total_words) * time_per_word
+            segments.append(
+                {
+                    "start": c_start,
+                    "end": c_end,
+                    "text": " ".join(chunk_words),
+                }
+            )
 
     return segments
 

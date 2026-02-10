@@ -32,6 +32,7 @@ _CHAR_WIDTH_RATIO = 0.52
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _wrap_title(title: str, font_size: int, max_width: int) -> list[str]:
     """Word-wrap *title* so it fits within *max_width* pixels.
 
@@ -142,7 +143,7 @@ class ClipGenerator:
         qp = QUALITY_PRESETS.get(output_quality, QUALITY_PRESETS["medium"])
 
         # -- Word-wrap the title ------------------------------------------
-        max_text_w = CANVAS_W - 4 * title_padding_x
+        max_text_w = CANVAS_W - 6 * title_padding_x
         title_lines = _wrap_title(title, title_font_size, max_text_w)
 
         # 1. Extract clip segment

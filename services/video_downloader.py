@@ -6,6 +6,8 @@ from youtube_transcript_api import YouTubeTranscriptApi
 
 from config import TEMP_DIR, MAX_VIDEO_SIZE_MB
 
+_yt_transcript_api = YouTubeTranscriptApi()
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,26 +49,53 @@ class VideoDownloader:
             }
 
     def get_youtube_transcript(self, video_id: str) -> dict | None:
-        """Get transcript directly from YouTube."""
+        """Get transcript directly from YouTube (v1.x API).
+
+        Tries English first, then falls back to any available language.
+        """
+        fetched = None
+
+        # 1. Try English transcript (manual or auto-generated)
         try:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+            fetched = _yt_transcript_api.fetch(
+                video_id, languages=["en", "en-US", "en-GB"]
+            )
+            logger.info(
+                "Found %s transcript (%s) for %s",
+                fetched.language,
+                fetched.language_code,
+                video_id,
+            )
+        except Exception:
+            pass
 
-            segments = [
-                {
-                    "id": i,
-                    "start": entry["start"],
-                    "end": entry["start"] + entry["duration"],
-                    "text": entry["text"],
-                }
-                for i, entry in enumerate(transcript_list)
-            ]
+        # 2. Fall back to any available language
+        if fetched is None:
+            try:
+                fetched = _yt_transcript_api.fetch(video_id)
+                logger.info(
+                    "Found %s transcript (%s) for %s",
+                    fetched.language,
+                    fetched.language_code,
+                    video_id,
+                )
+            except Exception as e:
+                logger.warning("Could not get YouTube transcript for %s: %s", video_id, e)
+                return None
 
-            full_text = " ".join(s["text"] for s in segments)
+        segments = [
+            {
+                "id": i,
+                "start": snippet.start,
+                "end": snippet.start + snippet.duration,
+                "text": snippet.text,
+            }
+            for i, snippet in enumerate(fetched)
+        ]
 
-            return {"text": full_text, "segments": segments, "source": "youtube"}
-        except Exception as e:
-            logger.warning("Could not get YouTube transcript: %s", e)
-            return None
+        full_text = " ".join(s["text"] for s in segments)
+
+        return {"text": full_text, "segments": segments, "source": "youtube"}
 
     def extract_audio(self, video_path: str) -> str:
         """Extract audio from video for Whisper transcription."""
