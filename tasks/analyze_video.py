@@ -172,6 +172,7 @@ def analyze_video_task(job_data: dict):
                     f'{video_data["title"][:50]}'
                 ),
                 "p_video_id": video_id,
+                "p_clip_id": None,
             },
         ).execute()
 
@@ -179,7 +180,11 @@ def analyze_video_task(job_data: dict):
             {"credits_charged": credits_required, "clip_count": inserted_count}
         ).eq("id", video_id).execute()
 
-        update_job_status(job_id, "completed", 100)
+        update_job_status(job_id, "completed", 100, result_data={
+            "clip_count": inserted_count,
+            "duration_seconds": duration_seconds,
+            "credits_charged": credits_required,
+        })
         logger.info(
             "[%s] Video analysis completed - %d clips saved", job_id, inserted_count
         )

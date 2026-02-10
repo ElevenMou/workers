@@ -238,14 +238,15 @@ def generate_clip_task(job_data: dict):
             supabase.storage.from_("thumbnails").upload(thumbnail_path, f)
 
         # Update clip record
-        supabase.table("clips").update(
-            {
-                "status": "completed",
-                "storage_path": storage_path,
-                "thumbnail_path": thumbnail_path,
-                "file_size_bytes": result["file_size"],
-            }
-        ).eq("id", clip_id).execute()
+        clip_update = {
+            "status": "completed",
+            "storage_path": storage_path,
+            "thumbnail_path": thumbnail_path,
+            "file_size_bytes": result["file_size"],
+        }
+        if layout_id:
+            clip_update["layout_id"] = layout_id
+        supabase.table("clips").update(clip_update).eq("id", clip_id).execute()
 
         # Charge credits
         supabase.rpc(
@@ -255,11 +256,16 @@ def generate_clip_task(job_data: dict):
                 "p_amount": CREDIT_COST_CLIP_GENERATION,
                 "p_type": "clip_generation",
                 "p_description": f'Clip generation: {clip["title"][:50]}',
+                "p_video_id": clip["video_id"],
                 "p_clip_id": clip_id,
             },
         ).execute()
 
-        update_job_status(job_id, "completed", 100)
+        update_job_status(job_id, "completed", 100, result_data={
+            "storage_path": storage_path,
+            "thumbnail_path": thumbnail_path,
+            "file_size": result["file_size"],
+        })
         logger.info("[%s] Clip generation completed: %s", job_id, clip_id)
 
     except Exception as e:

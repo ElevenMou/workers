@@ -37,7 +37,13 @@ except Exception:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 
-def update_job_status(job_id: str, status: str, progress: int, error: str = None):
+def update_job_status(
+    job_id: str,
+    status: str,
+    progress: int,
+    error: str = None,
+    result_data: dict = None,
+):
     """Update job status and progress"""
     data = {"status": status, "progress": progress}
 
@@ -48,6 +54,9 @@ def update_job_status(job_id: str, status: str, progress: int, error: str = None
 
     if error:
         data["error_message"] = error
+
+    if result_data:
+        data["result_data"] = result_data
 
     supabase.table("jobs").update(data).eq("id", job_id).execute()
 
