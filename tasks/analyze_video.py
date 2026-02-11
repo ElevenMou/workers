@@ -146,6 +146,16 @@ def analyze_video_task(job_data: dict):
                 )
                 continue
 
+            # ai_score is DECIMAL(3,2); clamp to 0-1 to avoid numeric overflow
+            raw_score = clip.get("score")
+            if raw_score is not None:
+                try:
+                    score = max(0.0, min(1.0, float(raw_score)))
+                except (TypeError, ValueError):
+                    score = None
+            else:
+                score = None
+
             supabase.table("clips").insert(
                 {
                     "video_id": video_id,
@@ -153,7 +163,7 @@ def analyze_video_task(job_data: dict):
                     "start_time": start,
                     "end_time": end,
                     "title": clip["title"],
-                    "ai_score": clip["score"],
+                    "ai_score": round(score, 2) if score is not None else None,
                     "transcript_excerpt": clip["text"][:500],
                     "status": "pending",
                 }
