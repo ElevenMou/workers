@@ -5,9 +5,9 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, HttpUrl
 
-from config import CREDIT_COST_CLIP_GENERATION, calculate_video_analysis_cost
-from utils.redis_client import clip_queue, video_queue
-from utils.supabase_client import supabase
+from config import CREDIT_COST_CLIP_GENERATION, calculate_video_analysis_cost, validate_env
+from utils.redis_client import enqueue_job
+from utils.supabase_client import assert_response_ok, supabase
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,6 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger("clipry.api")
 
 app = FastAPI(title="Clipry Workers API", version="1.0.0")
+validate_env()
 
 # Use string paths so the API process does not eagerly import heavy worker deps
 ANALYZE_TASK_PATH = "tasks.analyze_video.analyze_video_task"
@@ -82,13 +83,54 @@ class CreditsCostResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 def _raise_on_error(response, context: str):
-    error = getattr(response, "error", None)
-    if error:
-        detail = getattr(error, "message", None) or str(error)
+    try:
+        assert_response_ok(response, context)
+    except RuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"{context}: {detail}",
+            detail=str(exc),
         )
+
+
+def _enqueue_or_fail(
+    *,
+    queue_name: str,
+    task_path: str,
+    job_data: dict,
+    job_id: str,
+    user_id: str,
+    job_type: str,
+    video_id: str,
+    clip_id: str | None = None,
+):
+    try:
+        enqueue_job(queue_name, task_path, job_data, job_id=job_id)
+    except Exception as exc:
+        err = f"Queue enqueue failed: {exc}"
+        logger.error("Failed to enqueue job %s: %s", job_id, exc)
+
+        fail_resp = (
+            supabase.table("jobs")
+            .update({"status": "failed", "error_message": err})
+            .eq("id", job_id)
+            .execute()
+        )
+        _raise_on_error(fail_resp, "Failed to mark job as failed after enqueue error")
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to queue job right now. Please retry.",
+        )
+
+    logger.info(
+        "Job %s enqueued on %s queue (type=%s user=%s video=%s clip=%s)",
+        job_id,
+        queue_name,
+        job_type,
+        user_id,
+        video_id,
+        clip_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +155,7 @@ def analyze_video(payload: AnalyzeVideoRequest) -> AnalyzeVideoResponse:
         .limit(1)
         .execute()
     )
+    _raise_on_error(existing, "Failed to query existing video")
     if existing.data and len(existing.data) > 0:
         video_id = existing.data[0]["id"]
         logger.info("Reusing existing video %s for analyze url", video_id)
@@ -168,8 +211,15 @@ def analyze_video(payload: AnalyzeVideoRequest) -> AnalyzeVideoResponse:
     )
     _raise_on_error(job_resp, "Failed to upsert job")
 
-    video_queue.enqueue(ANALYZE_TASK_PATH, job_data, job_id=job_id)
-    logger.info("Job %s enqueued on video-processing queue", job_id)
+    _enqueue_or_fail(
+        queue_name="video-processing",
+        task_path=ANALYZE_TASK_PATH,
+        job_data=job_data,
+        job_id=job_id,
+        user_id=payload.userId,
+        job_type="analyze_video",
+        video_id=video_id,
+    )
 
     return AnalyzeVideoResponse(jobId=job_id, videoId=video_id, status="queued")
 
@@ -231,8 +281,16 @@ def generate_clip(payload: GenerateClipRequest) -> GenerateClipResponse:
     )
     _raise_on_error(job_resp, "Failed to upsert job")
 
-    clip_queue.enqueue(GENERATE_TASK_PATH, job_data, job_id=job_id)
-    logger.info("Job %s enqueued on clip-generation queue", job_id)
+    _enqueue_or_fail(
+        queue_name="clip-generation",
+        task_path=GENERATE_TASK_PATH,
+        job_data=job_data,
+        job_id=job_id,
+        user_id=payload.userId,
+        job_type="generate_clip",
+        video_id=clip["video_id"],
+        clip_id=payload.clipId,
+    )
 
     return GenerateClipResponse(
         jobId=job_id,
@@ -276,6 +334,7 @@ def custom_clip(payload: CustomClipRequest) -> GenerateClipResponse:
         .limit(1)
         .execute()
     )
+    _raise_on_error(existing, "Failed to query existing video")
     if existing.data and len(existing.data) > 0:
         video_id = existing.data[0]["id"]
         logger.info("Reusing existing video %s for url", video_id)
@@ -342,8 +401,16 @@ def custom_clip(payload: CustomClipRequest) -> GenerateClipResponse:
     )
     _raise_on_error(job_resp, "Failed to insert job")
 
-    clip_queue.enqueue(CUSTOM_CLIP_TASK_PATH, job_data, job_id=job_id)
-    logger.info("Job %s enqueued on clip-generation queue (custom)", job_id)
+    _enqueue_or_fail(
+        queue_name="clip-generation",
+        task_path=CUSTOM_CLIP_TASK_PATH,
+        job_data=job_data,
+        job_id=job_id,
+        user_id=payload.userId,
+        job_type="generate_clip",
+        video_id=video_id,
+        clip_id=clip_id,
+    )
 
     return GenerateClipResponse(
         jobId=job_id,

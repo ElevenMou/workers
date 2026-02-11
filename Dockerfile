@@ -19,9 +19,9 @@ RUN apt-get update && \
 WORKDIR /app
 
 # -- Install Python deps in two stages for smaller image -------------------
-# 1) CPU-only PyTorch first (avoids pulling ~2 GB CUDA build)
+# 1) CPU-only PyTorch first (avoids pulling CUDA wheels)
 RUN pip install --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cpu
+    torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
 
 # 2) Everything else from requirements.txt
 COPY requirements.txt .

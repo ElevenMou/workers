@@ -8,7 +8,12 @@ import ffmpeg as ffmpeg_lib
 from config import CREDIT_COST_CLIP_GENERATION, TEMP_DIR
 from services.caption_renderer import extract_clip_segments, render_ass
 from services.clip_generator import ClipGenerator, compute_video_position
-from utils.supabase_client import supabase, update_job_status
+from utils.supabase_client import (
+    assert_response_ok,
+    charge_clip_generation_credits,
+    supabase,
+    update_job_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +76,7 @@ def generate_clip_task(job_data: dict):
             .single()
             .execute()
         )
+        assert_response_ok(layout_resp, f"Failed to load layout {layout_id}")
         layout = layout_resp.data
         if layout:
             bg_style = layout.get("background_style", "blur")
@@ -122,30 +128,25 @@ def generate_clip_task(job_data: dict):
 
     try:
         # Get clip and video details
-        clip = (
+        clip_resp = (
             supabase.table("clips")
             .select("*, videos(*)")
             .eq("id", clip_id)
             .single()
             .execute()
-            .data
         )
-
-        # Check credits
-        result = supabase.rpc(
-            "has_credits",
-            {"p_user_id": user_id, "p_amount": CREDIT_COST_CLIP_GENERATION},
-        ).execute()
-
-        if not result.data:
-            raise Exception("Insufficient credits")
+        assert_response_ok(clip_resp, f"Failed to load clip {clip_id}")
+        clip = clip_resp.data
+        if not clip:
+            raise Exception(f"Clip {clip_id} not found")
 
         update_job_status(job_id, "processing", 0)
 
         # Update clip status
-        supabase.table("clips").update({"status": "generating"}).eq(
+        clip_status_resp = supabase.table("clips").update({"status": "generating"}).eq(
             "id", clip_id
         ).execute()
+        assert_response_ok(clip_status_resp, f"Failed to mark clip {clip_id} generating")
 
         start_time = float(clip["start_time"])
         end_time = float(clip["end_time"])
@@ -246,20 +247,19 @@ def generate_clip_task(job_data: dict):
         }
         if layout_id:
             clip_update["layout_id"] = layout_id
-        supabase.table("clips").update(clip_update).eq("id", clip_id).execute()
+        clip_update_resp = (
+            supabase.table("clips").update(clip_update).eq("id", clip_id).execute()
+        )
+        assert_response_ok(clip_update_resp, f"Failed to finalize clip {clip_id}")
 
-        # Charge credits
-        supabase.rpc(
-            "charge_credits",
-            {
-                "p_user_id": user_id,
-                "p_amount": CREDIT_COST_CLIP_GENERATION,
-                "p_type": "clip_generation",
-                "p_description": f'Clip generation: {clip["title"][:50]}',
-                "p_video_id": clip["video_id"],
-                "p_clip_id": clip_id,
-            },
-        ).execute()
+        # Charge credits atomically (fails on insufficient balance).
+        charge_clip_generation_credits(
+            user_id=user_id,
+            amount=CREDIT_COST_CLIP_GENERATION,
+            description=f'Clip generation: {clip["title"][:50]}',
+            video_id=clip["video_id"],
+            clip_id=clip_id,
+        )
 
         update_job_status(job_id, "completed", 100, result_data={
             "storage_path": storage_path,
@@ -274,9 +274,10 @@ def generate_clip_task(job_data: dict):
         logger.debug(traceback.format_exc())
 
         update_job_status(job_id, "failed", 0, error_msg)
-        supabase.table("clips").update(
+        fail_resp = supabase.table("clips").update(
             {"status": "failed", "error_message": error_msg}
         ).eq("id", clip_id).execute()
+        assert_response_ok(fail_resp, f"Failed to mark clip {clip_id} failed")
 
         raise
 

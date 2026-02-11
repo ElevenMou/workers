@@ -7,7 +7,13 @@ from config import TEMP_DIR, calculate_video_analysis_cost
 from services.ai_analyzer import AIAnalyzer
 from services.transcriber import Transcriber
 from services.video_downloader import VideoDownloader
-from utils.supabase_client import supabase, update_job_status, update_video_status
+from utils.supabase_client import (
+    assert_response_ok,
+    charge_video_analysis_credits,
+    supabase,
+    update_job_status,
+    update_video_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,14 +64,6 @@ def analyze_video_task(job_data: dict):
             credits_required,
         )
 
-        # Check credits
-        result = supabase.rpc(
-            "has_credits", {"p_user_id": user_id, "p_amount": credits_required}
-        ).execute()
-
-        if not result.data:
-            raise Exception(f"Insufficient credits. Required: {credits_required}")
-
         # Update video metadata (keep raw_video_path for later clip generation)
         update_video_status(
             video_id,
@@ -105,14 +103,30 @@ def analyze_video_task(job_data: dict):
 
         # 4. Save results -----------------------------------------------------
         logger.info("[%s] Saving results …", job_id)
-        supabase.table("videos").update(
+        save_video_resp = supabase.table("videos").update(
             {"status": "completed", "transcript": transcript}
         ).eq("id", video_id).execute()
+        assert_response_ok(save_video_resp, f"Failed to save transcript for {video_id}")
 
         # Insert clip suggestions (enforce duration constraints: 60-90 s)
         MIN_CLIP_SECONDS = 60
         MAX_CLIP_SECONDS = 90
         inserted_count = 0
+        existing_resp = (
+            supabase.table("clips")
+            .select("start_time,end_time,title")
+            .eq("video_id", video_id)
+            .execute()
+        )
+        assert_response_ok(existing_resp, f"Failed to load existing clips for {video_id}")
+        existing_keys = {
+            (
+                round(float(row["start_time"]), 2),
+                round(float(row["end_time"]), 2),
+                (row.get("title") or "").strip().lower(),
+            )
+            for row in (existing_resp.data or [])
+        }
 
         for clip in clips:
             start = float(clip["start"])
@@ -156,7 +170,22 @@ def analyze_video_task(job_data: dict):
             else:
                 score = None
 
-            supabase.table("clips").insert(
+            clip_key = (
+                round(start, 2),
+                round(end, 2),
+                str(clip.get("title", "")).strip().lower(),
+            )
+            if clip_key in existing_keys:
+                logger.info(
+                    "[%s] Skipping duplicate clip suggestion %.2f-%.2f '%s'",
+                    job_id,
+                    start,
+                    end,
+                    clip.get("title", ""),
+                )
+                continue
+
+            clip_insert_resp = supabase.table("clips").insert(
                 {
                     "video_id": video_id,
                     "user_id": user_id,
@@ -168,27 +197,31 @@ def analyze_video_task(job_data: dict):
                     "status": "pending",
                 }
             ).execute()
+            assert_response_ok(
+                clip_insert_resp,
+                f"Failed to insert clip suggestion for {video_id} ({start}-{end})",
+            )
+            existing_keys.add(clip_key)
             inserted_count += 1
 
-        # Charge credits (dynamic amount)
-        supabase.rpc(
-            "charge_credits",
-            {
-                "p_user_id": user_id,
-                "p_amount": credits_required,
-                "p_type": "video_analysis",
-                "p_description": (
-                    f"Video analysis ({duration_seconds / 60:.1f}min): "
-                    f'{video_data["title"][:50]}'
-                ),
-                "p_video_id": video_id,
-                "p_clip_id": None,
-            },
-        ).execute()
+        # Charge credits atomically at finalization time.
+        charge_video_analysis_credits(
+            user_id=user_id,
+            amount=credits_required,
+            description=(
+                f"Video analysis ({duration_seconds / 60:.1f}min): "
+                f'{video_data["title"][:50]}'
+            ),
+            video_id=video_id,
+        )
 
-        supabase.table("videos").update(
+        finalize_video_resp = supabase.table("videos").update(
             {"credits_charged": credits_required, "clip_count": inserted_count}
         ).eq("id", video_id).execute()
+        assert_response_ok(
+            finalize_video_resp,
+            f"Failed to finalize video metadata for {video_id}",
+        )
 
         update_job_status(job_id, "completed", 100, result_data={
             "clip_count": inserted_count,

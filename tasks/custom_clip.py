@@ -18,7 +18,13 @@ from services.caption_renderer import extract_clip_segments, render_ass
 from services.clip_generator import ClipGenerator, compute_video_position
 from services.transcriber import Transcriber
 from services.video_downloader import VideoDownloader
-from utils.supabase_client import supabase, update_job_status, update_video_status
+from utils.supabase_client import (
+    assert_response_ok,
+    charge_clip_generation_credits,
+    supabase,
+    update_job_status,
+    update_video_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,19 +79,12 @@ def custom_clip_task(job_data: dict):
     audio_path: str | None = None
 
     try:
-        # 0. Check credits ----------------------------------------------------
-        result = supabase.rpc(
-            "has_credits",
-            {"p_user_id": user_id, "p_amount": CREDIT_COST_CLIP_GENERATION},
-        ).execute()
-        if not result.data:
-            raise Exception("Insufficient credits")
-
         update_job_status(job_id, "processing", 0)
         update_video_status(video_id, "downloading")
-        supabase.table("clips").update({"status": "generating"}).eq(
+        clip_status_resp = supabase.table("clips").update({"status": "generating"}).eq(
             "id", clip_id
         ).execute()
+        assert_response_ok(clip_status_resp, f"Failed to mark clip {clip_id} generating")
 
         # 1. Download video ----------------------------------------------------
         logger.info("[%s] Downloading video: %s", job_id, url)
@@ -129,9 +128,10 @@ def custom_clip_task(job_data: dict):
         update_job_status(job_id, "processing", 40)
 
         # Save transcript on video row
-        supabase.table("videos").update(
+        save_video_resp = supabase.table("videos").update(
             {"status": "completed", "transcript": transcript}
         ).eq("id", video_id).execute()
+        assert_response_ok(save_video_resp, f"Failed to save transcript for {video_id}")
 
         # 3. Load layout -------------------------------------------------------
         bg_style = "blur"
@@ -154,6 +154,7 @@ def custom_clip_task(job_data: dict):
                 .single()
                 .execute()
             )
+            assert_response_ok(layout_resp, f"Failed to load layout {layout_id}")
             layout = layout_resp.data
             if layout:
                 bg_style = layout.get("background_style", "blur")
@@ -293,20 +294,19 @@ def custom_clip_task(job_data: dict):
         }
         if layout_id:
             clip_update["layout_id"] = layout_id
-        supabase.table("clips").update(clip_update).eq("id", clip_id).execute()
+        clip_update_resp = (
+            supabase.table("clips").update(clip_update).eq("id", clip_id).execute()
+        )
+        assert_response_ok(clip_update_resp, f"Failed to finalize clip {clip_id}")
 
-        # 9. Charge credits ----------------------------------------------------
-        supabase.rpc(
-            "charge_credits",
-            {
-                "p_user_id": user_id,
-                "p_amount": CREDIT_COST_CLIP_GENERATION,
-                "p_type": "clip_generation",
-                "p_description": f"Custom clip: {title[:50]}",
-                "p_video_id": video_id,
-                "p_clip_id": clip_id,
-            },
-        ).execute()
+        # 9. Charge credits atomically -----------------------------------------
+        charge_clip_generation_credits(
+            user_id=user_id,
+            amount=CREDIT_COST_CLIP_GENERATION,
+            description=f"Custom clip: {title[:50]}",
+            video_id=video_id,
+            clip_id=clip_id,
+        )
 
         update_job_status(job_id, "completed", 100, result_data={
             "storage_path": storage_path,
@@ -321,9 +321,10 @@ def custom_clip_task(job_data: dict):
         logger.debug(traceback.format_exc())
 
         update_job_status(job_id, "failed", 0, error_msg)
-        supabase.table("clips").update(
+        fail_clip_resp = supabase.table("clips").update(
             {"status": "failed", "error_message": error_msg}
         ).eq("id", clip_id).execute()
+        assert_response_ok(fail_clip_resp, f"Failed to mark clip {clip_id} failed")
         update_video_status(video_id, "failed", error_message=error_msg)
 
         raise

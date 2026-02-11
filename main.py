@@ -12,7 +12,9 @@ is controlled by ``NUM_VIDEO_WORKERS`` / ``NUM_CLIP_WORKERS`` env vars
 import logging
 import multiprocessing
 import os
+import socket
 import sys
+import time
 
 from rq import Worker, SimpleWorker
 
@@ -67,8 +69,14 @@ def _cleanup_stale_workers(conn):
         logger.warning("Could not list existing workers: %s", exc)
         return
 
+    current_host = socket.gethostname()
+
     for w in existing:
         if not any(w.name.startswith(p) for p in _WORKER_PREFIXES):
+            continue
+
+        # Never deregister workers belonging to a different host.
+        if getattr(w, "hostname", None) and w.hostname != current_host:
             continue
 
         logger.info("Deregistering stale worker: %s (pid=%s)", w.name, w.pid)
@@ -104,41 +112,50 @@ def _run_worker(queue_names: list[str], worker_name: str):
     worker.work(with_scheduler=False)
 
 
+def _spawn_worker(queue_names: list[str], worker_name: str) -> multiprocessing.Process:
+    p = multiprocessing.Process(
+        target=_run_worker,
+        args=(queue_names, worker_name),
+        daemon=False,
+    )
+    p.start()
+    return p
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     # Import config here (not at module level) to avoid heavy transitive
     # imports in every subprocess before they actually need them.
-    from config import NUM_VIDEO_WORKERS, NUM_CLIP_WORKERS
+    from config import NUM_VIDEO_WORKERS, NUM_CLIP_WORKERS, validate_env
     from utils.redis_client import get_redis_connection
+
+    validate_env()
 
     # -- Clean up stale workers from a previous run -----------------------
     _startup_conn = get_redis_connection()
     _cleanup_stale_workers(_startup_conn)
 
-    processes: list[multiprocessing.Process] = []
+    processes: dict[str, multiprocessing.Process] = {}
+    worker_specs: dict[str, list[str]] = {}
 
     # -- Video-processing workers -----------------------------------------
     for i in range(NUM_VIDEO_WORKERS):
-        p = multiprocessing.Process(
-            target=_run_worker,
-            args=(["video-processing"], f"video-worker-{i}"),
-            daemon=True,
-        )
-        p.start()
-        processes.append(p)
+        name = f"video-worker-{i}"
+        queues = ["video-processing"]
+        p = _spawn_worker(queues, name)
+        processes[name] = p
+        worker_specs[name] = queues
         logger.info("Spawned video-worker-%d  (pid %d)", i, p.pid)
 
     # -- Clip-generation workers ------------------------------------------
     for i in range(NUM_CLIP_WORKERS):
-        p = multiprocessing.Process(
-            target=_run_worker,
-            args=(["clip-generation"], f"clip-worker-{i}"),
-            daemon=True,
-        )
-        p.start()
-        processes.append(p)
+        name = f"clip-worker-{i}"
+        queues = ["clip-generation"]
+        p = _spawn_worker(queues, name)
+        processes[name] = p
+        worker_specs[name] = queues
         logger.info("Spawned clip-worker-%d  (pid %d)", i, p.pid)
 
     total = NUM_VIDEO_WORKERS + NUM_CLIP_WORKERS
@@ -151,15 +168,30 @@ if __name__ == "__main__":
 
     # -- Keep the supervisor alive; Ctrl-C for graceful shutdown ----------
     try:
-        for p in processes:
-            p.join()
+        while True:
+            for name, p in list(processes.items()):
+                if p.is_alive():
+                    continue
+
+                exit_code = p.exitcode
+                logger.warning(
+                    "Worker %s exited unexpectedly (exit code %s). Restarting.",
+                    name,
+                    exit_code,
+                )
+                _cleanup_stale_workers(_startup_conn)
+                replacement = _spawn_worker(worker_specs[name], name)
+                processes[name] = replacement
+                logger.info("Respawned %s (pid %d)", name, replacement.pid)
+
+            time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Shutting down workers …")
 
         # Terminate subprocesses
-        for p in processes:
+        for p in processes.values():
             p.terminate()
-        for p in processes:
+        for p in processes.values():
             p.join(timeout=10)
 
         # Deregister from Redis so the next startup is clean
