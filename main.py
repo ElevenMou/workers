@@ -12,7 +12,6 @@ is controlled by ``NUM_VIDEO_WORKERS`` / ``NUM_CLIP_WORKERS`` env vars
 import logging
 import multiprocessing
 import os
-import socket
 import sys
 import time
 
@@ -23,10 +22,6 @@ logging.basicConfig(
     format="%(asctime)s  %(name)-28s [%(process)d] %(levelname)-7s %(message)s",
 )
 logger = logging.getLogger("clipry.worker")
-
-# Prefixes used for all worker names spawned by this supervisor
-_WORKER_PREFIXES = ("video-worker-", "clip-worker-")
-
 
 # ---------------------------------------------------------------------------
 # Windows compatibility - SimpleWorker without SIGALRM
@@ -55,13 +50,12 @@ def _worker_cls():
 # ---------------------------------------------------------------------------
 # Stale-worker cleanup
 # ---------------------------------------------------------------------------
-def _cleanup_stale_workers(conn):
-    """Remove Clipry worker registrations left in Redis from a previous run.
+def _cleanup_named_workers(conn, worker_names: set[str]):
+    """Remove Redis worker registrations for the exact provided names.
 
     RQ stores worker metadata in Redis.  If the supervisor was killed without
     a clean shutdown the old registrations persist and new workers with the
-    same names are rejected with ``ValueError``.  This function removes any
-    registrations whose names match our known prefixes.
+    same names are rejected with ``ValueError``.
     """
     try:
         existing = Worker.all(connection=conn)
@@ -69,14 +63,8 @@ def _cleanup_stale_workers(conn):
         logger.warning("Could not list existing workers: %s", exc)
         return
 
-    current_host = socket.gethostname()
-
     for w in existing:
-        if not any(w.name.startswith(p) for p in _WORKER_PREFIXES):
-            continue
-
-        # Never deregister workers belonging to a different host.
-        if getattr(w, "hostname", None) and w.hostname != current_host:
+        if w.name not in worker_names:
             continue
 
         logger.info("Deregistering stale worker: %s (pid=%s)", w.name, w.pid)
@@ -133,29 +121,33 @@ if __name__ == "__main__":
 
     validate_env()
 
-    # -- Clean up stale workers from a previous run -----------------------
-    _startup_conn = get_redis_connection()
-    _cleanup_stale_workers(_startup_conn)
-
-    processes: dict[str, multiprocessing.Process] = {}
     worker_specs: dict[str, list[str]] = {}
+    processes: dict[str, multiprocessing.Process] = {}
+
+    # Build the full worker name set first so cleanup can target exact names.
+    for i in range(NUM_VIDEO_WORKERS):
+        worker_specs[f"video-worker-{i}"] = ["video-processing"]
+    for i in range(NUM_CLIP_WORKERS):
+        worker_specs[f"clip-worker-{i}"] = ["clip-generation"]
+
+    # -- Clean up stale workers with the same names -----------------------
+    _startup_conn = get_redis_connection()
+    _cleanup_named_workers(_startup_conn, set(worker_specs.keys()))
 
     # -- Video-processing workers -----------------------------------------
     for i in range(NUM_VIDEO_WORKERS):
         name = f"video-worker-{i}"
-        queues = ["video-processing"]
+        queues = worker_specs[name]
         p = _spawn_worker(queues, name)
         processes[name] = p
-        worker_specs[name] = queues
         logger.info("Spawned video-worker-%d  (pid %d)", i, p.pid)
 
     # -- Clip-generation workers ------------------------------------------
     for i in range(NUM_CLIP_WORKERS):
         name = f"clip-worker-{i}"
-        queues = ["clip-generation"]
+        queues = worker_specs[name]
         p = _spawn_worker(queues, name)
         processes[name] = p
-        worker_specs[name] = queues
         logger.info("Spawned clip-worker-%d  (pid %d)", i, p.pid)
 
     total = NUM_VIDEO_WORKERS + NUM_CLIP_WORKERS
@@ -179,7 +171,7 @@ if __name__ == "__main__":
                     name,
                     exit_code,
                 )
-                _cleanup_stale_workers(_startup_conn)
+                _cleanup_named_workers(_startup_conn, {name})
                 replacement = _spawn_worker(worker_specs[name], name)
                 processes[name] = replacement
                 logger.info("Respawned %s (pid %d)", name, replacement.pid)
@@ -195,6 +187,6 @@ if __name__ == "__main__":
             p.join(timeout=10)
 
         # Deregister from Redis so the next startup is clean
-        _cleanup_stale_workers(_startup_conn)
+        _cleanup_named_workers(_startup_conn, set(worker_specs.keys()))
         logger.info("All workers stopped.")
         sys.exit(0)

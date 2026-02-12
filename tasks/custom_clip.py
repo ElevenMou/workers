@@ -9,7 +9,6 @@ import logging
 import os
 import shutil
 import traceback
-from datetime import datetime, timedelta
 
 import ffmpeg as ffmpeg_lib
 
@@ -103,8 +102,6 @@ def custom_clip_task(job_data: dict):
             thumbnail_url=video_data["thumbnail"],
             platform=video_data["platform"],
             external_id=video_data.get("external_id"),
-            raw_video_path=video_path,
-            raw_video_expires_at=(datetime.now() + timedelta(hours=24)).isoformat(),
         )
 
         # 2. Get transcript ----------------------------------------------------

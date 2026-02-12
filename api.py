@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, HttpUrl
 
 from config import CREDIT_COST_CLIP_GENERATION, calculate_video_analysis_cost, validate_env
+from services.video_downloader import VideoDownloader
 from utils.redis_client import enqueue_job
 from utils.supabase_client import assert_response_ok, supabase
 
@@ -17,6 +18,8 @@ logger = logging.getLogger("clipry.api")
 
 app = FastAPI(title="Clipry Workers API", version="1.0.0")
 validate_env()
+
+_WHISPER_READY: bool | None = None
 
 # Use string paths so the API process does not eagerly import heavy worker deps
 ANALYZE_TASK_PATH = "tasks.analyze_video.analyze_video_task"
@@ -79,6 +82,15 @@ class CreditsCostResponse(BaseModel):
     clipGenerationCredits: int
 
 
+class CreditsCostByUrlRequest(BaseModel):
+    url: HttpUrl
+
+
+class CreditsCostByUrlResponse(BaseModel):
+    valid_url: bool
+    cost: int
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -131,6 +143,25 @@ def _enqueue_or_fail(
         video_id,
         clip_id,
     )
+
+
+def _whisper_ready() -> bool:
+    """Lazily verify Whisper is usable on this server process."""
+    global _WHISPER_READY
+    if _WHISPER_READY is not None:
+        return _WHISPER_READY
+
+    try:
+        # Lazy import to avoid loading Whisper unless the cost endpoint needs it.
+        from services.transcriber import Transcriber
+
+        Transcriber()
+        _WHISPER_READY = True
+    except Exception as exc:
+        logger.warning("Whisper readiness check failed: %s", exc)
+        _WHISPER_READY = False
+
+    return _WHISPER_READY
 
 
 # ---------------------------------------------------------------------------
@@ -419,20 +450,36 @@ def custom_clip(payload: CustomClipRequest) -> GenerateClipResponse:
         status="queued",
     )
 
+@app.post("/credits/cost", response_model=CreditsCostByUrlResponse)
+def get_credit_cost_from_url(payload: CreditsCostByUrlRequest) -> CreditsCostByUrlResponse:
+    """Validate URL for clipping and return total credit cost.
 
-@app.get("/credits/cost", response_model=CreditsCostResponse)
-def get_credit_cost(durationSeconds: int) -> CreditsCostResponse:
-    if durationSeconds < 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="durationSeconds must be non-negative",
-        )
+    A URL is valid when yt-dlp can resolve a downloadable source and captions
+    are available either from the source metadata or through Whisper fallback.
+    """
+    url_str = str(payload.url)
+    downloader = VideoDownloader()
 
-    return CreditsCostResponse(
-        durationSeconds=durationSeconds,
-        analysisCredits=calculate_video_analysis_cost(durationSeconds),
-        clipGenerationCredits=CREDIT_COST_CLIP_GENERATION,
-    )
+    try:
+        probe = downloader.probe_url(url_str)
+    except Exception as exc:
+        logger.warning("URL validation failed for cost endpoint (%s): %s", url_str, exc)
+        return CreditsCostByUrlResponse(valid_url=False, cost=0)
+
+    duration_seconds = int(probe.get("duration_seconds") or 0)
+    can_download = bool(probe.get("can_download"))
+    has_source_captions = bool(probe.get("has_captions"))
+    has_audio = bool(probe.get("has_audio"))
+    can_use_whisper = has_audio and _whisper_ready()
+    has_captions = has_source_captions or can_use_whisper
+
+    valid_url = can_download and has_captions and duration_seconds > 0
+    if not valid_url:
+        return CreditsCostByUrlResponse(valid_url=False, cost=0)
+
+    analysis_cost = calculate_video_analysis_cost(duration_seconds)
+
+    return CreditsCostByUrlResponse(valid_url=True, cost=analysis_cost)
 
 
 if __name__ == "__main__":

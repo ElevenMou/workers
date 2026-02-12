@@ -8,6 +8,7 @@ import ffmpeg as ffmpeg_lib
 from config import CREDIT_COST_CLIP_GENERATION, TEMP_DIR
 from services.caption_renderer import extract_clip_segments, render_ass
 from services.clip_generator import ClipGenerator, compute_video_position
+from services.video_downloader import VideoDownloader
 from utils.supabase_client import (
     assert_response_ok,
     charge_clip_generation_credits,
@@ -42,6 +43,14 @@ _DEFAULT_CAPTIONS = {
     "position": "bottom",
     "maxWordsPerLine": 5,
 }
+
+
+def _probe_video_size(video_path: str) -> tuple[int, int]:
+    probe = ffmpeg_lib.probe(video_path)
+    v_stream = next((s for s in probe.get("streams", []) if s.get("codec_type") == "video"), None)
+    if v_stream is None:
+        raise RuntimeError(f"No video stream found in {video_path}")
+    return int(v_stream["width"]), int(v_stream["height"])
 
 
 def generate_clip_task(job_data: dict):
@@ -151,14 +160,37 @@ def generate_clip_task(job_data: dict):
         start_time = float(clip["start_time"])
         end_time = float(clip["end_time"])
 
-        # -- Compute video position for caption placement -------------------
-        video_file = clip["videos"]["raw_video_path"]
-        probe = ffmpeg_lib.probe(video_file)
-        v_stream = next(
-            s for s in probe["streams"] if s["codec_type"] == "video"
-        )
-        src_w = int(v_stream["width"])
-        src_h = int(v_stream["height"])
+        # -- Resolve source video path and dimensions -----------------------
+        video_file = clip["videos"].get("raw_video_path")
+        src_w: int | None = None
+        src_h: int | None = None
+
+        if video_file and os.path.isfile(video_file):
+            try:
+                src_w, src_h = _probe_video_size(video_file)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Existing raw video is not probeable (%s): %s",
+                    job_id,
+                    video_file,
+                    exc,
+                )
+                video_file = None
+        else:
+            video_file = None
+
+        if not video_file:
+            source_url = clip["videos"].get("url")
+            if not source_url:
+                raise RuntimeError("Missing source URL and raw_video_path for clip generation")
+
+            logger.info("[%s] Re-downloading source video for clip %s", job_id, clip_id)
+            downloader = VideoDownloader(work_dir=work_dir)
+            downloaded = downloader.download(source_url, clip["video_id"])
+            video_file = downloaded["path"]
+            src_w, src_h = _probe_video_size(video_file)
+
+        assert src_w is not None and src_h is not None
         _, vid_h, _, vid_y = compute_video_position(
             src_w, src_h, vid_cfg["widthPct"], vid_cfg["positionY"]
         )
@@ -194,7 +226,7 @@ def generate_clip_task(job_data: dict):
         # -- Generate clip ------------------------------------------------
         logger.info("[%s] Generating clip %s …", job_id, clip_id)
         result = generator.generate(
-            video_path=clip["videos"]["raw_video_path"],
+            video_path=video_file,
             clip_id=clip_id,
             start_time=start_time,
             end_time=end_time,
