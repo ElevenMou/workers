@@ -2,6 +2,7 @@ services:
   # ---------- Redis ----------
   redis:
     image: redis:7-alpine
+    container_name: redis
     ports:
       - "6379:6379"
     volumes:
@@ -15,6 +16,7 @@ services:
   # ---------- FastAPI ----------
   api:
     build: .
+    container_name: api
     command: uvicorn api:app --host 0.0.0.0 --port 8001
     ports:
       - "8001:8001"
@@ -26,6 +28,7 @@ services:
       - TEMP_DIR=${TEMP_DIR:-/tmp/video_clipper}
       - WHISPER_MODEL=${WHISPER_MODEL:-base}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - WORKER_SCALE_ADMIN_USER_IDS=${WORKER_SCALE_ADMIN_USER_IDS:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -33,6 +36,7 @@ services:
   # ---------- RQ Workers ----------
   workers:
     build: .
+    container_name: workers
     # Default CMD in the Dockerfile is already "python main.py"
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
@@ -44,8 +48,13 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - NUM_VIDEO_WORKERS=${NUM_VIDEO_WORKERS:-2}
       - NUM_CLIP_WORKERS=${NUM_CLIP_WORKERS:-2}
+      - RESET_WORKER_SCALE_ON_START=${RESET_WORKER_SCALE_ON_START:-true}
+      - FAIL_STARTED_JOBS_ON_START=${FAIL_STARTED_JOBS_ON_START:-true}
+      - FAIL_PROCESSING_ROWS_ON_START=${FAIL_PROCESSING_ROWS_ON_START:-true}
+      - PURGE_QUEUED_JOBS_ON_START=${PURGE_QUEUED_JOBS_ON_START:-false}
       - VIDEO_JOB_TIMEOUT=${VIDEO_JOB_TIMEOUT:-1800}
       - CLIP_JOB_TIMEOUT=${CLIP_JOB_TIMEOUT:-1800}
+      - RAW_VIDEO_CLEANUP_INTERVAL_SECONDS=${RAW_VIDEO_CLEANUP_INTERVAL_SECONDS:-300}
     volumes:
       - video_data:/tmp/video_clipper
     depends_on:

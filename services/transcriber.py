@@ -19,7 +19,7 @@ def _get_model():
     if _model is None:
         with _model_lock:
             if _model is None:  # double-check after acquiring lock
-                logger.info("Loading Whisper model '%s' …", WHISPER_MODEL)
+                logger.info("Loading Whisper model '%s' ...", WHISPER_MODEL)
                 _model = whisper.load_model(WHISPER_MODEL)
                 logger.info("Whisper model loaded.")
     return _model

@@ -14,3 +14,4 @@ youtube-transcript-api==1.2.4
 openai-whisper==20250625
 fastapi==0.115.0
 uvicorn==0.32.0
+pytest==8.3.4

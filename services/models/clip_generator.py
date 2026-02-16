@@ -1,0 +1,27 @@
+"""Clip generator model types."""
+
+from typing import TypedDict
+
+
+class QualityPreset(TypedDict):
+    crf: int
+    preset: str
+
+
+class ClipLayout(TypedDict):
+    vid_w: int
+    vid_h: int
+    vid_x: int
+    vid_y: int
+    title_padding_x: int
+    title_bar_y: int
+    title_bar_h: int
+    title_text_y: int
+
+
+class ClipGenerationResult(TypedDict):
+    clip_path: str
+    thumbnail_path: str
+    file_size: int
+    intermediates: list[str]
+

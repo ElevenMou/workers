@@ -32,6 +32,9 @@ NUM_VIDEO_WORKERS = int(os.getenv("NUM_VIDEO_WORKERS", 2))
 NUM_CLIP_WORKERS = int(os.getenv("NUM_CLIP_WORKERS", 2))
 VIDEO_JOB_TIMEOUT = int(os.getenv("VIDEO_JOB_TIMEOUT", 1800))  # 30 min
 CLIP_JOB_TIMEOUT = int(os.getenv("CLIP_JOB_TIMEOUT", 1800))  # 30 min
+RAW_VIDEO_CLEANUP_INTERVAL_SECONDS = int(
+    os.getenv("RAW_VIDEO_CLEANUP_INTERVAL_SECONDS", 300)
+)
 
 # ---------------------------------------------------------------------------
 # Credits - Dynamic pricing based on duration

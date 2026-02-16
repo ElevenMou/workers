@@ -62,7 +62,17 @@ REDIS_PORT=6379
 TEMP_DIR=/tmp/video_clipper
 WHISPER_MODEL=base
 ANTHROPIC_API_KEY=sk-ant-your-key
+WORKER_SCALE_ADMIN_USER_IDS=uuid-admin-1,uuid-admin-2
+PURGE_QUEUED_JOBS_ON_START=false
+FAIL_STARTED_JOBS_ON_START=true
+FAIL_PROCESSING_ROWS_ON_START=true
+RAW_VIDEO_CLEANUP_INTERVAL_SECONDS=300
 ```
+
+Notes:
+- `PURGE_QUEUED_JOBS_ON_START` now defaults to `false` and should stay `false` in production.
+- Use `WORKER_SCALE_ADMIN_USER_IDS` (comma-separated) to allow `/workers/scale` admin access.
+- Mutating API routes (`/videos/analyze`, `/clips/generate`, `/clips/custom`, `/workers/scale`) now require a valid `Authorization: Bearer <supabase-jwt>` header.
 
 ### 7) Test database connection
 
@@ -225,4 +235,3 @@ SELECT * FROM clips WHERE video_id = 'your-video-id';
 -- Credit balance
 SELECT * FROM credit_balances WHERE user_id = 'your-user-id';
 ```
-

@@ -1,7 +1,11 @@
-from anthropic import Anthropic
-import os
 import json
-from typing import List, Dict
+import logging
+import os
+from typing import Dict, List
+
+from anthropic import Anthropic
+
+logger = logging.getLogger(__name__)
 
 # Default to Sonnet for ~5x lower cost vs Opus; set CLAUDE_ANALYZER_MODEL for override
 # e.g. claude-3-5-haiku-20241022 (cheapest/fastest), claude-opus-4-20250514 (highest quality)
@@ -66,7 +70,7 @@ COUNT: Return exactly {num_clips} clip(s) if possible; fewer if video too short.
 
 EDITORIAL: High insight, strong opinions, actionable advice, emotional impact. Self-contained. No filler/intros/outros. Strong hook in first 3-5s. Rank by quality (1=best).
 
-OUTPUT: Valid JSON only. No markdown, no comments. Timestamps in numeric seconds. Schema: {{"clips": [{{"rank", "start_time", "end_time", "duration", "clip_title", "hook", "summary", "confidence_score", "tags"}}]}} max {num_clips} items. Verify duration = end_time - start_time and duration ≤ {max_duration}."""
+OUTPUT: Valid JSON only. No markdown, no comments. Timestamps in numeric seconds. Schema: {{"clips": [{{"rank", "start_time", "end_time", "duration", "clip_title", "hook", "summary", "confidence_score", "tags"}}]}} max {num_clips} items. Verify duration = end_time - start_time and duration <= {max_duration}."""
 
         user_message = f"""Extract {num_clips} clip(s). Use ONLY transcript timestamps. Return exactly {num_clips} if possible. Valid {min_duration}-{max_duration}s preferred; shorter OK.
 
@@ -115,5 +119,5 @@ Return ONLY valid JSON matching the schema."""
             return clips
 
         except Exception as e:
-            print(f"Error calling Claude API: {e}")
+            logger.exception("Claude analyzer call failed: %s", e)
             raise
