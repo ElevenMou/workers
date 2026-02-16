@@ -13,6 +13,7 @@ import traceback
 from config import CREDIT_COST_CLIP_GENERATION, TEMP_DIR
 from services.caption_renderer import normalize_caption_style
 from services.clip_generator import ClipGenerator, compute_video_position
+from services.clips.constants import canvas_size_for_aspect_ratio
 from services.video_downloader import VideoDownloader
 from tasks.clips.helpers.captions import build_caption_ass
 from tasks.clips.helpers.layout import (
@@ -246,6 +247,9 @@ def custom_clip_task(job_data: CustomClipJob):
             layout_overrides.layout_title,
             layout_overrides.layout_captions,
         )
+        canvas_aspect_ratio = str(vid_cfg.get("canvasAspectRatio") or "9:16")
+        video_scale_mode = str(vid_cfg.get("videoScaleMode") or "fit")
+        canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
         normalized_caption_style = normalize_caption_style(cap_cfg.get("style"))
 
         # Some styles need accurate per-word timing; if transcript is sentence-level
@@ -288,7 +292,13 @@ def custom_clip_task(job_data: CustomClipJob):
         # 4. Compute video position for caption placement ----------------------
         src_w, src_h = probe_video_size(video_path)
         _, vid_h, _, vid_y = compute_video_position(
-            src_w, src_h, vid_cfg["widthPct"], vid_cfg["positionY"]
+            src_w,
+            src_h,
+            vid_cfg["widthPct"],
+            vid_cfg["positionY"],
+            canvas_w=canvas_w,
+            canvas_h=canvas_h,
+            video_scale_mode=video_scale_mode,
         )
 
         caption_ass_path = build_caption_ass(
@@ -299,6 +309,8 @@ def custom_clip_task(job_data: CustomClipJob):
             normalized_caption_style=normalized_caption_style,
             start_time=start_time,
             end_time=end_time,
+            canvas_w=canvas_w,
+            canvas_h=canvas_h,
             vid_y=vid_y,
             vid_h=vid_h,
             work_dir=work_dir,
@@ -323,6 +335,8 @@ def custom_clip_task(job_data: CustomClipJob):
             # video layout
             video_width_pct=vid_cfg["widthPct"],
             video_position_y=vid_cfg["positionY"],
+            canvas_aspect_ratio=canvas_aspect_ratio,
+            video_scale_mode=video_scale_mode,
             # title style
             title_show=title_cfg["show"],
             title_font_size=title_cfg["fontSize"],

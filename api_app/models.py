@@ -56,6 +56,12 @@ class GenerateClipResponse(BaseModel):
     status: str
 
 
+class ClipLayoutOptionsResponse(BaseModel):
+    aspectRatios: list[str]
+    recommendedAspectRatio: str
+    videoScaleModes: list[str]
+
+
 class CreditsCostByUrlRequest(BaseModel):
     url: HttpUrl
 

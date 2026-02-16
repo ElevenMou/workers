@@ -18,6 +18,8 @@ def build_caption_ass(
     normalized_caption_style: str,
     start_time: float,
     end_time: float,
+    canvas_w: int,
+    canvas_h: int,
     vid_y: int,
     vid_h: int,
     work_dir: str,
@@ -56,8 +58,9 @@ def build_caption_ass(
         position=cap_cfg["position"],
         lines_per_page=cap_cfg.get("linesPerPage", 1),
         max_words_per_line=cap_cfg["maxWordsPerLine"],
+        canvas_w=canvas_w,
+        canvas_h=canvas_h,
         vid_y=vid_y,
         vid_h=vid_h,
         output_path=os.path.join(work_dir, f"{clip_id}.ass"),
     )
-

@@ -3,7 +3,12 @@
 import os
 
 from config import TEMP_DIR
-from services.clips.constants import CANVAS_W, QUALITY_PRESETS
+from services.clips.constants import (
+    DEFAULT_CANVAS_ASPECT_RATIO,
+    DEFAULT_VIDEO_SCALE_MODE,
+    QUALITY_PRESETS,
+    canvas_size_for_aspect_ratio,
+)
 from services.clips.ffmpeg_ops import (
     add_overlays,
     create_portrait_background,
@@ -32,6 +37,8 @@ class ClipGenerator:
         # -- video layout --
         video_width_pct: int = 100,
         video_position_y: str = "middle",
+        canvas_aspect_ratio: str = DEFAULT_CANVAS_ASPECT_RATIO,
+        video_scale_mode: str = DEFAULT_VIDEO_SCALE_MODE,
         # -- title style --
         title_show: bool = True,
         title_font_size: int = 48,
@@ -50,11 +57,12 @@ class ClipGenerator:
         blur_strength: int = 20,
         output_quality: str = "medium",
     ) -> ClipGenerationResult:
-        """Generate final portrait clip with title and optional captions."""
+        """Generate final clip with title and optional captions."""
         intermediates: list[str] = []
         qp = QUALITY_PRESETS.get(output_quality, QUALITY_PRESETS["medium"])
+        canvas_w, _ = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
 
-        max_text_w = CANVAS_W - 6 * title_padding_x
+        max_text_w = canvas_w - 6 * title_padding_x
         title_lines = wrap_title(title, title_font_size, max_text_w)
 
         raw_clip_path = os.path.join(self.temp_dir, f"{clip_id}_raw.mp4")
@@ -68,6 +76,8 @@ class ClipGenerator:
             title_font_size,
             title_padding_x,
             title_position_y,
+            canvas_aspect_ratio,
+            video_scale_mode,
             len(title_lines),
         )
 
@@ -76,11 +86,14 @@ class ClipGenerator:
             raw_clip_path,
             bg_clip_path,
             background_style,
+            layout["canvas_w"],
+            layout["canvas_h"],
             layout["vid_w"],
             layout["vid_h"],
             layout["vid_x"],
             layout["vid_y"],
             blur_strength,
+            video_scale_mode,
             qp,
             background_color=background_color,
             background_image_path=background_image_path,

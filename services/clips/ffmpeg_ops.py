@@ -6,7 +6,7 @@ from typing import Any
 
 import ffmpeg
 
-from services.clips.constants import CANVAS_H, CANVAS_W
+from services.clips.constants import normalize_video_scale_mode
 from services.clips.models import QualityPreset
 
 logger = logging.getLogger(__name__)
@@ -48,32 +48,52 @@ def create_portrait_background(
     input_path: str,
     output_path: str,
     style: str,
+    canvas_w: int,
+    canvas_h: int,
     vid_w: int,
     vid_h: int,
     vid_x: int,
     vid_y: int,
     blur_strength: int,
+    video_scale_mode: str,
     qp: QualityPreset,
     *,
     background_color: str = "#000000",
     background_image_path: str | None = None,
 ) -> None:
-    """Create 9:16 portrait canvas with source video over background."""
+    """Create canvas composition with source video over background."""
     logger.info(
-        "Creating portrait background (style=%s, blur=%d, color=%s, image=%s)",
+        "Creating canvas background (style=%s, %dx%d, blur=%d, color=%s, image=%s, mode=%s)",
         style,
+        canvas_w,
+        canvas_h,
         blur_strength,
         background_color,
         bool(background_image_path),
+        video_scale_mode,
     )
+    scale_mode = normalize_video_scale_mode(video_scale_mode)
+
+    def _foreground_video_stream():
+        stream = ffmpeg.input(input_path).filter(
+            "scale",
+            vid_w,
+            vid_h,
+            force_original_aspect_ratio="increase"
+            if scale_mode == "fill"
+            else "decrease",
+        )
+        if scale_mode == "fill":
+            stream = stream.filter("crop", vid_w, vid_h)
+        return stream
 
     if style == "blur":
         bg_temp = output_path + ".bg.mp4"
 
         (
             ffmpeg.input(input_path)
-            .filter("scale", CANVAS_W, CANVAS_H, force_original_aspect_ratio="increase")
-            .filter("crop", CANVAS_W, CANVAS_H)
+            .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase")
+            .filter("crop", canvas_w, canvas_h)
             .filter("boxblur", blur_strength)
             .output(bg_temp)
             .overwrite_output()
@@ -81,7 +101,7 @@ def create_portrait_background(
         )
 
         bg = ffmpeg.input(bg_temp)
-        video = ffmpeg.input(input_path).filter("scale", vid_w, vid_h)
+        video = _foreground_video_stream()
 
         (
             ffmpeg.filter([bg, video], "overlay", vid_x, vid_y)
@@ -104,10 +124,10 @@ def create_portrait_background(
         duration = float(probe["format"]["duration"])
 
         bg = ffmpeg.input(
-            f"color=c={background_color}:s={CANVAS_W}x{CANVAS_H}:d={duration}",
+            f"color=c={background_color}:s={canvas_w}x{canvas_h}:d={duration}",
             f="lavfi",
         )
-        video = ffmpeg.input(input_path).filter("scale", vid_w, vid_h)
+        video = _foreground_video_stream()
 
         (
             ffmpeg.filter([bg, video], "overlay", vid_x, vid_y)
@@ -129,8 +149,8 @@ def create_portrait_background(
 
         (
             ffmpeg.input(background_image_path)
-            .filter("scale", CANVAS_W, CANVAS_H, force_original_aspect_ratio="increase")
-            .filter("crop", CANVAS_W, CANVAS_H)
+            .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase")
+            .filter("crop", canvas_w, canvas_h)
             .output(bg_img_scaled, vframes=1)
             .overwrite_output()
             .run(quiet=True)
@@ -140,7 +160,7 @@ def create_portrait_background(
         duration = float(probe["format"]["duration"])
 
         bg = ffmpeg.input(bg_img_scaled, loop=1, t=duration, framerate=30)
-        video = ffmpeg.input(input_path).filter("scale", vid_w, vid_h)
+        video = _foreground_video_stream()
 
         (
             ffmpeg.filter([bg, video], "overlay", vid_x, vid_y)
@@ -160,9 +180,8 @@ def create_portrait_background(
         return
 
     (
-        ffmpeg.input(input_path)
-        .filter("scale", vid_w, vid_h)
-        .filter("pad", CANVAS_W, CANVAS_H, vid_x, vid_y, background_color)
+        _foreground_video_stream()
+        .filter("pad", canvas_w, canvas_h, vid_x, vid_y, background_color)
         .output(
             output_path,
             vcodec="libx264",

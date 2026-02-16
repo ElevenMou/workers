@@ -9,6 +9,8 @@ class QualityPreset(TypedDict):
 
 
 class ClipLayout(TypedDict):
+    canvas_w: int
+    canvas_h: int
     vid_w: int
     vid_h: int
     vid_x: int
@@ -24,4 +26,3 @@ class ClipGenerationResult(TypedDict):
     thumbnail_path: str
     file_size: int
     intermediates: list[str]
-

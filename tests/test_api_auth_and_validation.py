@@ -51,6 +51,15 @@ def test_unauthenticated_custom_clip_returns_401(client):
     assert response.status_code == 401
 
 
+def test_clip_layout_options_endpoint_exposes_aspect_and_scale_modes(client):
+    response = client.get("/clips/layout-options")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["recommendedAspectRatio"] == "9:16"
+    assert set(payload["aspectRatios"]) == {"9:16", "1:1", "4:5", "16:9"}
+    assert set(payload["videoScaleModes"]) == {"fit", "fill"}
+
+
 def test_generate_clip_rejects_non_owner(client, monkeypatch):
     from api_app.app import app
 
@@ -115,4 +124,3 @@ def test_credit_cost_endpoint_returns_explicit_fields(client, monkeypatch):
     assert payload["totalCredits"] == (
         payload["analysisCredits"] + payload["clipGenerationCredits"]
     )
-

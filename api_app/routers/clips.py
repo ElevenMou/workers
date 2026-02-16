@@ -8,6 +8,7 @@ from api_app.auth import AuthenticatedUser, get_current_user
 from api_app.constants import CUSTOM_CLIP_TASK_PATH, GENERATE_TASK_PATH
 from api_app.helpers import enqueue_or_fail, raise_on_error
 from api_app.models import (
+    ClipLayoutOptionsResponse,
     CustomClipRequest,
     GenerateClipRequest,
     GenerateClipResponse,
@@ -16,6 +17,22 @@ from api_app.state import logger
 from utils.supabase_client import supabase
 
 router = APIRouter()
+
+
+@router.get("/clips/layout-options", response_model=ClipLayoutOptionsResponse)
+def clip_layout_options() -> ClipLayoutOptionsResponse:
+    """Return supported clip canvas ratios and video scaling behavior."""
+    from api_app.constants import (
+        CANVAS_ASPECT_RATIO_OPTIONS,
+        RECOMMENDED_CANVAS_ASPECT_RATIO,
+        VIDEO_SCALE_MODE_OPTIONS,
+    )
+
+    return ClipLayoutOptionsResponse(
+        aspectRatios=CANVAS_ASPECT_RATIO_OPTIONS,
+        recommendedAspectRatio=RECOMMENDED_CANVAS_ASPECT_RATIO,
+        videoScaleModes=VIDEO_SCALE_MODE_OPTIONS,
+    )
 
 
 @router.post("/clips/generate", response_model=GenerateClipResponse)

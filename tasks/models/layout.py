@@ -6,6 +6,8 @@ from typing import Any, TypedDict
 class VideoLayout(TypedDict, total=False):
     widthPct: int
     positionY: str
+    canvasAspectRatio: str
+    videoScaleMode: str
 
 
 class TitleLayout(TypedDict, total=False):
@@ -46,7 +48,12 @@ class CaptionLayout(TypedDict, total=False):
     maxCharsPerCaption: int
 
 
-DEFAULT_VIDEO_LAYOUT: VideoLayout = {"widthPct": 100, "positionY": "middle"}
+DEFAULT_VIDEO_LAYOUT: VideoLayout = {
+    "widthPct": 100,
+    "positionY": "middle",
+    "canvasAspectRatio": "9:16",
+    "videoScaleMode": "fit",
+}
 DEFAULT_TITLE_LAYOUT: TitleLayout = {
     "show": True,
     "fontSize": 48,
@@ -95,4 +102,3 @@ def merge_layout_configs(
         {**DEFAULT_TITLE_LAYOUT, **(title_cfg or {})},
         {**DEFAULT_CAPTION_LAYOUT, **(caption_cfg or {})},
     )
-
