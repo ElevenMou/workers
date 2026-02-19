@@ -1,3 +1,6 @@
-"""Compatibility wrapper for caption animation effects."""
+"""Deprecated compatibility module.
 
-from services.captions.effects import *  # noqa: F401,F403
+Legacy effect helpers were removed in favor of preset-based ASS generation.
+"""
+
+__all__: list[str] = []

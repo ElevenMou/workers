@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import Any
+from pathlib import Path
 
 import ffmpeg
 
@@ -17,6 +17,132 @@ def safe_remove(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+def _resolve_caption_fonts_dir() -> str | None:
+    candidates = [
+        os.getenv("CAPTION_FONTS_DIR"),
+        os.path.join(os.getcwd(), "assets", "fonts"),
+        os.path.join(os.getcwd(), "fonts"),
+        "C:/Windows/Fonts",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def _normalize_ass_filter_path(path: str) -> str:
+    """Normalize filesystem path for FFmpeg ASS filename/fontsdir options."""
+    return path.replace("\\", "/")
+
+
+def _ass_escape(text: str) -> str:
+    return (
+        text.replace("\\", r"\\")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+        .replace("\n", r"\N")
+    )
+
+
+def _ass_time(seconds: float) -> str:
+    safe = max(0.0, float(seconds))
+    total_cs = int(round(safe * 100.0))
+    h = total_cs // 360000
+    m = (total_cs % 360000) // 6000
+    s = (total_cs % 6000) // 100
+    cs = total_cs % 100
+    return f"{h:02d}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def _hex_to_ass_color(value: str, fallback: str) -> str:
+    token = (value or "").strip()
+    if not token:
+        return fallback
+    if token.startswith("&H"):
+        return token.upper().rstrip("&")
+    named = {
+        "white": "&H00FFFFFF",
+        "black": "&H00000000",
+        "red": "&H000000FF",
+        "green": "&H0000FF00",
+        "blue": "&H00FF0000",
+        "yellow": "&H0000FFFF",
+    }
+    if token.lower() in named:
+        return named[token.lower()]
+    if token.startswith("#"):
+        raw = token.lstrip("#")
+        if len(raw) == 6:
+            r, g, b = raw[0:2], raw[2:4], raw[4:6]
+            return f"&H00{b}{g}{r}".upper()
+        if len(raw) == 8:
+            a, r, g, b = raw[0:2], raw[2:4], raw[4:6], raw[6:8]
+            return f"&H{a}{b}{g}{r}".upper()
+    return fallback
+
+
+def _build_title_ass(
+    *,
+    title_lines: list[str],
+    duration_seconds: float,
+    output_path: str,
+    canvas_w: int,
+    canvas_h: int,
+    title_font_size: int,
+    title_font_color: str,
+    title_font_family: str,
+    title_align: str,
+    title_stroke_width: int,
+    title_stroke_color: str,
+    title_padding_x: int,
+    title_text_y: int,
+) -> str | None:
+    if not title_lines:
+        return None
+
+    font_name = title_font_family or "Montserrat-Bold"
+    primary = _hex_to_ass_color(title_font_color, "&H00FFFFFF")
+    outline = _hex_to_ass_color(title_stroke_color, "&H00000000")
+    line_height = int(title_font_size * 1.3)
+    align_tag = r"\an8" if title_align == "center" else r"\an7"
+    x = canvas_w // 2 if title_align == "center" else max(0, int(title_padding_x))
+
+    lines: list[str] = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "ScaledBorderAndShadow: yes",
+        f"PlayResX: {canvas_w}",
+        f"PlayResY: {canvas_h}",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding",
+        (
+            "Style: Title,"
+            f"{font_name},{title_font_size},{primary},{primary},"
+            f"{outline},&H80000000,-1,0,0,0,100,100,0,0,1,"
+            f"{max(0, int(title_stroke_width))},0,7,0,0,0,1"
+        ),
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    start = _ass_time(0.0)
+    end = _ass_time(max(0.1, duration_seconds))
+    for idx, line in enumerate(title_lines):
+        y = max(0, int(title_text_y + (idx * line_height)))
+        tag = rf"{{{align_tag}\pos({x},{y})}}"
+        lines.append(f"Dialogue: 0,{start},{end},Title,,0,0,0,,{tag}{_ass_escape(line)}")
+
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
 
 
 def extract_segment(
@@ -230,6 +356,7 @@ def add_overlays(
     audio = ffmpeg.input(audio_path)
 
     stream = video
+    temp_files: list[str] = []
     if title_show and title_lines:
         if title_bar_enabled:
             stream = stream.drawbox(
@@ -240,39 +367,58 @@ def add_overlays(
                 color=title_bar_color,
                 t="fill",
             )
-
-        line_height = int(title_font_size * 1.3)
-        for i, line_text in enumerate(title_lines):
-            if title_align == "center":
-                text_x = "(w-text_w)/2"
-            else:
-                text_x = str(title_padding_x)
-
-            line_y = title_text_y + i * line_height
-
-            dt_kwargs: dict[str, Any] = {
-                "text": line_text,
-                "fontsize": title_font_size,
-                "fontcolor": title_font_color,
-                "x": text_x,
-                "y": str(line_y),
-            }
-            if title_font_family:
-                dt_kwargs["font"] = title_font_family
-
-            if title_stroke_width > 0:
-                dt_kwargs["borderw"] = title_stroke_width
-                dt_kwargs["bordercolor"] = title_stroke_color
-            else:
-                dt_kwargs["shadowcolor"] = "black@0.7"
-                dt_kwargs["shadowx"] = 2
-                dt_kwargs["shadowy"] = 2
-
-            stream = stream.drawtext(**dt_kwargs)
+        try:
+            probe = ffmpeg.probe(video_path)
+            duration_seconds = float(probe["format"]["duration"])
+            v_stream = next(
+                (s for s in probe.get("streams", []) if s.get("codec_type") == "video"),
+                {},
+            )
+            canvas_w = int(v_stream.get("width", 1080))
+            canvas_h = int(v_stream.get("height", 1920))
+            title_ass_path = _build_title_ass(
+                title_lines=title_lines,
+                duration_seconds=duration_seconds,
+                output_path=f"{output_path}.title.ass",
+                canvas_w=canvas_w,
+                canvas_h=canvas_h,
+                title_font_size=title_font_size,
+                title_font_color=title_font_color,
+                title_font_family=title_font_family,
+                title_align=title_align,
+                title_stroke_width=title_stroke_width,
+                title_stroke_color=title_stroke_color,
+                title_padding_x=title_padding_x,
+                title_text_y=title_text_y,
+            )
+            if title_ass_path:
+                temp_files.append(title_ass_path)
+                normalized_title_ass = _normalize_ass_filter_path(title_ass_path)
+                fonts_dir = _resolve_caption_fonts_dir()
+                if fonts_dir:
+                    normalized_fonts = _normalize_ass_filter_path(fonts_dir)
+                    stream = stream.filter(
+                        "ass",
+                        filename=normalized_title_ass,
+                        fontsdir=normalized_fonts,
+                    )
+                else:
+                    stream = stream.filter("ass", filename=normalized_title_ass)
+        except Exception:
+            logger.exception("Failed to build title ASS; continuing without title text overlay")
 
     if caption_ass_path and os.path.isfile(caption_ass_path):
-        escaped_path = caption_ass_path.replace("\\", "/").replace(":", "\\:")
-        stream = stream.filter("subtitles", escaped_path)
+        normalized_ass_path = _normalize_ass_filter_path(caption_ass_path)
+        fonts_dir = _resolve_caption_fonts_dir()
+        if fonts_dir:
+            normalized_fonts_dir = _normalize_ass_filter_path(fonts_dir)
+            stream = stream.filter(
+                "ass",
+                filename=normalized_ass_path,
+                fontsdir=normalized_fonts_dir,
+            )
+        else:
+            stream = stream.filter("ass", filename=normalized_ass_path)
 
     try:
         (
@@ -294,6 +440,9 @@ def add_overlays(
         stderr_output = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
         logger.error("FFmpeg overlay failed:\n%s", stderr_output)
         raise
+    finally:
+        for temp_file in temp_files:
+            safe_remove(temp_file)
 
 
 def generate_thumbnail(video_path: str, output_path: str) -> None:

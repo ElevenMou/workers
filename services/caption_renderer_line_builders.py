@@ -1,3 +1,6 @@
-"""Compatibility wrapper for caption line builders."""
+"""Deprecated compatibility module.
 
-from services.captions.line_builders import *  # noqa: F401,F403
+Legacy line-builder helpers were removed in favor of preset-based ASS generation.
+"""
+
+__all__: list[str] = []

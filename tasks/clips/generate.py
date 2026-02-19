@@ -4,7 +4,6 @@ import shutil
 import traceback
 
 from config import CREDIT_COST_CLIP_GENERATION, TEMP_DIR
-from services.caption_renderer import normalize_caption_style
 from services.clip_generator import ClipGenerator, compute_video_position
 from services.clips.constants import canvas_size_for_aspect_ratio
 from services.video_downloader import VideoDownloader
@@ -130,7 +129,6 @@ def generate_clip_task(job_data: GenerateClipJob):
     canvas_aspect_ratio = str(vid_cfg.get("canvasAspectRatio") or "9:16")
     video_scale_mode = str(vid_cfg.get("videoScaleMode") or "fit")
     canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
-    normalized_caption_style = normalize_caption_style(cap_cfg.get("style"))
 
     # -- Per-clip working directory for isolation -------------------------
     work_dir = os.path.join(TEMP_DIR, f"clip_{clip_id}")
@@ -222,13 +220,13 @@ def generate_clip_task(job_data: GenerateClipJob):
             clip_id=clip_id,
             transcript=clip["videos"].get("transcript"),
             cap_cfg=cap_cfg,
-            normalized_caption_style=normalized_caption_style,
             start_time=start_time,
             end_time=end_time,
             canvas_w=canvas_w,
             canvas_h=canvas_h,
             vid_y=vid_y,
             vid_h=vid_h,
+            video_aspect_ratio=canvas_aspect_ratio,
             work_dir=work_dir,
             logger=logger,
         )

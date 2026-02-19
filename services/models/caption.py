@@ -1,68 +1,38 @@
-"""Caption renderer model types."""
+"""Shared caption model types (preset-driven ASS rendering)."""
+
+from __future__ import annotations
 
 from typing import Literal, TypedDict
 
-CaptionStyle = Literal[
-    "animated",
-    "grouped",
-    "headline",
-    "lowercase",
-    "progressive",
-    "punctuated",
-    "static",
-    "two_line",
-    "uppercase",
-    "word_by_word",
-]
-FontCase = Literal["as_typed", "uppercase", "lowercase", "headline"]
+AnimationType = Literal["fade", "slide_up", "pop", "karaoke", "none"]
 
 
-class CaptionTemplate(TypedDict):
+class CaptionAnimation(TypedDict):
+    type: AnimationType
+    duration: float
+
+
+class CaptionTemplate(TypedDict, total=False):
     show: bool
-    style: CaptionStyle
-    animation: str
-    fontSize: int
-    fontColor: str
-    fontFamily: str
-    fontWeight: str
-    fontCase: FontCase
-    italic: bool
-    underline: bool
-    strokeColor: str
-    strokeThickness: int
-    shadowColor: str
-    shadowX: int
-    shadowY: int
-    shadowBlur: int
-    highlightColor: str
+    presetName: str
+    animation: AnimationType
     position: str
-    linesPerPage: int
-    maxWordsPerLine: int
+    fontSize: int
+    fontFamily: str
+    fontColor: str
+    highlightColor: str
+    strokeColor: str
+    shadowColor: str
     maxCharsPerCaption: int
+    maxLines: int
+    lineDelay: float
+    uppercase: bool
+    wordHighlight: bool
+    backgroundBox: bool
 
 
-class CaptionTemplateOverrides(TypedDict, total=False):
-    show: bool
-    style: CaptionStyle
-    animation: str
-    fontSize: int
-    fontColor: str
-    fontFamily: str
-    fontWeight: str
-    fontCase: FontCase
-    italic: bool
-    underline: bool
-    strokeColor: str
-    strokeThickness: int
-    shadowColor: str
-    shadowX: int
-    shadowY: int
-    shadowBlur: int
-    highlightColor: str
-    position: str
-    linesPerPage: int
-    maxWordsPerLine: int
-    maxCharsPerCaption: int
+class CaptionTemplateOverrides(CaptionTemplate, total=False):
+    pass
 
 
 class CaptionPreset(TypedDict):
@@ -76,10 +46,14 @@ class CaptionPresetDefinition(TypedDict, total=False):
     id: str
     label: str
     description: str
-    style: CaptionStyle
-    animation: str
-    position: str
-    linesPerPage: int
-    maxWordsPerLine: int
     captions: CaptionTemplateOverrides
 
+
+__all__ = [
+    "AnimationType",
+    "CaptionAnimation",
+    "CaptionPreset",
+    "CaptionPresetDefinition",
+    "CaptionTemplate",
+    "CaptionTemplateOverrides",
+]

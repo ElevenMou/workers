@@ -1,19 +1,13 @@
-"""Caption feature model aliases."""
+"""Caption feature model aliases for the preset-driven ASS system."""
 
-from services.models.caption import (
+from services.captions.caption_presets import (
+    CaptionAnimation,
     CaptionPreset,
-    CaptionPresetDefinition,
-    CaptionStyle,
     CaptionTemplate,
-    CaptionTemplateOverrides,
-    FontCase,
 )
 
 __all__ = [
+    "CaptionAnimation",
     "CaptionPreset",
-    "CaptionPresetDefinition",
-    "CaptionStyle",
     "CaptionTemplate",
-    "CaptionTemplateOverrides",
-    "FontCase",
 ]

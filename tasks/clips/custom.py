@@ -11,7 +11,6 @@ import shutil
 import traceback
 
 from config import CREDIT_COST_CLIP_GENERATION, TEMP_DIR
-from services.caption_renderer import normalize_caption_style
 from services.clip_generator import ClipGenerator, compute_video_position
 from services.clips.constants import canvas_size_for_aspect_ratio
 from services.video_downloader import VideoDownloader
@@ -24,7 +23,6 @@ from tasks.clips.helpers.media import probe_video_size
 from tasks.models.jobs import CustomClipJob
 from tasks.models.layout import merge_layout_configs
 from tasks.videos.transcript import (
-    transcript_has_word_timing,
     transcribe_clip_window_with_whisper,
 )
 from utils.supabase_client import (
@@ -250,36 +248,6 @@ def custom_clip_task(job_data: CustomClipJob):
         canvas_aspect_ratio = str(vid_cfg.get("canvasAspectRatio") or "9:16")
         video_scale_mode = str(vid_cfg.get("videoScaleMode") or "fit")
         canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
-        normalized_caption_style = normalize_caption_style(cap_cfg.get("style"))
-
-        # Some styles need accurate per-word timing; if transcript is sentence-level
-        # only (e.g., YouTube), use clip-window Whisper to avoid drift.
-        needs_word_timing = normalized_caption_style in {
-            "animated",
-            "word_by_word",
-            "progressive",
-        }
-        if cap_cfg.get("show") and needs_word_timing and not transcript_has_word_timing(
-            transcript
-        ):
-            logger.info(
-                "[%s] Caption style '%s' needs word timing; switching to Whisper clip-window transcript",
-                job_id,
-                normalized_caption_style,
-            )
-            if not audio_path:
-                audio_path = downloader.extract_audio(video_path)
-            update_job_status(job_id, "processing", 30)
-            transcript = transcribe_clip_window_with_whisper(
-                audio_path=audio_path,
-                work_dir=work_dir,
-                clip_id=clip_id,
-                start_time=start_time,
-                end_time=end_time,
-                video_duration_seconds=duration_seconds,
-            )
-            partial_transcript = True
-            update_job_status(job_id, "processing", 45)
 
         bg_style, bg_image_path = maybe_download_layout_background_image(
             bg_style=bg_style,
@@ -306,13 +274,13 @@ def custom_clip_task(job_data: CustomClipJob):
             clip_id=clip_id,
             transcript=transcript,
             cap_cfg=cap_cfg,
-            normalized_caption_style=normalized_caption_style,
             start_time=start_time,
             end_time=end_time,
             canvas_w=canvas_w,
             canvas_h=canvas_h,
             vid_y=vid_y,
             vid_h=vid_h,
+            video_aspect_ratio=canvas_aspect_ratio,
             work_dir=work_dir,
             logger=logger,
         )

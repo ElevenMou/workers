@@ -26,6 +26,7 @@ class TitleLayout(TypedDict, total=False):
 
 class CaptionLayout(TypedDict, total=False):
     show: bool
+    presetName: str
     style: str
     animation: str
     fontSize: int
@@ -46,6 +47,11 @@ class CaptionLayout(TypedDict, total=False):
     linesPerPage: int
     maxWordsPerLine: int
     maxCharsPerCaption: int
+    maxLines: int
+    lineDelay: float
+    uppercase: bool
+    wordHighlight: bool
+    backgroundBox: bool
 
 
 DEFAULT_VIDEO_LAYOUT: VideoLayout = {
@@ -69,25 +75,32 @@ DEFAULT_TITLE_LAYOUT: TitleLayout = {
 }
 DEFAULT_CAPTION_LAYOUT: CaptionLayout = {
     "show": False,
-    "style": "animated",
+    "presetName": "clean_minimal",
+    "style": "clean_minimal",
     "animation": "none",
-    "fontSize": 42,
-    "fontColor": "white",
-    "fontFamily": "",
+    "fontSize": 68,
+    "fontColor": "&H00FFFFFF",
+    "fontFamily": "Montserrat-Bold",
     "fontWeight": "bold",
     "fontCase": "as_typed",
     "italic": False,
     "underline": False,
-    "strokeColor": "black",
+    "strokeColor": "&H00000000",
     "strokeThickness": 3,
-    "shadowColor": "#000000AA",
-    "shadowX": 2,
-    "shadowY": 2,
-    "shadowBlur": 2,
-    "highlightColor": "#FFD700",
+    "shadowColor": "&H80000000",
+    "shadowX": 1,
+    "shadowY": 1,
+    "shadowBlur": 1,
+    "highlightColor": "&H0000C8FF",
     "position": "auto",
-    "linesPerPage": 1,
+    "linesPerPage": 2,
     "maxWordsPerLine": 5,
+    "maxCharsPerCaption": 30,
+    "maxLines": 2,
+    "lineDelay": 0.0,
+    "uppercase": False,
+    "wordHighlight": False,
+    "backgroundBox": False,
 }
 
 

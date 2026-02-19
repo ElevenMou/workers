@@ -1,6 +1,8 @@
 import logging
 import os
+from glob import glob
 
+import ffmpeg as ffmpeg_lib
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 
@@ -19,8 +21,11 @@ class VideoDownloader:
     @staticmethod
     def _base_ydl_opts() -> dict:
         return {
-            "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best",
+            # Prefer separate A/V streams (merged locally), then muxed fallback.
+            # This avoids silent "video-only" files for sources with fragmented media.
+            "format": "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
             "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
+            "merge_output_format": "mp4",
             # Try multiple YouTube client profiles to avoid signature/403 issues
             "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
             # Set a desktop UA to reduce throttling/403
@@ -35,30 +40,82 @@ class VideoDownloader:
             "fragment_retries": 3,
         }
 
-    def download(self, url: str, video_id: str) -> dict:
-        """Download video and return metadata."""
-        output_path = os.path.join(self.temp_dir, f"{video_id}.mp4")
+    @staticmethod
+    def _has_audio_stream(video_path: str) -> bool:
+        try:
+            probe = ffmpeg_lib.probe(video_path)
+        except Exception as exc:
+            logger.warning("Failed to probe audio streams in %s: %s", video_path, exc)
+            return False
+        return any(s.get("codec_type") == "audio" for s in probe.get("streams", []))
 
+    @staticmethod
+    def _resolve_output_path(expected_path: str) -> str:
+        if os.path.isfile(expected_path):
+            return expected_path
+
+        base, _ = os.path.splitext(expected_path)
+        candidates = [p for p in glob(f"{base}.*") if os.path.isfile(p)]
+        if not candidates:
+            return expected_path
+        return max(candidates, key=os.path.getmtime)
+
+    def _download_with_opts(self, url: str, output_path: str, *, format_selector: str) -> dict:
         ydl_opts = self._base_ydl_opts()
         ydl_opts.update(
             {
+                "format": format_selector,
                 "outtmpl": output_path,
                 "quiet": False,
                 "no_warnings": False,
             }
         )
-
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            return ydl.extract_info(url, download=True)
 
-            return {
-                "path": output_path,
-                "title": info.get("title"),
-                "duration": info.get("duration"),
-                "thumbnail": info.get("thumbnail"),
-                "platform": info.get("extractor_key", "unknown").lower(),
-                "external_id": info.get("id"),
-            }
+    def download(self, url: str, video_id: str) -> dict:
+        """Download video and return metadata."""
+        output_path = os.path.join(self.temp_dir, f"{video_id}.mp4")
+
+        info = self._download_with_opts(
+            url,
+            output_path,
+            format_selector="bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
+        )
+        downloaded_path = self._resolve_output_path(output_path)
+
+        if not self._has_audio_stream(downloaded_path):
+            logger.warning(
+                "Downloaded media for %s has no audio stream; retrying with muxed A/V format",
+                video_id,
+            )
+            try:
+                os.remove(downloaded_path)
+            except OSError:
+                pass
+
+            info = self._download_with_opts(
+                url,
+                output_path,
+                format_selector=(
+                    "b[ext=mp4][height<=720][vcodec!=none][acodec!=none]/"
+                    "b[height<=720][vcodec!=none][acodec!=none]/"
+                    "b[vcodec!=none][acodec!=none]"
+                ),
+            )
+            downloaded_path = self._resolve_output_path(output_path)
+
+        if not self._has_audio_stream(downloaded_path):
+            logger.warning("Downloaded media for %s still has no audio stream", video_id)
+
+        return {
+            "path": downloaded_path,
+            "title": info.get("title"),
+            "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+            "platform": info.get("extractor_key", "unknown").lower(),
+            "external_id": info.get("id"),
+        }
 
     def probe_url(self, url: str) -> dict:
         """Validate URL with yt-dlp and return probe metadata.
