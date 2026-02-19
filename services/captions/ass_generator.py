@@ -289,6 +289,10 @@ def _animation_tag(
         pop_ms = max(1, duration_ms or 200)
         return rf"{{\t(0,{pop_ms},\fscx120\fscy120)}}"
 
+    if animation_type == "scale":
+        scale_ms = max(1, duration_ms or 220)
+        return rf"{{\t(0,{scale_ms},\fscx112\fscy112)}}"
+
     return ""
 
 
@@ -349,7 +353,10 @@ def _build_events(
         if not pages:
             continue
 
-        use_karaoke = wants_word_highlight and bool(segment.words)
+        # Word highlight must also work when source transcript has only line-level
+        # timing (e.g. YouTube captions). In that case we synthesize per-word
+        # timing in `_words_for_line_fallback` and still emit karaoke tags.
+        use_karaoke = wants_word_highlight and bool(words)
         for page in pages:
             start, end = _page_start_end(page, segment)
             delay_seconds = event_index * line_delay

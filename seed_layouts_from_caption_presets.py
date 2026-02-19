@@ -51,6 +51,7 @@ def _build_layout_rows(user_id: str, name_prefix: str) -> list[dict[str, Any]]:
     for preset in list_caption_presets():
         label = str(preset.get("label") or preset.get("id") or "Preset").strip()
         captions = dict(preset.get("captions") or {})
+        captions["show"] = True
         rows.append(
             {
                 "user_id": user_id,

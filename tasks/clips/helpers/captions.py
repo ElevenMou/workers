@@ -10,8 +10,17 @@ from services.caption_renderer import (
     extract_clip_segments,
     generate_ass_file,
     normalize_caption_style,
+    resolve_preset,
     to_ass_color,
 )
+from services.captions.positioning import compute_video_anchored_margin_v
+
+
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _overrides_from_layout(cap_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -99,9 +108,13 @@ def build_caption_ass(
     logger: logging.Logger,
 ) -> str | None:
     """Render caption ASS file from transcript and caption config."""
-    del canvas_w, canvas_h, vid_y, vid_h
-
     if not cap_cfg.get("show"):
+        logger.info(
+            "[%s] Captions disabled by layout config (show=%r, preset=%r)",
+            job_id,
+            cap_cfg.get("show"),
+            cap_cfg.get("presetName") or cap_cfg.get("style"),
+        )
         return None
     if not transcript or not transcript.get("segments"):
         logger.warning("[%s] Captions requested but no transcript available", job_id)
@@ -116,6 +129,34 @@ def build_caption_ass(
     preset_name = normalize_caption_style(str(requested_preset))
     logger.info("[%s] Building caption preset '%s' ...", job_id, preset_name)
 
+    overrides = _overrides_from_layout(cap_cfg)
+    resolved_preset = resolve_preset(preset_name, overrides=overrides)
+    requested_position = str(
+        overrides.get("position") or cap_cfg.get("position") or "auto"
+    ).strip().lower()
+    if requested_position in {"top", "bottom"}:
+        inset = _to_int(
+            resolved_preset.get(
+                "safe_margin_y" if requested_position == "top" else "margin_v"
+            ),
+            _to_int(resolved_preset.get("margin_v"), 80),
+        )
+        anchored_margin = compute_video_anchored_margin_v(
+            position=requested_position,
+            canvas_h=canvas_h,
+            vid_y=vid_y,
+            vid_h=vid_h,
+            inset=inset,
+        )
+        if anchored_margin is not None:
+            overrides["margin_v"] = anchored_margin
+            logger.info(
+                "[%s] Caption position '%s' anchored to video bounds (margin_v=%d)",
+                job_id,
+                requested_position,
+                anchored_margin,
+            )
+
     segments = extract_clip_segments(transcript, start_time, end_time)
     if not segments:
         return None
@@ -125,5 +166,5 @@ def build_caption_ass(
         preset_name=preset_name,
         output_path=os.path.join(work_dir, f"{clip_id}.ass"),
         video_aspect_ratio=video_aspect_ratio,
-        overrides=_overrides_from_layout(cap_cfg),
+        overrides=overrides,
     )

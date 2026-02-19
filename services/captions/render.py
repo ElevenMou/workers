@@ -6,6 +6,14 @@ from typing import Any
 
 from services.captions.ass_generator import generate_ass_file
 from services.captions.caption_presets import normalize_caption_style, to_ass_color
+from services.captions.positioning import compute_video_anchored_margin_v
+
+
+def _to_int(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def render_ass(
@@ -40,7 +48,7 @@ def render_ass(
 
     The legacy style/mode args are mapped to the new preset architecture.
     """
-    del font_weight, shadow_x, shadow_y, vid_y, vid_h
+    del font_weight, shadow_x, shadow_y
 
     preset_name = normalize_caption_style(style)
     words_to_char_ratio = 6
@@ -65,6 +73,16 @@ def render_ass(
         "italic": bool(italic),
         "underline": bool(underline),
     }
+
+    anchored_margin = compute_video_anchored_margin_v(
+        position=position,
+        canvas_h=canvas_h,
+        vid_y=vid_y,
+        vid_h=vid_h,
+        inset=_to_int(overrides.get("margin_v"), 80),
+    )
+    if anchored_margin is not None:
+        overrides["margin_v"] = anchored_margin
 
     video_aspect_ratio = "16:9" if canvas_w >= canvas_h else "9:16"
     transcript_json = {"segments": segments}
