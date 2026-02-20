@@ -263,11 +263,19 @@ def _animation_tag(
     animation = preset.get("animation") or {"type": "none", "duration": 0.0}
     animation_type = str(animation.get("type", "none"))
     duration_ms = max(0, int(round(_to_float(animation.get("duration"), 0.0) * 1000.0)))
+
     if animation_type == "fade":
         fade_ms = max(1, duration_ms or 200)
         return rf"{{\fad({fade_ms},{fade_ms})}}"
 
+    if animation_type == "pop":
+        pop_ms = max(1, duration_ms or 120)
+        # Scale overshoot: start at 130%, ease down to 100%
+        return rf"{{\fscx130\fscy130\t(0,{pop_ms},0.4,\fscx100\fscy100)}}"
+
     if animation_type == "slide_up":
+        slide_ms = max(1, duration_ms or 150)
+        # Use \move relative to current position - slide up 9% of canvas height
         alignment = _to_int(preset.get("alignment"), 2)
         column = _alignment_column(alignment)
         margin_l = _to_int(preset.get("margin_l"), _to_int(preset.get("safe_margin_x"), 56))
@@ -283,16 +291,26 @@ def _animation_tag(
 
         end_y = play_res[1] - margin_v
         start_y = end_y + int(play_res[1] * 0.09)
-        return rf"{{\move({x},{start_y},{x},{end_y})}}"
+        return rf"{{\move({x},{start_y},{x},{end_y},0,{slide_ms})}}"
 
-    if animation_type == "pop":
-        pop_ms = max(1, duration_ms or 200)
-        return rf"{{\t(0,{pop_ms},\fscx120\fscy120)}}"
+    if animation_type == "bounce":
+        # Multi-stage scale bounce: 130% -> 92% -> 105% -> 100%
+        t1 = max(1, (duration_ms or 220) // 3)
+        t2 = t1 * 2
+        t3 = t1 * 3
+        return (
+            rf"{{\fscx130\fscy130"
+            rf"\t(0,{t1},\fscx92\fscy92)"
+            rf"\t({t1},{t2},\fscx105\fscy105)"
+            rf"\t({t2},{t3},\fscx100\fscy100)}}"
+        )
 
-    if animation_type == "scale":
-        scale_ms = max(1, duration_ms or 220)
-        return rf"{{\t(0,{scale_ms},\fscx112\fscy112)}}"
+    if animation_type == "glow":
+        glow_ms = max(1, duration_ms or 200)
+        # Start blurred, resolve to sharp
+        return rf"{{\blur4\t(0,{glow_ms},\blur0)}}"
 
+    # "karaoke" and "none" return empty - karaoke is handled via \kf tags
     return ""
 
 
@@ -308,7 +326,7 @@ def _karaoke_text(
         for word in line_words:
             token = _line_text([word], uppercase=uppercase, cleanup_punctuation=cleanup_punctuation)
             centis = max(1, int(round((word.end - word.start) * 100.0)))
-            fragments.append(rf"{{\k{centis}}}{_escape_ass_text(token)}")
+            fragments.append(rf"{{\kf{centis}}}{_escape_ass_text(token)}")
         lines.append(" ".join(fragment for fragment in fragments if fragment))
     return r"\N".join(lines)
 
@@ -329,6 +347,62 @@ def _static_text(
     return r"\N".join(lines)
 
 
+def _build_word_by_word_events(
+    pages: list[list[list[WordToken]]],
+    segment: SegmentToken,
+    preset: dict[str, Any],
+    *,
+    uppercase: bool,
+    cleanup_punctuation: bool,
+    animation_tag: str,
+    line_delay: float,
+    event_index: int,
+) -> list[DialogueEvent]:
+    """Generate accumulating word-by-word events for each page."""
+    events: list[DialogueEvent] = []
+
+    for page in pages:
+        flat_words = [word for line in page for word in line]
+        if not flat_words:
+            continue
+
+        page_start, page_end = _page_start_end(page, segment)
+
+        for word_idx, word in enumerate(flat_words):
+            # Each event shows all words up to current, with animation on the newest
+            accumulated = flat_words[:word_idx + 1]
+
+            event_start = word.start + (event_index * line_delay)
+            # Event lasts until next word starts or page ends
+            if word_idx + 1 < len(flat_words):
+                event_end = flat_words[word_idx + 1].start + (event_index * line_delay)
+            else:
+                event_end = page_end + (event_index * line_delay)
+
+            if event_end <= event_start:
+                event_end = event_start + _MIN_EVENT_DURATION_SECONDS
+
+            # Build text: previous words plain, current word gets animation tag
+            parts: list[str] = []
+            for i, w in enumerate(accumulated):
+                token = _line_text([w], uppercase=uppercase, cleanup_punctuation=cleanup_punctuation)
+                escaped = _escape_ass_text(token)
+                parts.append(escaped)
+
+            text = " ".join(parts)
+            if not text:
+                continue
+
+            events.append(DialogueEvent(
+                start=event_start,
+                end=event_end,
+                text=text,
+                animation_tag=animation_tag,
+            ))
+
+    return events
+
+
 def _build_events(
     transcript_segments: list[SegmentToken],
     preset: CaptionPreset,
@@ -340,11 +414,13 @@ def _build_events(
     uppercase = bool(preset.get("uppercase", False))
     cleanup_punctuation = bool(preset.get("punctuation_cleanup", True))
     line_delay = max(0.0, _to_float(preset.get("line_delay"), 0.0))
+    style = str(preset.get("style", "grouped"))
     wants_word_highlight = bool(preset.get("word_highlight", False))
     animation_tag = _animation_tag(preset, play_res=play_res)
 
     events: list[DialogueEvent] = []
     event_index = 0
+
     for segment in transcript_segments:
         words = _words_for_line_fallback(segment)
         if not words:
@@ -353,34 +429,44 @@ def _build_events(
         if not pages:
             continue
 
-        # Word highlight must also work when source transcript has only line-level
-        # timing (e.g. YouTube captions). In that case we synthesize per-word
-        # timing in `_words_for_line_fallback` and still emit karaoke tags.
-        use_karaoke = wants_word_highlight and bool(words)
-        for page in pages:
-            start, end = _page_start_end(page, segment)
-            delay_seconds = event_index * line_delay
-            start += delay_seconds
-            end += delay_seconds
-            if end <= start:
-                end = start + _MIN_EVENT_DURATION_SECONDS
+        if style == "word_by_word":
+            # Each word appears individually with animation
+            events.extend(_build_word_by_word_events(
+                pages, segment, preset,
+                uppercase=uppercase,
+                cleanup_punctuation=cleanup_punctuation,
+                animation_tag=animation_tag,
+                line_delay=line_delay,
+                event_index=event_index,
+            ))
+            event_index += sum(len(line) for page in pages for line in page)
+        elif style == "karaoke" or (wants_word_highlight and bool(words)):
+            # All words visible but use \kf tags for progressive fill
+            for page in pages:
+                start, end = _page_start_end(page, segment)
+                delay_seconds = event_index * line_delay
+                start += delay_seconds
+                end += delay_seconds
+                if end <= start:
+                    end = start + _MIN_EVENT_DURATION_SECONDS
+                text = _karaoke_text(page, uppercase=uppercase, cleanup_punctuation=cleanup_punctuation)
+                if text:
+                    events.append(DialogueEvent(start=start, end=end, text=text, animation_tag=animation_tag))
+                    event_index += 1
+        else:
+            # grouped (default): one event per page
+            for page in pages:
+                start, end = _page_start_end(page, segment)
+                delay_seconds = event_index * line_delay
+                start += delay_seconds
+                end += delay_seconds
+                if end <= start:
+                    end = start + _MIN_EVENT_DURATION_SECONDS
+                text = _static_text(page, uppercase=uppercase, cleanup_punctuation=cleanup_punctuation)
+                if text:
+                    events.append(DialogueEvent(start=start, end=end, text=text, animation_tag=animation_tag))
+                    event_index += 1
 
-            text = (
-                _karaoke_text(page, uppercase=uppercase, cleanup_punctuation=cleanup_punctuation)
-                if use_karaoke
-                else _static_text(page, uppercase=uppercase, cleanup_punctuation=cleanup_punctuation)
-            )
-            if not text:
-                continue
-            events.append(
-                DialogueEvent(
-                    start=start,
-                    end=end,
-                    text=text,
-                    animation_tag=animation_tag,
-                )
-            )
-            event_index += 1
     return events
 
 

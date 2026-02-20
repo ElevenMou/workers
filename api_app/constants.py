@@ -8,6 +8,8 @@ CUSTOM_CLIP_TASK_PATH = "tasks.custom_clip.custom_clip_task"
 CAPTION_FONT_CASES = ["as_typed", "uppercase", "lowercase"]
 CAPTION_POSITIONS = ["auto", "top", "middle", "bottom"]
 CAPTION_LINES_PER_PAGE_OPTIONS = [1, 2, 3]
+CAPTION_STYLES = ["grouped", "word_by_word", "karaoke"]
+CAPTION_ANIMATIONS = ["none", "fade", "pop", "slide_up", "bounce", "glow", "karaoke"]
 
 CANVAS_ASPECT_RATIO_OPTIONS = ["9:16", "1:1", "4:5", "16:9"]
 VIDEO_SCALE_MODE_OPTIONS = ["fit", "fill"]

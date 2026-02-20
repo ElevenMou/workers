@@ -3,9 +3,11 @@
 from fastapi import APIRouter
 
 from api_app.constants import (
+    CAPTION_ANIMATIONS,
     CAPTION_FONT_CASES,
     CAPTION_LINES_PER_PAGE_OPTIONS,
     CAPTION_POSITIONS,
+    CAPTION_STYLES,
 )
 from api_app.models import (
     CaptionModesResponse,
@@ -31,8 +33,8 @@ def caption_modes() -> CaptionModesResponse:
 def caption_options() -> CaptionOptionsResponse:
     """Return caption options for CapCut-like UI controls."""
     return CaptionOptionsResponse(
-        modes=list_supported_styles(),
-        animations=list_animation_presets(),
+        styles=CAPTION_STYLES,
+        animations=CAPTION_ANIMATIONS,
         presets=list_caption_presets(),
         fontCases=CAPTION_FONT_CASES,
         positions=CAPTION_POSITIONS,

@@ -88,6 +88,17 @@ def _overrides_from_layout(cap_cfg: dict[str, Any]) -> dict[str, Any]:
     if isinstance(animation, str) and animation.strip():
         overrides["animation"] = animation.strip()
 
+    # Map the new style field ("grouped", "word_by_word", "karaoke").
+    # When style is "karaoke", also enable word_highlight so the ASS
+    # generator uses \kf tags for progressive fill.
+    style = cap_cfg.get("style")
+    if isinstance(style, str) and style.strip():
+        normalized_style = style.strip().lower()
+        if normalized_style in {"grouped", "word_by_word", "karaoke"}:
+            overrides["style"] = normalized_style
+            if normalized_style == "karaoke":
+                overrides["word_highlight"] = True
+
     return overrides
 
 
@@ -124,7 +135,7 @@ def build_caption_ass(
         cap_cfg.get("presetName")
         or cap_cfg.get("preset")
         or cap_cfg.get("style")
-        or "clean_minimal"
+        or "clean"
     )
     preset_name = normalize_caption_style(str(requested_preset))
     logger.info("[%s] Building caption preset '%s' ...", job_id, preset_name)

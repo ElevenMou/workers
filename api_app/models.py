@@ -78,7 +78,7 @@ class CaptionModesResponse(BaseModel):
 
 
 class CaptionOptionsResponse(BaseModel):
-    modes: list[str]
+    styles: list[str]
     animations: list[str]
     presets: list[dict]
     fontCases: list[str]
