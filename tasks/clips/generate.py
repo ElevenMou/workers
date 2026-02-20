@@ -24,6 +24,19 @@ from utils.supabase_client import (
 
 logger = logging.getLogger(__name__)
 
+_VIDEO_UPLOAD_OPTIONS = {"content-type": "video/mp4", "cache-control": "3600"}
+_THUMBNAIL_UPLOAD_OPTIONS = {"content-type": "image/jpeg", "cache-control": "3600"}
+
+
+def _update_clip_job_progress(job_id: str, progress: int, stage: str):
+    """Persist clip-generation progress plus machine-readable stage."""
+    update_job_status(
+        job_id,
+        "processing",
+        progress,
+        result_data={"stage": stage},
+    )
+
 
 def _best_effort_cleanup_uploaded_artifacts(
     *,
@@ -107,28 +120,7 @@ def generate_clip_task(job_data: GenerateClipJob):
     job_id = job_data["jobId"]
     clip_id = job_data["clipId"]
     user_id = job_data["userId"]
-
     layout_id = job_data.get("layoutId")
-    layout_overrides = load_layout_overrides(
-        user_id=user_id,
-        layout_id=layout_id,
-        job_id=job_id,
-        logger=logger,
-    )
-    bg_style = layout_overrides.bg_style
-    bg_color = layout_overrides.bg_color
-    blur_strength = layout_overrides.blur_strength
-    output_quality = layout_overrides.output_quality
-
-    # Unpack nested style dicts (layout values override task defaults)
-    vid_cfg, title_cfg, cap_cfg = merge_layout_configs(
-        layout_overrides.layout_video,
-        layout_overrides.layout_title,
-        layout_overrides.layout_captions,
-    )
-    canvas_aspect_ratio = str(vid_cfg.get("canvasAspectRatio") or "9:16")
-    video_scale_mode = str(vid_cfg.get("videoScaleMode") or "fit")
-    canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
 
     # -- Per-clip working directory for isolation -------------------------
     work_dir = os.path.join(TEMP_DIR, f"clip_{clip_id}")
@@ -136,20 +128,15 @@ def generate_clip_task(job_data: GenerateClipJob):
 
     generator = ClipGenerator(work_dir=work_dir)
 
-    bg_style, bg_image_path = maybe_download_layout_background_image(
-        bg_style=bg_style,
-        bg_image_storage_path=layout_overrides.bg_image_storage_path,
-        work_dir=work_dir,
-        job_id=job_id,
-        logger=logger,
-    )
-
     storage_path: str | None = None
     thumbnail_path: str | None = None
     uploaded_storage_path: str | None = None
     uploaded_thumbnail_path: str | None = None
 
     try:
+        _update_clip_job_progress(job_id, 0, "starting")
+        _update_clip_job_progress(job_id, 5, "loading_clip")
+
         # Get clip and video details
         clip_resp = (
             supabase.table("clips")
@@ -163,18 +150,47 @@ def generate_clip_task(job_data: GenerateClipJob):
         if not clip:
             raise Exception(f"Clip {clip_id} not found")
 
-        update_job_status(job_id, "processing", 0)
-
         # Update clip status
         clip_status_resp = supabase.table("clips").update({"status": "generating"}).eq(
             "id", clip_id
         ).execute()
         assert_response_ok(clip_status_resp, f"Failed to mark clip {clip_id} generating")
 
+        _update_clip_job_progress(job_id, 12, "loading_layout")
+        layout_overrides = load_layout_overrides(
+            user_id=user_id,
+            layout_id=layout_id,
+            job_id=job_id,
+            logger=logger,
+        )
+        bg_style = layout_overrides.bg_style
+        bg_color = layout_overrides.bg_color
+        blur_strength = layout_overrides.blur_strength
+        output_quality = layout_overrides.output_quality
+
+        # Unpack nested style dicts (layout values override task defaults)
+        vid_cfg, title_cfg, cap_cfg = merge_layout_configs(
+            layout_overrides.layout_video,
+            layout_overrides.layout_title,
+            layout_overrides.layout_captions,
+        )
+        canvas_aspect_ratio = str(vid_cfg.get("canvasAspectRatio") or "9:16")
+        video_scale_mode = str(vid_cfg.get("videoScaleMode") or "fit")
+        canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
+
+        bg_style, bg_image_path = maybe_download_layout_background_image(
+            bg_style=bg_style,
+            bg_image_storage_path=layout_overrides.bg_image_storage_path,
+            work_dir=work_dir,
+            job_id=job_id,
+            logger=logger,
+        )
+
         start_time = float(clip["start_time"])
         end_time = float(clip["end_time"])
 
         # -- Resolve source video path and dimensions -----------------------
+        _update_clip_job_progress(job_id, 20, "preparing_source_video")
         video_file = clip["videos"].get("raw_video_path")
         src_w: int | None = None
         src_h: int | None = None
@@ -198,6 +214,7 @@ def generate_clip_task(job_data: GenerateClipJob):
             if not source_url:
                 raise RuntimeError("Missing source URL and raw_video_path for clip generation")
 
+            _update_clip_job_progress(job_id, 30, "downloading_source_video")
             logger.info("[%s] Re-downloading source video for clip %s", job_id, clip_id)
             downloader = VideoDownloader(work_dir=work_dir)
             downloaded = downloader.download(source_url, clip["video_id"])
@@ -210,11 +227,15 @@ def generate_clip_task(job_data: GenerateClipJob):
             src_h,
             vid_cfg["widthPct"],
             vid_cfg["positionY"],
+            vid_cfg.get("customX"),
+            vid_cfg.get("customY"),
+            vid_cfg.get("customWidth"),
             canvas_w=canvas_w,
             canvas_h=canvas_h,
             video_scale_mode=video_scale_mode,
         )
 
+        _update_clip_job_progress(job_id, 40, "preparing_captions")
         caption_ass_path = build_caption_ass(
             job_id=job_id,
             clip_id=clip_id,
@@ -232,6 +253,7 @@ def generate_clip_task(job_data: GenerateClipJob):
         )
 
         # -- Generate clip ------------------------------------------------
+        _update_clip_job_progress(job_id, 60, "rendering_clip")
         logger.info("[%s] Generating clip %s ...", job_id, clip_id)
         result = generator.generate(
             video_path=video_file,
@@ -245,6 +267,9 @@ def generate_clip_task(job_data: GenerateClipJob):
             # video layout
             video_width_pct=vid_cfg["widthPct"],
             video_position_y=vid_cfg["positionY"],
+            video_custom_x=vid_cfg.get("customX"),
+            video_custom_y=vid_cfg.get("customY"),
+            video_custom_width=vid_cfg.get("customWidth"),
             canvas_aspect_ratio=canvas_aspect_ratio,
             video_scale_mode=video_scale_mode,
             # title style
@@ -259,6 +284,9 @@ def generate_clip_task(job_data: GenerateClipJob):
             title_bar_color=title_cfg["barColor"],
             title_padding_x=title_cfg["paddingX"],
             title_position_y=title_cfg["positionY"],
+            title_custom_x=title_cfg.get("customX"),
+            title_custom_y=title_cfg.get("customY"),
+            title_custom_width=title_cfg.get("customWidth"),
             # captions
             caption_ass_path=caption_ass_path,
             # misc
@@ -266,23 +294,32 @@ def generate_clip_task(job_data: GenerateClipJob):
             output_quality=output_quality,
         )
 
-        update_job_status(job_id, "processing", 90)
-
         # Upload to Supabase Storage
         storage_path = f"clips/{clip_id}.mp4"
         thumbnail_path = f"thumbnails/{clip_id}.jpg"
 
+        _update_clip_job_progress(job_id, 80, "uploading_clip")
         logger.info("[%s] Uploading clip to storage ...", job_id)
 
         with open(result["clip_path"], "rb") as f:
-            supabase.storage.from_("generated-clips").upload(storage_path, f)
+            supabase.storage.from_("generated-clips").upload(
+                storage_path,
+                f,
+                file_options=_VIDEO_UPLOAD_OPTIONS,
+            )
         uploaded_storage_path = storage_path
 
+        _update_clip_job_progress(job_id, 86, "uploading_thumbnail")
         with open(result["thumbnail_path"], "rb") as f:
-            supabase.storage.from_("thumbnails").upload(thumbnail_path, f)
+            supabase.storage.from_("thumbnails").upload(
+                thumbnail_path,
+                f,
+                file_options=_THUMBNAIL_UPLOAD_OPTIONS,
+            )
         uploaded_thumbnail_path = thumbnail_path
 
         # Charge credits atomically before finalizing clip completion status.
+        _update_clip_job_progress(job_id, 92, "charging_credits")
         charge_clip_generation_credits(
             user_id=user_id,
             amount=CREDIT_COST_CLIP_GENERATION,
@@ -292,6 +329,7 @@ def generate_clip_task(job_data: GenerateClipJob):
         )
 
         # Update clip record
+        _update_clip_job_progress(job_id, 97, "finalizing")
         clip_update = {
             "status": "completed",
             "storage_path": storage_path,
@@ -310,6 +348,7 @@ def generate_clip_task(job_data: GenerateClipJob):
             "completed",
             100,
             result_data={
+                "stage": "completed",
                 "storage_path": storage_path,
                 "thumbnail_path": thumbnail_path,
                 "file_size": result["file_size"],

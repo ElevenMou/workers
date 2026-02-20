@@ -905,80 +905,99 @@ def resolve_preset(
     resolved_name = normalize_caption_style(preset_name)
     base_preset = PRESETS.get(resolved_name) or PRESETS[CAPTION_TEMPLATE_DEFAULTS["presetName"]]
     base = deepcopy(base_preset.to_style_dict())
-    if not overrides:
-        return base
+    if overrides:
+        for raw_key, value in overrides.items():
+            key_name = _normalize_override_key(str(raw_key))
 
-    for raw_key, value in overrides.items():
-        key_name = _normalize_override_key(str(raw_key))
-
-        if key_name == "animation":
-            if isinstance(value, Mapping):
-                base["animation"] = _normalize_animation_config(dict(value))
-            else:
-                current = dict(base.get("animation") or {})
-                current["type"] = _normalize_animation(str(value))
-                current.setdefault("duration", 0.2)
-                current.setdefault("delay_between_words", 0.05)
-                base["animation"] = _normalize_animation_config(current)
-            continue
-
-        if key_name in {"primary_color", "secondary_color", "outline_color", "back_color", "highlight_color"}:
-            fallback = base.get(key_name, "&H00FFFFFF")
-            base[key_name] = to_ass_color(str(value), fallback=str(fallback))
-            if key_name == "highlight_color" and bool(base.get("word_highlight")):
-                base["secondary_color"] = base["highlight_color"]
-            continue
-
-        if key_name in {
-            "font_size",
-            "outline",
-            "shadow",
-            "margin_v",
-            "margin_l",
-            "margin_r",
-            "margin_h",
-            "max_words_per_line",
-            "max_chars_per_line",
-            "max_lines",
-            "safe_margin_x",
-            "safe_margin_y",
-            "background_padding",
-            "alignment",
-        }:
-            try:
-                casted = int(value)
-            except (TypeError, ValueError):
+            if key_name == "animation":
+                if isinstance(value, Mapping):
+                    base["animation"] = _normalize_animation_config(dict(value))
+                else:
+                    current = dict(base.get("animation") or {})
+                    current["type"] = _normalize_animation(str(value))
+                    current.setdefault("duration", 0.2)
+                    current.setdefault("delay_between_words", 0.05)
+                    base["animation"] = _normalize_animation_config(current)
                 continue
-            base[key_name] = casted
-            if key_name == "margin_h":
-                base["margin_l"] = casted
-                base["margin_r"] = casted
-            if key_name == "max_words_per_line" and "max_chars_per_line" not in overrides:
-                base["max_chars_per_line"] = max(12, casted * 6)
-            continue
 
-        if key_name in {
-            "bold",
-            "italic",
-            "word_highlight",
-            "background_box",
-            "uppercase",
-            "safe_area",
-        }:
-            base[key_name] = bool(value)
-            if key_name == "word_highlight" and bool(value):
-                base["secondary_color"] = base.get("highlight_color", base["secondary_color"])
-            continue
+            if key_name in {"primary_color", "secondary_color", "outline_color", "back_color", "highlight_color"}:
+                fallback = base.get(key_name, "&H00FFFFFF")
+                base[key_name] = to_ass_color(str(value), fallback=str(fallback))
+                if key_name == "highlight_color" and bool(base.get("word_highlight")):
+                    base["secondary_color"] = base["highlight_color"]
+                continue
 
-        if key_name in {"line_delay"}:
-            base[key_name] = max(0.0, _as_float(value, 0.0))
-            continue
+            if key_name in {
+                "font_size",
+                "outline",
+                "shadow",
+                "margin_v",
+                "margin_l",
+                "margin_r",
+                "margin_h",
+                "max_words_per_line",
+                "max_chars_per_line",
+                "max_lines",
+                "safe_margin_x",
+                "safe_margin_y",
+                "background_padding",
+                "alignment",
+            }:
+                try:
+                    casted = int(value)
+                except (TypeError, ValueError):
+                    continue
+                base[key_name] = casted
+                if key_name == "margin_h":
+                    base["margin_l"] = casted
+                    base["margin_r"] = casted
+                if key_name == "max_words_per_line" and "max_chars_per_line" not in overrides:
+                    base["max_chars_per_line"] = max(12, casted * 6)
+                continue
 
-        if key_name in {"position", "font_name", "label", "description", "style"}:
-            base[key_name] = str(value)
-            continue
+            if key_name in {
+                "bold",
+                "italic",
+                "word_highlight",
+                "background_box",
+                "uppercase",
+                "safe_area",
+            }:
+                base[key_name] = bool(value)
+                if key_name == "word_highlight" and bool(value):
+                    base["secondary_color"] = base.get("highlight_color", base["secondary_color"])
+                continue
 
-        base[key_name] = value
+            if key_name in {"line_delay"}:
+                base[key_name] = max(0.0, _as_float(value, 0.0))
+                continue
+
+            if key_name in {"position", "font_name", "label", "description", "style"}:
+                base[key_name] = str(value)
+                continue
+
+            base[key_name] = value
+
+    style_name = str(base.get("style", "grouped")).strip().lower()
+    uses_karaoke_fill = style_name == "karaoke" or (
+        bool(base.get("word_highlight")) and style_name != "word_by_word"
+    )
+    if uses_karaoke_fill:
+        # ASS karaoke (\k/\kf) fills from Secondary -> Primary.
+        # To match UI semantics:
+        # - fontColor = base text color
+        # - highlightColor = sweep/highlight color
+        # we must map:
+        # - Primary = highlight
+        # - Secondary = base
+        base_text_color = to_ass_color(str(base.get("primary_color")), fallback="&H00FFFFFF")
+        highlight_color = to_ass_color(
+            str(base.get("highlight_color")),
+            fallback=base_text_color,
+        )
+        base["highlight_color"] = highlight_color
+        base["primary_color"] = highlight_color
+        base["secondary_color"] = base_text_color
 
     return base
 
@@ -987,6 +1006,19 @@ def resolve_caption_preset(preset: str | None) -> dict[str, Any]:
     """Return frontend caption template payload for the chosen preset."""
     cfg = resolve_preset(preset)
     animation = cfg.get("animation") or {"type": "none", "duration": 0.0, "delay_between_words": 0.0}
+    style_name = str(cfg.get("style", "grouped")).strip().lower()
+    uses_karaoke_fill = style_name == "karaoke" or (
+        bool(cfg.get("word_highlight")) and style_name != "word_by_word"
+    )
+    # resolve_preset maps colors for ASS karaoke semantics (Primary=highlight, Secondary=base).
+    # For frontend template payload keep semantic fields:
+    # - fontColor = base text
+    # - highlightColor = highlight sweep
+    font_color = (
+        str(cfg.get("secondary_color", CAPTION_TEMPLATE_DEFAULTS["fontColor"]))
+        if uses_karaoke_fill
+        else str(cfg.get("primary_color", CAPTION_TEMPLATE_DEFAULTS["fontColor"]))
+    )
     return {
         **CAPTION_TEMPLATE_DEFAULTS,
         "show": True,
@@ -995,7 +1027,7 @@ def resolve_caption_preset(preset: str | None) -> dict[str, Any]:
         "position": cfg.get("position", "auto"),
         "fontSize": int(cfg.get("font_size", CAPTION_TEMPLATE_DEFAULTS["fontSize"])),
         "fontFamily": str(cfg.get("font_name", CAPTION_TEMPLATE_DEFAULTS["fontFamily"])),
-        "fontColor": str(cfg.get("primary_color", CAPTION_TEMPLATE_DEFAULTS["fontColor"])),
+        "fontColor": font_color,
         "highlightColor": str(cfg.get("highlight_color", CAPTION_TEMPLATE_DEFAULTS["highlightColor"])),
         "strokeColor": str(cfg.get("outline_color", CAPTION_TEMPLATE_DEFAULTS["strokeColor"])),
         "shadowColor": str(cfg.get("back_color", CAPTION_TEMPLATE_DEFAULTS["shadowColor"])),

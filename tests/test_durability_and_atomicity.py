@@ -38,3 +38,54 @@ def test_clip_tasks_charge_before_marking_completed():
     assert custom_code.index("charge_clip_generation_credits(") < custom_code.index(
         "clip_update = {"
     )
+
+
+def test_clip_tasks_emit_stage_progress_updates():
+    generate_code = (
+        _repo_root() / "workers" / "tasks" / "clips" / "generate.py"
+    ).read_text(encoding="utf-8")
+    custom_code = (
+        _repo_root() / "workers" / "tasks" / "clips" / "custom.py"
+    ).read_text(encoding="utf-8")
+
+    generate_stages = [
+        '"starting"',
+        '"loading_clip"',
+        '"loading_layout"',
+        '"preparing_source_video"',
+        '"preparing_captions"',
+        '"rendering_clip"',
+        '"uploading_clip"',
+        '"uploading_thumbnail"',
+        '"charging_credits"',
+        '"finalizing"',
+    ]
+    for stage in generate_stages:
+        assert stage in generate_code
+
+    custom_stages = [
+        '"starting"',
+        '"downloading_video"',
+        '"loading_layout"',
+        '"preparing_captions"',
+        '"rendering_clip"',
+        '"uploading_clip"',
+        '"uploading_thumbnail"',
+        '"charging_credits"',
+        '"finalizing"',
+    ]
+    for stage in custom_stages:
+        assert stage in custom_code
+
+
+def test_clip_uploads_set_media_content_types():
+    generate_code = (
+        _repo_root() / "workers" / "tasks" / "clips" / "generate.py"
+    ).read_text(encoding="utf-8")
+    custom_code = (
+        _repo_root() / "workers" / "tasks" / "clips" / "custom.py"
+    ).read_text(encoding="utf-8")
+
+    for code in (generate_code, custom_code):
+        assert '"content-type": "video/mp4"' in code
+        assert '"content-type": "image/jpeg"' in code

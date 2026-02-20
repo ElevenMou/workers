@@ -26,6 +26,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=${REDIS_PORT:-6379}
       - TEMP_DIR=${TEMP_DIR:-/tmp/video_clipper}
+      - CAPTION_FONTS_DIR=${CAPTION_FONTS_DIR:-/app/assets/fonts}
       - WHISPER_MODEL=${WHISPER_MODEL:-base}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - WORKER_SCALE_ADMIN_USER_IDS=${WORKER_SCALE_ADMIN_USER_IDS:-}
@@ -44,6 +45,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=${REDIS_PORT:-6379}
       - TEMP_DIR=${TEMP_DIR:-/tmp/video_clipper}
+      - CAPTION_FONTS_DIR=${CAPTION_FONTS_DIR:-/app/assets/fonts}
       - WHISPER_MODEL=${WHISPER_MODEL:-base}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - NUM_VIDEO_WORKERS=${NUM_VIDEO_WORKERS:-2}

@@ -16,6 +16,8 @@ class ClipLayout(TypedDict):
     vid_x: int
     vid_y: int
     title_padding_x: int
+    title_bar_x: int
+    title_bar_w: int
     title_bar_y: int
     title_bar_h: int
     title_text_y: int

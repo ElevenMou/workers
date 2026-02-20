@@ -24,6 +24,8 @@ def _resolve_caption_fonts_dir() -> str | None:
         os.getenv("CAPTION_FONTS_DIR"),
         os.path.join(os.getcwd(), "assets", "fonts"),
         os.path.join(os.getcwd(), "fonts"),
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
         "C:/Windows/Fonts",
     ]
     for candidate in candidates:
@@ -98,6 +100,8 @@ def _build_title_ass(
     title_stroke_color: str,
     title_padding_x: int,
     title_text_y: int,
+    title_area_x: int,
+    title_area_w: int,
 ) -> str | None:
     if not title_lines:
         return None
@@ -107,7 +111,9 @@ def _build_title_ass(
     outline = _hex_to_ass_color(title_stroke_color, "&H00000000")
     line_height = int(title_font_size * 1.3)
     align_tag = r"\an8" if title_align == "center" else r"\an7"
-    x = canvas_w // 2 if title_align == "center" else max(0, int(title_padding_x))
+    area_x = max(0, int(title_area_x))
+    area_w = max(2, min(canvas_w - area_x, int(title_area_w)))
+    x = area_x + (area_w // 2) if title_align == "center" else area_x + max(0, int(title_padding_x))
 
     lines: list[str] = [
         "[Script Info]",
@@ -335,6 +341,8 @@ def add_overlays(
     title_stroke_color: str,
     title_bar_enabled: bool,
     title_bar_color: str,
+    title_bar_x: int,
+    title_bar_w: int,
     title_padding_x: int,
     title_bar_y: int,
     title_text_y: int,
@@ -360,9 +368,9 @@ def add_overlays(
     if title_show and title_lines:
         if title_bar_enabled:
             stream = stream.drawbox(
-                x=0,
+                x=max(0, int(title_bar_x)),
                 y=title_bar_y,
-                width="iw",
+                width=max(2, int(title_bar_w)),
                 height=title_bar_h,
                 color=title_bar_color,
                 t="fill",
@@ -390,6 +398,8 @@ def add_overlays(
                 title_stroke_color=title_stroke_color,
                 title_padding_x=title_padding_x,
                 title_text_y=title_text_y,
+                title_area_x=title_bar_x,
+                title_area_w=title_bar_w,
             )
             if title_ass_path:
                 temp_files.append(title_ass_path)

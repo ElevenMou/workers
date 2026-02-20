@@ -19,6 +19,16 @@ from utils.supabase_client import (
 logger = logging.getLogger(__name__)
 
 
+def _update_analysis_job_progress(job_id: str, progress: int, stage: str):
+    """Persist progress percentage plus a machine-readable stage label."""
+    update_job_status(
+        job_id,
+        "processing",
+        progress,
+        result_data={"stage": stage},
+    )
+
+
 def _best_effort_mark_failed(*, job_id: str, video_id: str, error_msg: str):
     try:
         update_job_status(job_id, "failed", 0, error_msg)
@@ -56,14 +66,15 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
     audio_path = None
 
     try:
-        update_job_status(job_id, "processing", 0)
+        _update_analysis_job_progress(job_id, 0, "starting")
         update_video_status(video_id, "downloading")
 
         # 1. Download video --------------------------------------------------
+        _update_analysis_job_progress(job_id, 5, "downloading_video")
         logger.info("[%s] Downloading video: %s", job_id, url)
         video_data = downloader.download(url, video_id)
         video_path = video_data["path"]
-        update_job_status(job_id, "processing", 20)
+        _update_analysis_job_progress(job_id, 20, "downloading_video")
 
         # Calculate credits based on duration
         duration_seconds = int(video_data["duration"])
@@ -95,26 +106,30 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         # 2. Get transcript ---------------------------------------------------
         transcript = None
         if video_data["platform"] == "youtube" and video_data.get("external_id"):
+            _update_analysis_job_progress(job_id, 35, "fetching_source_captions")
             logger.info("[%s] Attempting to get YouTube transcript ...", job_id)
             transcript = downloader.get_youtube_transcript(video_data["external_id"])
             if transcript:
                 logger.info("[%s] Got transcript from YouTube", job_id)
-                update_job_status(job_id, "processing", 60)
+                _update_analysis_job_progress(job_id, 60, "fetching_source_captions")
 
         if not transcript:
+            _update_analysis_job_progress(job_id, 35, "extracting_audio")
             logger.info("[%s] Extracting audio for Whisper transcription ...", job_id)
             audio_path = downloader.extract_audio(video_path)
-            update_job_status(job_id, "processing", 40)
+            _update_analysis_job_progress(job_id, 40, "extracting_audio")
 
+            _update_analysis_job_progress(job_id, 50, "transcribing_audio")
             logger.info("[%s] Transcribing with Whisper ...", job_id)
             transcript = transcriber.transcribe(audio_path)
             transcript["source"] = "whisper"
-            update_job_status(job_id, "processing", 60)
+            _update_analysis_job_progress(job_id, 60, "transcribing_audio")
 
         # 3. Analyse with Claude -----------------------------------------------
+        _update_analysis_job_progress(job_id, 70, "analyzing_transcript")
         logger.info("[%s] Analysing for %d clips with Claude ...", job_id, num_clips)
         clips = analyzer.find_best_clips(transcript, num_clips=num_clips)
-        update_job_status(job_id, "processing", 90)
+        _update_analysis_job_progress(job_id, 90, "saving_results")
 
         # 4. Save results -----------------------------------------------------
         logger.info("[%s] Saving results ...", job_id)
@@ -220,6 +235,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             inserted_count += 1
 
         # Charge credits atomically at finalization time.
+        _update_analysis_job_progress(job_id, 95, "charging_credits")
         charge_video_analysis_credits(
             user_id=user_id,
             amount=credits_required,
@@ -242,7 +258,9 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             f"Failed to finalize video metadata for {video_id}",
         )
 
+        _update_analysis_job_progress(job_id, 99, "finalizing")
         update_job_status(job_id, "completed", 100, result_data={
+            "stage": "completed",
             "clip_count": inserted_count,
             "duration_seconds": duration_seconds,
             "credits_charged": credits_required,

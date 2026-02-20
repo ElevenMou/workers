@@ -69,7 +69,6 @@ class CreditsCostByUrlRequest(BaseModel):
 class CreditsCostByUrlResponse(BaseModel):
     valid_url: bool
     analysisCredits: int
-    clipGenerationCredits: int
     totalCredits: int
 
 

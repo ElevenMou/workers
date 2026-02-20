@@ -6,6 +6,9 @@ from typing import Any, TypedDict
 class VideoLayout(TypedDict, total=False):
     widthPct: int
     positionY: str
+    customX: int
+    customY: int
+    customWidth: int
     canvasAspectRatio: str
     videoScaleMode: str
 
@@ -22,6 +25,9 @@ class TitleLayout(TypedDict, total=False):
     barColor: str
     paddingX: int
     positionY: str
+    customX: int
+    customY: int
+    customWidth: int
 
 
 class CaptionLayout(TypedDict, total=False):
@@ -52,26 +58,35 @@ class CaptionLayout(TypedDict, total=False):
     uppercase: bool
     wordHighlight: bool
     backgroundBox: bool
+    customX: int
+    customY: int
+    customWidth: int
 
 
 DEFAULT_VIDEO_LAYOUT: VideoLayout = {
     "widthPct": 100,
     "positionY": "middle",
+    "customX": 0,
+    "customY": 0,
+    "customWidth": 1080,
     "canvasAspectRatio": "9:16",
     "videoScaleMode": "fit",
 }
 DEFAULT_TITLE_LAYOUT: TitleLayout = {
     "show": True,
     "fontSize": 48,
-    "fontColor": "white",
+    "fontColor": "#FFFFFF",
     "fontFamily": "",
     "align": "left",
     "strokeWidth": 0,
-    "strokeColor": "black",
+    "strokeColor": "#000000",
     "barEnabled": True,
-    "barColor": "black@0.5",
+    "barColor": "#000000",
     "paddingX": 16,
     "positionY": "above_video",
+    "customX": 0,
+    "customY": 0,
+    "customWidth": 1080,
 }
 DEFAULT_CAPTION_LAYOUT: CaptionLayout = {
     "show": False,
@@ -79,19 +94,19 @@ DEFAULT_CAPTION_LAYOUT: CaptionLayout = {
     "style": "clean_minimal",
     "animation": "none",
     "fontSize": 68,
-    "fontColor": "&H00FFFFFF",
+    "fontColor": "#FFFFFF",
     "fontFamily": "Montserrat-Bold",
     "fontWeight": "bold",
     "fontCase": "as_typed",
     "italic": False,
     "underline": False,
-    "strokeColor": "&H00000000",
+    "strokeColor": "#000000",
     "strokeThickness": 3,
-    "shadowColor": "&H80000000",
+    "shadowColor": "#80000000",
     "shadowX": 1,
     "shadowY": 1,
     "shadowBlur": 1,
-    "highlightColor": "&H0000C8FF",
+    "highlightColor": "#FFC800",
     "position": "auto",
     "linesPerPage": 2,
     "maxWordsPerLine": 5,
@@ -101,6 +116,9 @@ DEFAULT_CAPTION_LAYOUT: CaptionLayout = {
     "uppercase": False,
     "wordHighlight": False,
     "backgroundBox": False,
+    "customX": 44,
+    "customY": 1460,
+    "customWidth": 992,
 }
 
 

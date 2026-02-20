@@ -35,6 +35,19 @@ from utils.supabase_client import (
 
 logger = logging.getLogger(__name__)
 
+_VIDEO_UPLOAD_OPTIONS = {"content-type": "video/mp4", "cache-control": "3600"}
+_THUMBNAIL_UPLOAD_OPTIONS = {"content-type": "image/jpeg", "cache-control": "3600"}
+
+
+def _update_clip_job_progress(job_id: str, progress: int, stage: str):
+    """Persist custom clip-generation progress plus machine-readable stage."""
+    update_job_status(
+        job_id,
+        "processing",
+        progress,
+        result_data={"stage": stage},
+    )
+
 
 def _best_effort_cleanup_uploaded_artifacts(
     *,
@@ -144,7 +157,7 @@ def custom_clip_task(job_data: CustomClipJob):
     uploaded_thumbnail_path: str | None = None
 
     try:
-        update_job_status(job_id, "processing", 0)
+        _update_clip_job_progress(job_id, 0, "starting")
         update_video_status(video_id, "downloading")
         clip_status_resp = supabase.table("clips").update({"status": "generating"}).eq(
             "id", clip_id
@@ -152,10 +165,11 @@ def custom_clip_task(job_data: CustomClipJob):
         assert_response_ok(clip_status_resp, f"Failed to mark clip {clip_id} generating")
 
         # 1. Download video ----------------------------------------------------
+        _update_clip_job_progress(job_id, 12, "downloading_video")
         logger.info("[%s] Downloading video: %s", job_id, url)
         video_data = downloader.download(url, video_id)
         video_path = video_data["path"]
-        update_job_status(job_id, "processing", 20)
+        _update_clip_job_progress(job_id, 20, "downloading_video")
 
         duration_seconds = int(video_data["duration"])
 
@@ -195,16 +209,19 @@ def custom_clip_task(job_data: CustomClipJob):
         if not transcript and video_data["platform"] == "youtube" and video_data.get(
             "external_id"
         ):
+            _update_clip_job_progress(job_id, 30, "fetching_source_captions")
             logger.info("[%s] Attempting to get YouTube transcript ...", job_id)
             transcript = downloader.get_youtube_transcript(video_data["external_id"])
             if transcript:
                 logger.info("[%s] Got transcript from YouTube", job_id)
 
         if not transcript:
+            _update_clip_job_progress(job_id, 30, "extracting_audio")
             logger.info("[%s] Extracting audio for Whisper transcription ...", job_id)
             audio_path = downloader.extract_audio(video_path)
-            update_job_status(job_id, "processing", 30)
+            _update_clip_job_progress(job_id, 38, "extracting_audio")
 
+            _update_clip_job_progress(job_id, 45, "transcribing_audio")
             transcript = transcribe_clip_window_with_whisper(
                 audio_path=audio_path,
                 work_dir=work_dir,
@@ -215,7 +232,7 @@ def custom_clip_task(job_data: CustomClipJob):
             )
             partial_transcript = True
 
-        update_job_status(job_id, "processing", 40)
+        _update_clip_job_progress(job_id, 52, "loading_layout")
 
         # Save transcript on video row only when it represents the full video.
         video_update = {"status": "completed"}
@@ -264,11 +281,15 @@ def custom_clip_task(job_data: CustomClipJob):
             src_h,
             vid_cfg["widthPct"],
             vid_cfg["positionY"],
+            vid_cfg.get("customX"),
+            vid_cfg.get("customY"),
+            vid_cfg.get("customWidth"),
             canvas_w=canvas_w,
             canvas_h=canvas_h,
             video_scale_mode=video_scale_mode,
         )
 
+        _update_clip_job_progress(job_id, 65, "preparing_captions")
         caption_ass_path = build_caption_ass(
             job_id=job_id,
             clip_id=clip_id,
@@ -285,9 +306,8 @@ def custom_clip_task(job_data: CustomClipJob):
             logger=logger,
         )
 
-        update_job_status(job_id, "processing", 50)
-
         # 6. Generate clip -----------------------------------------------------
+        _update_clip_job_progress(job_id, 75, "rendering_clip")
         generator = ClipGenerator(work_dir=work_dir)
         logger.info("[%s] Generating clip %s ...", job_id, clip_id)
 
@@ -303,6 +323,9 @@ def custom_clip_task(job_data: CustomClipJob):
             # video layout
             video_width_pct=vid_cfg["widthPct"],
             video_position_y=vid_cfg["positionY"],
+            video_custom_x=vid_cfg.get("customX"),
+            video_custom_y=vid_cfg.get("customY"),
+            video_custom_width=vid_cfg.get("customWidth"),
             canvas_aspect_ratio=canvas_aspect_ratio,
             video_scale_mode=video_scale_mode,
             # title style
@@ -317,6 +340,9 @@ def custom_clip_task(job_data: CustomClipJob):
             title_bar_color=title_cfg["barColor"],
             title_padding_x=title_cfg["paddingX"],
             title_position_y=title_cfg["positionY"],
+            title_custom_x=title_cfg.get("customX"),
+            title_custom_y=title_cfg.get("customY"),
+            title_custom_width=title_cfg.get("customWidth"),
             # captions
             caption_ass_path=caption_ass_path,
             # misc
@@ -324,23 +350,32 @@ def custom_clip_task(job_data: CustomClipJob):
             output_quality=output_quality,
         )
 
-        update_job_status(job_id, "processing", 90)
-
         # 7. Upload to Supabase Storage ----------------------------------------
         storage_path = f"clips/{clip_id}.mp4"
         thumbnail_path = f"thumbnails/{clip_id}.jpg"
 
+        _update_clip_job_progress(job_id, 84, "uploading_clip")
         logger.info("[%s] Uploading clip to storage ...", job_id)
 
         with open(result["clip_path"], "rb") as f:
-            supabase.storage.from_("generated-clips").upload(storage_path, f)
+            supabase.storage.from_("generated-clips").upload(
+                storage_path,
+                f,
+                file_options=_VIDEO_UPLOAD_OPTIONS,
+            )
         uploaded_storage_path = storage_path
 
+        _update_clip_job_progress(job_id, 88, "uploading_thumbnail")
         with open(result["thumbnail_path"], "rb") as f:
-            supabase.storage.from_("thumbnails").upload(thumbnail_path, f)
+            supabase.storage.from_("thumbnails").upload(
+                thumbnail_path,
+                f,
+                file_options=_THUMBNAIL_UPLOAD_OPTIONS,
+            )
         uploaded_thumbnail_path = thumbnail_path
 
         # 8. Charge credits before finalizing completion state -----------------
+        _update_clip_job_progress(job_id, 93, "charging_credits")
         charge_clip_generation_credits(
             user_id=user_id,
             amount=CREDIT_COST_CLIP_GENERATION,
@@ -350,6 +385,7 @@ def custom_clip_task(job_data: CustomClipJob):
         )
 
         # 9. Update clip record ------------------------------------------------
+        _update_clip_job_progress(job_id, 97, "finalizing")
         clip_update = {
             "status": "completed",
             "storage_path": storage_path,
@@ -363,11 +399,17 @@ def custom_clip_task(job_data: CustomClipJob):
         )
         assert_response_ok(clip_update_resp, f"Failed to finalize clip {clip_id}")
 
-        update_job_status(job_id, "completed", 100, result_data={
-            "storage_path": storage_path,
-            "thumbnail_path": thumbnail_path,
-            "file_size": result["file_size"],
-        })
+        update_job_status(
+            job_id,
+            "completed",
+            100,
+            result_data={
+                "stage": "completed",
+                "storage_path": storage_path,
+                "thumbnail_path": thumbnail_path,
+                "file_size": result["file_size"],
+            },
+        )
         logger.info("[%s] Custom clip completed: %s", job_id, clip_id)
 
     except Exception as e:

@@ -13,13 +13,13 @@ _VIDEO = {"widthPct": 100, "positionY": "middle"}
 _TITLE = {
     "show": True,
     "fontSize": 48,
-    "fontColor": "white",
+    "fontColor": "#FFFFFF",
     "fontFamily": "Montserrat",
     "align": "left",
     "strokeWidth": 0,
-    "strokeColor": "black",
+    "strokeColor": "#000000",
     "barEnabled": True,
-    "barColor": "black@0.5",
+    "barColor": "#000000",
     "paddingX": 16,
     "positionY": "above_video",
 }

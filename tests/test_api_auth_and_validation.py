@@ -120,7 +120,17 @@ def test_credit_cost_endpoint_returns_explicit_fields(client, monkeypatch):
     payload = response.json()
     assert payload["valid_url"] is True
     assert payload["analysisCredits"] >= 0
-    assert payload["clipGenerationCredits"] >= 0
-    assert payload["totalCredits"] == (
-        payload["analysisCredits"] + payload["clipGenerationCredits"]
+    assert payload["totalCredits"] == payload["analysisCredits"]
+
+
+def test_credit_cost_endpoint_allows_cors_preflight(client):
+    response = client.options(
+        "/credits/cost",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type",
+        },
     )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"

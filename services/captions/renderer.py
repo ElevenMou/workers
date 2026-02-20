@@ -30,6 +30,8 @@ def resolve_font_dir(
         os.getenv("CAPTION_FONTS_DIR"),
         str(Path(workspace_root or ".") / "assets" / "fonts"),
         str(Path(workspace_root or ".") / "fonts"),
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
         "C:/Windows/Fonts",
     ]
     for candidate in candidates:

@@ -23,7 +23,16 @@ def _to_int(value: Any, default: int) -> int:
         return default
 
 
-def _overrides_from_layout(cap_cfg: dict[str, Any]) -> dict[str, Any]:
+def _clamp(value: int, lower: int, upper: int) -> int:
+    return max(lower, min(upper, value))
+
+
+def _overrides_from_layout(
+    cap_cfg: dict[str, Any],
+    *,
+    canvas_w: int,
+    canvas_h: int,
+) -> dict[str, Any]:
     """Translate layout caption fields into preset override keys."""
     overrides: dict[str, Any] = {}
 
@@ -41,6 +50,7 @@ def _overrides_from_layout(cap_cfg: dict[str, Any]) -> dict[str, Any]:
 
     highlight_color = cap_cfg.get("highlightColor")
     if isinstance(highlight_color, str) and highlight_color.strip():
+        overrides["highlight_color"] = to_ass_color(highlight_color)
         overrides["secondary_color"] = to_ass_color(highlight_color)
 
     stroke_color = cap_cfg.get("strokeColor")
@@ -60,8 +70,26 @@ def _overrides_from_layout(cap_cfg: dict[str, Any]) -> dict[str, Any]:
         overrides["shadow"] = max(0, int(shadow_blur))
 
     position = cap_cfg.get("position")
-    if isinstance(position, str) and position.strip():
-        overrides["position"] = position.strip().lower()
+    normalized_position = (
+        str(position).strip().lower()
+        if isinstance(position, str) and position.strip()
+        else ""
+    )
+    if normalized_position == "custom":
+        box_width = _clamp(
+            _to_int(cap_cfg.get("customWidth"), canvas_w),
+            2,
+            max(2, canvas_w),
+        )
+        box_x = max(0, (canvas_w - box_width) // 2)
+        box_y = _clamp(_to_int(cap_cfg.get("customY"), 0), 0, max(0, canvas_h - 1))
+        overrides["position"] = "auto"
+        overrides["alignment"] = 7
+        overrides["margin_l"] = box_x
+        overrides["margin_r"] = max(0, canvas_w - (box_x + box_width))
+        overrides["margin_v"] = box_y
+    elif normalized_position:
+        overrides["position"] = normalized_position
 
     max_chars = cap_cfg.get("maxCharsPerCaption")
     if isinstance(max_chars, (int, float)):
@@ -140,7 +168,11 @@ def build_caption_ass(
     preset_name = normalize_caption_style(str(requested_preset))
     logger.info("[%s] Building caption preset '%s' ...", job_id, preset_name)
 
-    overrides = _overrides_from_layout(cap_cfg)
+    overrides = _overrides_from_layout(
+        cap_cfg,
+        canvas_w=canvas_w,
+        canvas_h=canvas_h,
+    )
     resolved_preset = resolve_preset(preset_name, overrides=overrides)
     requested_position = str(
         overrides.get("position") or cap_cfg.get("position") or "auto"

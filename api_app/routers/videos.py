@@ -14,7 +14,7 @@ from api_app.models import (
     CreditsCostByUrlResponse,
 )
 from api_app.state import logger, whisper_ready
-from config import CREDIT_COST_CLIP_GENERATION, calculate_video_analysis_cost
+from config import calculate_video_analysis_cost
 from services.video_downloader import VideoDownloader
 from utils.supabase_client import supabase
 
@@ -111,7 +111,7 @@ def analyze_video(
 def get_credit_cost_from_url(
     payload: CreditsCostByUrlRequest,
 ) -> CreditsCostByUrlResponse:
-    """Validate URL for clipping and return analysis + generation credit costs."""
+    """Validate URL for clipping and return analysis credit cost only."""
     url_str = str(payload.url)
     downloader = VideoDownloader()
 
@@ -122,7 +122,6 @@ def get_credit_cost_from_url(
         return CreditsCostByUrlResponse(
             valid_url=False,
             analysisCredits=0,
-            clipGenerationCredits=0,
             totalCredits=0,
         )
 
@@ -138,15 +137,12 @@ def get_credit_cost_from_url(
         return CreditsCostByUrlResponse(
             valid_url=False,
             analysisCredits=0,
-            clipGenerationCredits=0,
             totalCredits=0,
         )
 
     analysis_credits = calculate_video_analysis_cost(duration_seconds)
-    clip_generation_credits = CREDIT_COST_CLIP_GENERATION
     return CreditsCostByUrlResponse(
         valid_url=True,
         analysisCredits=analysis_credits,
-        clipGenerationCredits=clip_generation_credits,
-        totalCredits=analysis_credits + clip_generation_credits,
+        totalCredits=analysis_credits,
     )
