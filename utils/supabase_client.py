@@ -12,6 +12,7 @@ from supabase import Client, create_client
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, validate_env
 
 logger = logging.getLogger(__name__)
+_FREE_RESET_RPC_AVAILABLE: bool | None = None
 
 _RETRYABLE_METHODS = {"GET", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"}
 _DEFAULT_MAX_ATTEMPTS = 4
@@ -208,6 +209,40 @@ def assert_response_ok(response: Any, context: str):
     return response
 
 
+def _refresh_free_monthly_credits_if_needed(user_id: str):
+    """Apply free-plan monthly reset (set balance to 20) when the DB function exists."""
+    global _FREE_RESET_RPC_AVAILABLE
+
+    if _FREE_RESET_RPC_AVAILABLE is False:
+        return
+
+    response = supabase.rpc(
+        "reset_free_monthly_credits",
+        {
+            "p_user_id": user_id,
+        },
+    ).execute()
+
+    error = getattr(response, "error", None)
+    if not error:
+        _FREE_RESET_RPC_AVAILABLE = True
+        return
+
+    code = getattr(error, "code", None)
+    detail = _error_detail(error)
+    is_missing_function = code == "42883" or "reset_free_monthly_credits" in detail
+    if is_missing_function:
+        if _FREE_RESET_RPC_AVAILABLE is not False:
+            logger.warning(
+                "Missing DB function reset_free_monthly_credits. "
+                "Apply SQL/free_plan_monthly_credits.sql to enable free-plan monthly resets."
+            )
+        _FREE_RESET_RPC_AVAILABLE = False
+        return
+
+    raise RuntimeError(f"Failed to refresh free monthly credits for {user_id}: {detail}")
+
+
 def _charge_credits_or_raise(
     *,
     user_id: str,
@@ -219,6 +254,8 @@ def _charge_credits_or_raise(
     context: str,
 ):
     """Atomically charge credits in DB and fail when balance is insufficient."""
+    _refresh_free_monthly_credits_if_needed(user_id)
+
     resp = supabase.rpc(
         "charge_credits",
         {
@@ -260,6 +297,8 @@ def has_sufficient_credits(*, user_id: str, amount: int) -> bool:
     """Check whether user has at least `amount` credits."""
     if amount <= 0:
         return True
+
+    _refresh_free_monthly_credits_if_needed(user_id)
 
     response = supabase.rpc(
         "has_credits",
