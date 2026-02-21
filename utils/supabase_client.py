@@ -231,6 +231,44 @@ def _charge_credits_or_raise(
         raise RuntimeError(f"{context}: insufficient credits")
 
 
+def get_credit_balance(user_id: str) -> int:
+    """Return current user credit balance (0 when missing)."""
+    response = (
+        supabase.table("credit_balances")
+        .select("balance")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    assert_response_ok(response, f"Failed to load credit balance for {user_id}")
+
+    rows = response.data or []
+    if not rows:
+        return 0
+
+    try:
+        return int(rows[0].get("balance") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def has_sufficient_credits(*, user_id: str, amount: int) -> bool:
+    """Check whether user has at least `amount` credits."""
+    if amount <= 0:
+        return True
+
+    response = supabase.rpc(
+        "has_credits",
+        {
+            "p_user_id": user_id,
+            "p_amount": amount,
+        },
+    ).execute()
+    assert_response_ok(response, f"Failed to check credits for {user_id}")
+
+    return bool(response.data)
+
+
 def charge_clip_generation_credits(
     *,
     user_id: str,

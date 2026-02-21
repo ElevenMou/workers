@@ -70,6 +70,8 @@ class CreditsCostByUrlResponse(BaseModel):
     valid_url: bool
     analysisCredits: int
     totalCredits: int
+    currentBalance: Optional[int] = None
+    hasEnoughCredits: Optional[bool] = None
 
 
 class CaptionModesResponse(BaseModel):

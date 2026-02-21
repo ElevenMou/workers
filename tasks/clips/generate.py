@@ -18,6 +18,8 @@ from tasks.models.layout import merge_layout_configs
 from utils.supabase_client import (
     assert_response_ok,
     charge_clip_generation_credits,
+    get_credit_balance,
+    has_sufficient_credits,
     supabase,
     update_job_status,
 )
@@ -121,6 +123,7 @@ def generate_clip_task(job_data: GenerateClipJob):
     clip_id = job_data["clipId"]
     user_id = job_data["userId"]
     layout_id = job_data.get("layoutId")
+    generation_credits = int(job_data.get("generationCredits") or CREDIT_COST_CLIP_GENERATION)
 
     # -- Per-clip working directory for isolation -------------------------
     work_dir = os.path.join(TEMP_DIR, f"clip_{clip_id}")
@@ -135,6 +138,17 @@ def generate_clip_task(job_data: GenerateClipJob):
 
     try:
         _update_clip_job_progress(job_id, 0, "starting")
+
+        if generation_credits > 0 and not has_sufficient_credits(
+            user_id=user_id,
+            amount=generation_credits,
+        ):
+            available = get_credit_balance(user_id)
+            raise RuntimeError(
+                "Insufficient credits for clip generation before processing starts: "
+                f"required={generation_credits}, available={available}"
+            )
+
         _update_clip_job_progress(job_id, 5, "loading_clip")
 
         # Get clip and video details
@@ -322,7 +336,7 @@ def generate_clip_task(job_data: GenerateClipJob):
         _update_clip_job_progress(job_id, 92, "charging_credits")
         charge_clip_generation_credits(
             user_id=user_id,
-            amount=CREDIT_COST_CLIP_GENERATION,
+            amount=generation_credits,
             description=f'Clip generation: {clip["title"][:50]}',
             video_id=clip["video_id"],
             clip_id=clip_id,

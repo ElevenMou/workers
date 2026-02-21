@@ -11,6 +11,8 @@ from tasks.models.jobs import AnalyzeVideoJob
 from utils.supabase_client import (
     assert_response_ok,
     charge_video_analysis_credits,
+    get_credit_balance,
+    has_sufficient_credits,
     supabase,
     update_job_status,
     update_video_status,
@@ -53,6 +55,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
     user_id = job_data["userId"]
     url = job_data["url"]
     num_clips = job_data.get("numClips", 5)
+    expected_credits = int(job_data.get("analysisCredits") or 0)
 
     # -- Per-job working directory for isolation --------------------------
     work_dir = os.path.join(TEMP_DIR, f"analyze_{job_id}")
@@ -67,6 +70,17 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
 
     try:
         _update_analysis_job_progress(job_id, 0, "starting")
+
+        if expected_credits > 0 and not has_sufficient_credits(
+            user_id=user_id,
+            amount=expected_credits,
+        ):
+            available = get_credit_balance(user_id)
+            raise RuntimeError(
+                "Insufficient credits for analysis before processing starts: "
+                f"required={expected_credits}, available={available}"
+            )
+
         update_video_status(video_id, "downloading")
 
         # 1. Download video --------------------------------------------------

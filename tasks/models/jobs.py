@@ -9,6 +9,7 @@ class AnalyzeVideoJob(TypedDict):
     userId: str
     url: str
     numClips: NotRequired[int]
+    analysisCredits: NotRequired[int]
 
 
 class GenerateClipJob(TypedDict):
@@ -16,6 +17,7 @@ class GenerateClipJob(TypedDict):
     clipId: str
     userId: str
     layoutId: NotRequired[str]
+    generationCredits: NotRequired[int]
 
 
 class CustomClipJob(TypedDict):
@@ -28,3 +30,4 @@ class CustomClipJob(TypedDict):
     endTime: float
     title: str
     layoutId: NotRequired[str]
+    generationCredits: NotRequired[int]

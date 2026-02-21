@@ -2,8 +2,9 @@
 
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, status
 
+from api_app.access_rules import enforce_monthly_video_limit, enforce_processing_access_rules
 from api_app.auth import AuthenticatedUser, get_current_user
 from api_app.constants import ANALYZE_TASK_PATH
 from api_app.helpers import enqueue_or_fail, raise_on_error
@@ -16,9 +17,59 @@ from api_app.models import (
 from api_app.state import logger, whisper_ready
 from config import calculate_video_analysis_cost
 from services.video_downloader import VideoDownloader
-from utils.supabase_client import supabase
+from utils.supabase_client import get_credit_balance, has_sufficient_credits, supabase
 
 router = APIRouter()
+
+
+def _probe_credit_cost_for_url(url_str: str) -> dict:
+    downloader = VideoDownloader()
+
+    try:
+        probe = downloader.probe_url(url_str)
+    except Exception as exc:
+        logger.warning("URL validation failed for %s: %s", url_str, exc)
+        return {
+            "valid_url": False,
+            "analysis_credits": 0,
+        }
+
+    duration_seconds = int(probe.get("duration_seconds") or 0)
+    can_download = bool(probe.get("can_download"))
+    has_source_captions = bool(probe.get("has_captions"))
+    has_audio = bool(probe.get("has_audio"))
+    can_use_whisper = has_audio and whisper_ready()
+    has_captions = has_source_captions or can_use_whisper
+
+    valid_url = can_download and has_captions and duration_seconds > 0
+    if not valid_url:
+        return {
+            "valid_url": False,
+            "analysis_credits": 0,
+        }
+
+    analysis_credits = calculate_video_analysis_cost(duration_seconds)
+    return {
+        "valid_url": True,
+        "analysis_credits": analysis_credits,
+    }
+
+
+def _raise_if_insufficient_credits(*, user_id: str, required_credits: int):
+    if required_credits <= 0:
+        return
+
+    if has_sufficient_credits(user_id=user_id, amount=required_credits):
+        return
+
+    balance = get_credit_balance(user_id)
+    raise HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail=(
+            "Insufficient credits for analysis. "
+            f"Required: {required_credits}, available: {balance}."
+        ),
+    )
 
 
 @router.post("/videos/analyze", response_model=AnalyzeVideoResponse)
@@ -30,6 +81,27 @@ def analyze_video(
     job_id = str(uuid4())
     url_str = str(payload.url)
     user_id = current_user.id
+
+    # Fast-fail if user has no credits at all (before URL probing).
+    _raise_if_insufficient_credits(user_id=user_id, required_credits=1)
+
+    enforce_processing_access_rules(user_id, supabase_client=supabase)
+
+    # Enforce validation gate equivalent to /credits/cost before job enqueue.
+    url_probe = _probe_credit_cost_for_url(url_str)
+    if not url_probe["valid_url"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Video URL cannot be analyzed. Ensure it is downloadable and has "
+                "captions (or audio for transcription)."
+            ),
+        )
+
+    _raise_if_insufficient_credits(
+        user_id=user_id,
+        required_credits=int(url_probe["analysis_credits"]),
+    )
 
     existing = (
         supabase.table("videos")
@@ -44,6 +116,7 @@ def analyze_video(
         video_id = existing.data[0]["id"]
         logger.info("Reusing existing video %s for analyze url", video_id)
     else:
+        enforce_monthly_video_limit(user_id, supabase_client=supabase)
         video_id = payload.videoId or str(uuid4())
 
     logger.info(
@@ -52,6 +125,12 @@ def analyze_video(
         video_id,
         url_str,
         payload.numClips,
+    )
+    logger.info(
+        "Analyze request accepted - user=%s  url=%s  analysisCredits=%s",
+        user_id,
+        url_str,
+        url_probe["analysis_credits"],
     )
 
     video_resp = (
@@ -75,6 +154,7 @@ def analyze_video(
         "userId": user_id,
         "url": url_str,
         "numClips": payload.numClips,
+        "analysisCredits": int(url_probe["analysis_credits"]),
     }
 
     job_resp = (
@@ -110,39 +190,27 @@ def analyze_video(
 @router.post("/credits/cost", response_model=CreditsCostByUrlResponse)
 def get_credit_cost_from_url(
     payload: CreditsCostByUrlRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> CreditsCostByUrlResponse:
     """Validate URL for clipping and return analysis credit cost only."""
     url_str = str(payload.url)
-    downloader = VideoDownloader()
-
-    try:
-        probe = downloader.probe_url(url_str)
-    except Exception as exc:
-        logger.warning("URL validation failed for cost endpoint (%s): %s", url_str, exc)
+    user_id = current_user.id
+    probe = _probe_credit_cost_for_url(url_str)
+    if not probe["valid_url"]:
         return CreditsCostByUrlResponse(
             valid_url=False,
             analysisCredits=0,
             totalCredits=0,
+            currentBalance=get_credit_balance(user_id),
+            hasEnoughCredits=False,
         )
 
-    duration_seconds = int(probe.get("duration_seconds") or 0)
-    can_download = bool(probe.get("can_download"))
-    has_source_captions = bool(probe.get("has_captions"))
-    has_audio = bool(probe.get("has_audio"))
-    can_use_whisper = has_audio and whisper_ready()
-    has_captions = has_source_captions or can_use_whisper
-
-    valid_url = can_download and has_captions and duration_seconds > 0
-    if not valid_url:
-        return CreditsCostByUrlResponse(
-            valid_url=False,
-            analysisCredits=0,
-            totalCredits=0,
-        )
-
-    analysis_credits = calculate_video_analysis_cost(duration_seconds)
+    analysis_credits = int(probe["analysis_credits"])
+    balance = get_credit_balance(user_id)
     return CreditsCostByUrlResponse(
         valid_url=True,
         analysisCredits=analysis_credits,
         totalCredits=analysis_credits,
+        currentBalance=balance,
+        hasEnoughCredits=balance >= analysis_credits,
     )

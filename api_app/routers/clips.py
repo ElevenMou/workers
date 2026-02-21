@@ -4,6 +4,11 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
+from api_app.access_rules import (
+    enforce_clip_duration_limit,
+    enforce_monthly_video_limit,
+    enforce_processing_access_rules,
+)
 from api_app.auth import AuthenticatedUser, get_current_user
 from api_app.constants import CUSTOM_CLIP_TASK_PATH, GENERATE_TASK_PATH
 from api_app.helpers import enqueue_or_fail, raise_on_error
@@ -14,9 +19,25 @@ from api_app.models import (
     GenerateClipResponse,
 )
 from api_app.state import logger
-from utils.supabase_client import supabase
+from config import CREDIT_COST_CLIP_GENERATION
+from utils.supabase_client import get_credit_balance, has_sufficient_credits, supabase
 
 router = APIRouter()
+
+
+def _raise_if_insufficient_clip_generation_credits(*, user_id: str):
+    required = int(CREDIT_COST_CLIP_GENERATION)
+    if has_sufficient_credits(user_id=user_id, amount=required):
+        return
+
+    balance = get_credit_balance(user_id)
+    raise HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail=(
+            "Insufficient credits for clip generation. "
+            f"Required: {required}, available: {balance}."
+        ),
+    )
 
 
 @router.get("/clips/layout-options", response_model=ClipLayoutOptionsResponse)
@@ -43,6 +64,8 @@ def generate_clip(
     """Enqueue generation for an existing suggested clip."""
     job_id = str(uuid4())
     user_id = current_user.id
+    _raise_if_insufficient_clip_generation_credits(user_id=user_id)
+    enforce_processing_access_rules(user_id, supabase_client=supabase)
 
     logger.info(
         "Generate clip request - user=%s  clip=%s",
@@ -52,7 +75,7 @@ def generate_clip(
 
     clip_resp = (
         supabase.table("clips")
-        .select("id, video_id, user_id")
+        .select("id, video_id, user_id, start_time, end_time")
         .eq("id", payload.clipId)
         .execute()
     )
@@ -72,11 +95,19 @@ def generate_clip(
             detail="Clip does not belong to this user",
         )
 
+    clip_duration = float(clip["end_time"]) - float(clip["start_time"])
+    enforce_clip_duration_limit(
+        user_id=user_id,
+        duration_seconds=clip_duration,
+        supabase_client=supabase,
+    )
+
     job_data = {
         "jobId": job_id,
         "clipId": payload.clipId,
         "userId": user_id,
         "layoutId": payload.layoutId,
+        "generationCredits": int(CREDIT_COST_CLIP_GENERATION),
     }
 
     job_resp = (
@@ -138,6 +169,13 @@ def custom_clip(
     job_id = str(uuid4())
     url_str = str(payload.url)
     user_id = current_user.id
+    _raise_if_insufficient_clip_generation_credits(user_id=user_id)
+    enforce_processing_access_rules(user_id, supabase_client=supabase)
+    enforce_clip_duration_limit(
+        user_id=user_id,
+        duration_seconds=duration,
+        supabase_client=supabase,
+    )
 
     logger.info(
         "Custom clip request - user=%s  url=%s  %.2f-%.2f",
@@ -160,6 +198,7 @@ def custom_clip(
         video_id = existing.data[0]["id"]
         logger.info("Reusing existing video %s for url", video_id)
     else:
+        enforce_monthly_video_limit(user_id, supabase_client=supabase)
         video_id = str(uuid4())
         video_resp = (
             supabase.table("videos")
@@ -199,6 +238,7 @@ def custom_clip(
         "endTime": payload.endTime,
         "title": payload.title,
         "layoutId": payload.layoutId,
+        "generationCredits": int(CREDIT_COST_CLIP_GENERATION),
     }
 
     job_resp = (

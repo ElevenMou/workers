@@ -69,6 +69,11 @@ def test_generate_clip_rejects_non_owner(client, monkeypatch):
         claims={},
     )
     monkeypatch.setattr(clips_router, "supabase", _FakeSupabase())
+    monkeypatch.setattr(
+        clips_router,
+        "has_sufficient_credits",
+        lambda *, user_id, amount: True,
+    )
 
     response = client.post(
         "/clips/generate",
@@ -101,6 +106,14 @@ def test_custom_clip_duration_validation_returns_400(client):
 
 
 def test_credit_cost_endpoint_returns_explicit_fields(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+
     def _fake_probe(_self, _url: str):
         return {
             "duration_seconds": 120,
@@ -111,6 +124,12 @@ def test_credit_cost_endpoint_returns_explicit_fields(client, monkeypatch):
 
     monkeypatch.setattr(videos_router.VideoDownloader, "probe_url", _fake_probe)
     monkeypatch.setattr(videos_router, "whisper_ready", lambda: True)
+    monkeypatch.setattr(videos_router, "get_credit_balance", lambda _user_id: 25)
+    monkeypatch.setattr(
+        videos_router,
+        "has_sufficient_credits",
+        lambda *, user_id, amount: True,
+    )
 
     response = client.post(
         "/credits/cost",
@@ -121,6 +140,66 @@ def test_credit_cost_endpoint_returns_explicit_fields(client, monkeypatch):
     assert payload["valid_url"] is True
     assert payload["analysisCredits"] >= 0
     assert payload["totalCredits"] == payload["analysisCredits"]
+    assert payload["currentBalance"] == 25
+    assert payload["hasEnoughCredits"] is True
+
+
+def test_analyze_video_fails_early_when_no_credits(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+
+    monkeypatch.setattr(
+        videos_router,
+        "has_sufficient_credits",
+        lambda *, user_id, amount: False,
+    )
+    monkeypatch.setattr(videos_router, "get_credit_balance", lambda _user_id: 0)
+
+    def _should_not_probe(_url: str):
+        raise AssertionError("URL probe should not run when user has no credits")
+
+    monkeypatch.setattr(videos_router, "_probe_credit_cost_for_url", _should_not_probe)
+
+    response = client.post(
+        "/videos/analyze",
+        json={
+            "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
+            "numClips": 5,
+        },
+    )
+
+    assert response.status_code == 402
+    assert "Insufficient credits for analysis" in response.json()["detail"]
+
+
+def test_generate_clip_fails_early_when_no_credits(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+
+    monkeypatch.setattr(
+        clips_router,
+        "has_sufficient_credits",
+        lambda *, user_id, amount: False,
+    )
+    monkeypatch.setattr(clips_router, "get_credit_balance", lambda _user_id: 0)
+
+    response = client.post(
+        "/clips/generate",
+        json={"clipId": "clip-1"},
+    )
+
+    assert response.status_code == 402
+    assert "Insufficient credits for clip generation" in response.json()["detail"]
 
 
 def test_credit_cost_endpoint_allows_cors_preflight(client):

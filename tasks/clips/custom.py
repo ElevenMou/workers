@@ -28,6 +28,8 @@ from tasks.videos.transcript import (
 from utils.supabase_client import (
     assert_response_ok,
     charge_clip_generation_credits,
+    get_credit_balance,
+    has_sufficient_credits,
     supabase,
     update_job_status,
     update_video_status,
@@ -146,6 +148,7 @@ def custom_clip_task(job_data: CustomClipJob):
     start_time = float(job_data["startTime"])
     end_time = float(job_data["endTime"])
     title = job_data["title"]
+    generation_credits = int(job_data.get("generationCredits") or CREDIT_COST_CLIP_GENERATION)
 
     # -- Per-job working directory ------------------------------------------
     work_dir = os.path.join(TEMP_DIR, f"custom_{clip_id}")
@@ -158,6 +161,17 @@ def custom_clip_task(job_data: CustomClipJob):
 
     try:
         _update_clip_job_progress(job_id, 0, "starting")
+
+        if generation_credits > 0 and not has_sufficient_credits(
+            user_id=user_id,
+            amount=generation_credits,
+        ):
+            available = get_credit_balance(user_id)
+            raise RuntimeError(
+                "Insufficient credits for custom clip generation before processing starts: "
+                f"required={generation_credits}, available={available}"
+            )
+
         update_video_status(video_id, "downloading")
         clip_status_resp = supabase.table("clips").update({"status": "generating"}).eq(
             "id", clip_id
@@ -378,7 +392,7 @@ def custom_clip_task(job_data: CustomClipJob):
         _update_clip_job_progress(job_id, 93, "charging_credits")
         charge_clip_generation_credits(
             user_id=user_id,
-            amount=CREDIT_COST_CLIP_GENERATION,
+            amount=generation_credits,
             description=f"Custom clip: {title[:50]}",
             video_id=video_id,
             clip_id=clip_id,
