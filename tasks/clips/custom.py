@@ -10,7 +10,7 @@ import os
 import shutil
 import traceback
 
-from config import CREDIT_COST_CLIP_GENERATION, TEMP_DIR
+from config import CREDIT_COST_CLIP_GENERATION
 from services.clip_generator import ClipGenerator, compute_video_position
 from services.clips.constants import canvas_size_for_aspect_ratio
 from services.video_downloader import VideoDownloader
@@ -25,6 +25,7 @@ from tasks.models.layout import merge_layout_configs
 from tasks.videos.transcript import (
     transcribe_clip_window_with_whisper,
 )
+from utils.workdirs import create_work_dir
 from utils.supabase_client import (
     assert_response_ok,
     charge_clip_generation_credits,
@@ -151,8 +152,7 @@ def custom_clip_task(job_data: CustomClipJob):
     generation_credits = int(job_data.get("generationCredits") or CREDIT_COST_CLIP_GENERATION)
 
     # -- Per-job working directory ------------------------------------------
-    work_dir = os.path.join(TEMP_DIR, f"custom_{clip_id}")
-    os.makedirs(work_dir, exist_ok=True)
+    work_dir = create_work_dir(f"custom_{clip_id}")
 
     downloader = VideoDownloader(work_dir=work_dir)
     audio_path: str | None = None

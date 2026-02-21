@@ -3,11 +3,12 @@ import os
 import traceback
 from datetime import datetime, timedelta, timezone
 
-from config import TEMP_DIR, calculate_video_analysis_cost
+from config import calculate_video_analysis_cost
 from services.ai_analyzer import AIAnalyzer
 from services.transcriber import Transcriber
 from services.video_downloader import VideoDownloader
 from tasks.models.jobs import AnalyzeVideoJob
+from utils.workdirs import create_work_dir
 from utils.supabase_client import (
     assert_response_ok,
     charge_video_analysis_credits,
@@ -58,8 +59,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
     expected_credits = int(job_data.get("analysisCredits") or 0)
 
     # -- Per-job working directory for isolation --------------------------
-    work_dir = os.path.join(TEMP_DIR, f"analyze_{job_id}")
-    os.makedirs(work_dir, exist_ok=True)
+    work_dir = create_work_dir(f"analyze_{job_id}")
 
     downloader = VideoDownloader(work_dir=work_dir)
     transcriber = Transcriber()
