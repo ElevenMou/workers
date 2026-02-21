@@ -13,7 +13,6 @@ from services.clips.ffmpeg_ops import (
     add_overlays,
     create_portrait_background,
     extract_segment,
-    generate_thumbnail,
 )
 from services.clips.layout import compute_layout, compute_video_position, wrap_title
 from services.clips.models import ClipGenerationResult
@@ -147,13 +146,9 @@ class ClipGenerator:
             qp=qp,
         )
 
-        thumbnail_path = os.path.join(self.temp_dir, f"{clip_id}_thumb.jpg")
-        generate_thumbnail(final_clip_path, thumbnail_path)
-
         file_size = os.path.getsize(final_clip_path)
         return {
             "clip_path": final_clip_path,
-            "thumbnail_path": thumbnail_path,
             "file_size": file_size,
             "intermediates": intermediates,
         }

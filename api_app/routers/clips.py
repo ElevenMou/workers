@@ -27,6 +27,7 @@ from config import CREDIT_COST_CLIP_GENERATION
 from utils.supabase_client import get_credit_balance, has_sufficient_credits, supabase
 
 router = APIRouter()
+_ACTIVE_GENERATE_JOB_STATUSES = ("queued", "processing", "retrying")
 
 
 def _raise_if_insufficient_clip_generation_credits(*, user_id: str):
@@ -70,8 +71,6 @@ def generate_clip(
     """Enqueue generation for an existing suggested clip."""
     job_id = str(uuid4())
     user_id = current_user.id
-    _raise_if_insufficient_clip_generation_credits(user_id=user_id)
-    enforce_processing_access_rules(user_id, supabase_client=supabase)
 
     logger.info(
         "Generate clip request - user=%s  clip=%s",
@@ -107,6 +106,39 @@ def generate_clip(
         duration_seconds=clip_duration,
         supabase_client=supabase,
     )
+
+    active_job_resp = (
+        supabase.table("jobs")
+        .select("id, status")
+        .eq("user_id", user_id)
+        .eq("clip_id", payload.clipId)
+        .eq("type", "generate_clip")
+        .in_("status", list(_ACTIVE_GENERATE_JOB_STATUSES))
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    raise_on_error(active_job_resp, "Failed to check existing active generation job")
+
+    active_job_rows = active_job_resp.data or []
+    if active_job_rows:
+        active_job = active_job_rows[0]
+        logger.info(
+            "Reusing active clip generation job - user=%s clip=%s job=%s status=%s",
+            user_id,
+            payload.clipId,
+            active_job.get("id"),
+            active_job.get("status"),
+        )
+        return GenerateClipResponse(
+            jobId=active_job["id"],
+            clipId=payload.clipId,
+            videoId=clip["video_id"],
+            status=active_job["status"],
+        )
+
+    _raise_if_insufficient_clip_generation_credits(user_id=user_id)
+    enforce_processing_access_rules(user_id, supabase_client=supabase)
 
     job_data = {
         "jobId": job_id,

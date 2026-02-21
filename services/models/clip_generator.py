@@ -25,6 +25,5 @@ class ClipLayout(TypedDict):
 
 class ClipGenerationResult(TypedDict):
     clip_path: str
-    thumbnail_path: str
     file_size: int
     intermediates: list[str]

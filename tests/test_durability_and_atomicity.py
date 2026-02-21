@@ -56,7 +56,6 @@ def test_clip_tasks_emit_stage_progress_updates():
         '"preparing_captions"',
         '"rendering_clip"',
         '"uploading_clip"',
-        '"uploading_thumbnail"',
         '"charging_credits"',
         '"finalizing"',
     ]
@@ -70,7 +69,6 @@ def test_clip_tasks_emit_stage_progress_updates():
         '"preparing_captions"',
         '"rendering_clip"',
         '"uploading_clip"',
-        '"uploading_thumbnail"',
         '"charging_credits"',
         '"finalizing"',
     ]
@@ -88,4 +86,17 @@ def test_clip_uploads_set_media_content_types():
 
     for code in (generate_code, custom_code):
         assert '"content-type": "video/mp4"' in code
-        assert '"content-type": "image/jpeg"' in code
+
+
+def test_clip_tasks_resolve_default_layout_before_rendering():
+    generate_code = (
+        _repo_root() / "workers" / "tasks" / "clips" / "generate.py"
+    ).read_text(encoding="utf-8")
+    custom_code = (
+        _repo_root() / "workers" / "tasks" / "clips" / "custom.py"
+    ).read_text(encoding="utf-8")
+
+    for code in (generate_code, custom_code):
+        assert "resolve_effective_layout_id(" in code
+        assert code.index("resolve_effective_layout_id(") < code.index("load_layout_overrides(")
+        assert 'clip_update["layout_id"] = layout_id' in code

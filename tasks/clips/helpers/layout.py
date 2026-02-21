@@ -22,6 +22,82 @@ class LayoutOverrides:
     layout_captions: dict[str, Any] = field(default_factory=dict)
 
 
+def _normalize_layout_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _first_created_layout_id(*, user_id: str) -> str | None:
+    first_layout_resp = (
+        supabase.table("layouts")
+        .select("id")
+        .eq("user_id", user_id)
+        .order("created_at", desc=False)
+        .order("id", desc=False)
+        .limit(1)
+        .execute()
+    )
+    assert_response_ok(first_layout_resp, "Failed to load fallback layout")
+
+    first_rows = first_layout_resp.data or []
+    if not first_rows:
+        return None
+
+    first_id = _normalize_layout_id(first_rows[0].get("id"))
+    if first_id:
+        return first_id
+    return None
+
+
+def resolve_effective_layout_id(
+    *,
+    user_id: str,
+    job_id: str,
+    logger: logging.Logger,
+) -> str | None:
+    """Resolve the layout id to be used for clip rendering.
+
+    Priority:
+    1) User default layout (`is_default = true`)
+    2) First created layout (legacy fallback for users without defaults)
+    3) None -> renderer built-in defaults
+    """
+    logger.info("[%s] Resolving effective layout for user %s", job_id, user_id)
+
+    try:
+        default_layout_resp = (
+            supabase.table("layouts")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("is_default", True)
+            .limit(1)
+            .execute()
+        )
+        assert_response_ok(default_layout_resp, "Failed to load default layout")
+        default_rows = default_layout_resp.data or []
+        if default_rows:
+            default_id = _normalize_layout_id(default_rows[0].get("id"))
+            if default_id:
+                logger.info("[%s] Using default layout %s", job_id, default_id)
+                return default_id
+    except Exception as exc:
+        logger.warning(
+            "[%s] Default layout lookup failed, trying fallback strategies: %s",
+            job_id,
+            exc,
+        )
+
+    first_id = _first_created_layout_id(user_id=user_id)
+    if first_id:
+        logger.info("[%s] Falling back to first created layout %s", job_id, first_id)
+        return first_id
+
+    logger.info("[%s] No layout available, using renderer defaults", job_id)
+    return None
+
+
 def load_layout_overrides(
     *,
     user_id: str,
@@ -99,4 +175,3 @@ def maybe_download_layout_background_image(
             dl_err,
         )
         return "blur", None
-

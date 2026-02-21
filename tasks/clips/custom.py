@@ -18,6 +18,7 @@ from tasks.clips.helpers.captions import build_caption_ass
 from tasks.clips.helpers.layout import (
     load_layout_overrides,
     maybe_download_layout_background_image,
+    resolve_effective_layout_id,
 )
 from tasks.clips.helpers.media import probe_video_size
 from tasks.models.jobs import CustomClipJob
@@ -39,7 +40,6 @@ from utils.supabase_client import (
 logger = logging.getLogger(__name__)
 
 _VIDEO_UPLOAD_OPTIONS = {"content-type": "video/mp4", "cache-control": "3600"}
-_THUMBNAIL_UPLOAD_OPTIONS = {"content-type": "image/jpeg", "cache-control": "3600"}
 
 
 def _update_clip_job_progress(job_id: str, progress: int, stage: str):
@@ -57,7 +57,6 @@ def _best_effort_cleanup_uploaded_artifacts(
     job_id: str,
     clip_id: str,
     storage_path: str | None,
-    thumbnail_path: str | None,
 ):
     if storage_path:
         try:
@@ -70,18 +69,7 @@ def _best_effort_cleanup_uploaded_artifacts(
                 exc,
             )
 
-    if thumbnail_path:
-        try:
-            supabase.storage.from_("thumbnails").remove([thumbnail_path])
-        except Exception as exc:
-            logger.warning(
-                "[%s] Failed to delete uploaded thumbnail artifact %s: %s",
-                job_id,
-                thumbnail_path,
-                exc,
-            )
-
-    if storage_path or thumbnail_path:
+    if storage_path:
         try:
             clear_resp = (
                 supabase.table("clips")
@@ -139,7 +127,7 @@ def custom_clip_task(job_data: CustomClipJob):
 
     ``job_data`` keys:
         jobId, videoId, clipId, userId, url, startTime, endTime, title,
-        layoutId (optional)
+        layoutId (optional, ignored in favor of the user's default layout)
     """
     job_id = job_data["jobId"]
     video_id = job_data["videoId"]
@@ -149,6 +137,7 @@ def custom_clip_task(job_data: CustomClipJob):
     start_time = float(job_data["startTime"])
     end_time = float(job_data["endTime"])
     title = job_data["title"]
+    layout_id: str | None = None
     generation_credits = int(job_data.get("generationCredits") or CREDIT_COST_CLIP_GENERATION)
 
     # -- Per-job working directory ------------------------------------------
@@ -157,7 +146,6 @@ def custom_clip_task(job_data: CustomClipJob):
     downloader = VideoDownloader(work_dir=work_dir)
     audio_path: str | None = None
     uploaded_storage_path: str | None = None
-    uploaded_thumbnail_path: str | None = None
 
     try:
         _update_clip_job_progress(job_id, 0, "starting")
@@ -259,7 +247,11 @@ def custom_clip_task(job_data: CustomClipJob):
         assert_response_ok(save_video_resp, f"Failed to save transcript for {video_id}")
 
         # 3. Load layout -------------------------------------------------------
-        layout_id = job_data.get("layoutId")
+        layout_id = resolve_effective_layout_id(
+            user_id=user_id,
+            job_id=job_id,
+            logger=logger,
+        )
         layout_overrides = load_layout_overrides(
             user_id=user_id,
             layout_id=layout_id,
@@ -366,7 +358,6 @@ def custom_clip_task(job_data: CustomClipJob):
 
         # 7. Upload to Supabase Storage ----------------------------------------
         storage_path = f"clips/{clip_id}.mp4"
-        thumbnail_path = f"thumbnails/{clip_id}.jpg"
 
         _update_clip_job_progress(job_id, 84, "uploading_clip")
         logger.info("[%s] Uploading clip to storage ...", job_id)
@@ -379,17 +370,8 @@ def custom_clip_task(job_data: CustomClipJob):
             )
         uploaded_storage_path = storage_path
 
-        _update_clip_job_progress(job_id, 88, "uploading_thumbnail")
-        with open(result["thumbnail_path"], "rb") as f:
-            supabase.storage.from_("thumbnails").upload(
-                thumbnail_path,
-                f,
-                file_options=_THUMBNAIL_UPLOAD_OPTIONS,
-            )
-        uploaded_thumbnail_path = thumbnail_path
-
         # 8. Charge credits before finalizing completion state -----------------
-        _update_clip_job_progress(job_id, 93, "charging_credits")
+        _update_clip_job_progress(job_id, 90, "charging_credits")
         charge_clip_generation_credits(
             user_id=user_id,
             amount=generation_credits,
@@ -403,7 +385,7 @@ def custom_clip_task(job_data: CustomClipJob):
         clip_update = {
             "status": "completed",
             "storage_path": storage_path,
-            "thumbnail_path": thumbnail_path,
+            "thumbnail_path": None,
             "file_size_bytes": result["file_size"],
         }
         if layout_id:
@@ -420,7 +402,6 @@ def custom_clip_task(job_data: CustomClipJob):
             result_data={
                 "stage": "completed",
                 "storage_path": storage_path,
-                "thumbnail_path": thumbnail_path,
                 "file_size": result["file_size"],
             },
         )
@@ -435,7 +416,6 @@ def custom_clip_task(job_data: CustomClipJob):
             job_id=job_id,
             clip_id=clip_id,
             storage_path=uploaded_storage_path,
-            thumbnail_path=uploaded_thumbnail_path,
         )
         _best_effort_mark_failed(
             job_id=job_id,

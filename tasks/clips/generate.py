@@ -11,6 +11,7 @@ from tasks.clips.helpers.captions import build_caption_ass
 from tasks.clips.helpers.layout import (
     load_layout_overrides,
     maybe_download_layout_background_image,
+    resolve_effective_layout_id,
 )
 from tasks.clips.helpers.media import probe_video_size
 from tasks.models.jobs import GenerateClipJob
@@ -28,7 +29,43 @@ from utils.supabase_client import (
 logger = logging.getLogger(__name__)
 
 _VIDEO_UPLOAD_OPTIONS = {"content-type": "video/mp4", "cache-control": "3600"}
-_THUMBNAIL_UPLOAD_OPTIONS = {"content-type": "image/jpeg", "cache-control": "3600"}
+
+
+def _is_latest_generate_job_for_clip(*, job_id: str, clip_id: str) -> bool:
+    latest_job_resp = (
+        supabase.table("jobs")
+        .select("id")
+        .eq("clip_id", clip_id)
+        .eq("type", "generate_clip")
+        .order("created_at", desc=True)
+        .order("id", desc=True)
+        .limit(1)
+        .execute()
+    )
+    assert_response_ok(latest_job_resp, f"Failed to load latest generate job for clip {clip_id}")
+    latest_jobs = latest_job_resp.data or []
+    if not latest_jobs:
+        return True
+
+    latest_job_id = latest_jobs[0].get("id")
+    return latest_job_id == job_id
+
+
+def _best_effort_mark_superseded(*, job_id: str, clip_id: str):
+    reason = (
+        "Superseded by a newer clip generation request for the same clip. "
+        "This job exited without charging credits."
+    )
+    try:
+        update_job_status(
+            job_id,
+            "failed",
+            0,
+            reason,
+            result_data={"stage": "superseded", "clip_id": clip_id},
+        )
+    except Exception as exc:
+        logger.warning("[%s] Failed to mark job superseded: %s", job_id, exc)
 
 
 def _update_clip_job_progress(job_id: str, progress: int, stage: str):
@@ -46,7 +83,6 @@ def _best_effort_cleanup_uploaded_artifacts(
     job_id: str,
     clip_id: str,
     storage_path: str | None,
-    thumbnail_path: str | None,
 ):
     """Delete uploaded files and clear DB pointers after partial failure."""
     if storage_path:
@@ -60,18 +96,7 @@ def _best_effort_cleanup_uploaded_artifacts(
                 exc,
             )
 
-    if thumbnail_path:
-        try:
-            supabase.storage.from_("thumbnails").remove([thumbnail_path])
-        except Exception as exc:
-            logger.warning(
-                "[%s] Failed to delete uploaded thumbnail artifact %s: %s",
-                job_id,
-                thumbnail_path,
-                exc,
-            )
-
-    if storage_path or thumbnail_path:
+    if storage_path:
         try:
             clear_resp = (
                 supabase.table("clips")
@@ -123,7 +148,7 @@ def generate_clip_task(job_data: GenerateClipJob):
     job_id = job_data["jobId"]
     clip_id = job_data["clipId"]
     user_id = job_data["userId"]
-    layout_id = job_data.get("layoutId")
+    layout_id: str | None = None
     generation_credits = int(job_data.get("generationCredits") or CREDIT_COST_CLIP_GENERATION)
 
     # -- Per-clip working directory for isolation -------------------------
@@ -132,9 +157,7 @@ def generate_clip_task(job_data: GenerateClipJob):
     generator = ClipGenerator(work_dir=work_dir)
 
     storage_path: str | None = None
-    thumbnail_path: str | None = None
     uploaded_storage_path: str | None = None
-    uploaded_thumbnail_path: str | None = None
 
     try:
         _update_clip_job_progress(job_id, 0, "starting")
@@ -164,6 +187,15 @@ def generate_clip_task(job_data: GenerateClipJob):
         if not clip:
             raise Exception(f"Clip {clip_id} not found")
 
+        if not _is_latest_generate_job_for_clip(job_id=job_id, clip_id=clip_id):
+            logger.info(
+                "[%s] Skipping generation for clip %s because a newer job is active",
+                job_id,
+                clip_id,
+            )
+            _best_effort_mark_superseded(job_id=job_id, clip_id=clip_id)
+            return
+
         # Update clip status
         clip_status_resp = supabase.table("clips").update({"status": "generating"}).eq(
             "id", clip_id
@@ -171,6 +203,11 @@ def generate_clip_task(job_data: GenerateClipJob):
         assert_response_ok(clip_status_resp, f"Failed to mark clip {clip_id} generating")
 
         _update_clip_job_progress(job_id, 12, "loading_layout")
+        layout_id = resolve_effective_layout_id(
+            user_id=user_id,
+            job_id=job_id,
+            logger=logger,
+        )
         layout_overrides = load_layout_overrides(
             user_id=user_id,
             layout_id=layout_id,
@@ -310,7 +347,6 @@ def generate_clip_task(job_data: GenerateClipJob):
 
         # Upload to Supabase Storage
         storage_path = f"clips/{clip_id}.mp4"
-        thumbnail_path = f"thumbnails/{clip_id}.jpg"
 
         _update_clip_job_progress(job_id, 80, "uploading_clip")
         logger.info("[%s] Uploading clip to storage ...", job_id)
@@ -323,17 +359,22 @@ def generate_clip_task(job_data: GenerateClipJob):
             )
         uploaded_storage_path = storage_path
 
-        _update_clip_job_progress(job_id, 86, "uploading_thumbnail")
-        with open(result["thumbnail_path"], "rb") as f:
-            supabase.storage.from_("thumbnails").upload(
-                thumbnail_path,
-                f,
-                file_options=_THUMBNAIL_UPLOAD_OPTIONS,
+        if not _is_latest_generate_job_for_clip(job_id=job_id, clip_id=clip_id):
+            logger.info(
+                "[%s] Uploaded output for stale generation job on clip %s; cleaning up",
+                job_id,
+                clip_id,
             )
-        uploaded_thumbnail_path = thumbnail_path
+            _best_effort_cleanup_uploaded_artifacts(
+                job_id=job_id,
+                clip_id=clip_id,
+                storage_path=uploaded_storage_path,
+            )
+            _best_effort_mark_superseded(job_id=job_id, clip_id=clip_id)
+            return
 
         # Charge credits atomically before finalizing clip completion status.
-        _update_clip_job_progress(job_id, 92, "charging_credits")
+        _update_clip_job_progress(job_id, 90, "charging_credits")
         charge_clip_generation_credits(
             user_id=user_id,
             amount=generation_credits,
@@ -347,7 +388,7 @@ def generate_clip_task(job_data: GenerateClipJob):
         clip_update = {
             "status": "completed",
             "storage_path": storage_path,
-            "thumbnail_path": thumbnail_path,
+            "thumbnail_path": None,
             "file_size_bytes": result["file_size"],
         }
         if layout_id:
@@ -364,7 +405,6 @@ def generate_clip_task(job_data: GenerateClipJob):
             result_data={
                 "stage": "completed",
                 "storage_path": storage_path,
-                "thumbnail_path": thumbnail_path,
                 "file_size": result["file_size"],
             },
         )
@@ -379,7 +419,6 @@ def generate_clip_task(job_data: GenerateClipJob):
             job_id=job_id,
             clip_id=clip_id,
             storage_path=uploaded_storage_path,
-            thumbnail_path=uploaded_thumbnail_path,
         )
         _best_effort_mark_failed(job_id=job_id, clip_id=clip_id, error_msg=error_msg)
 

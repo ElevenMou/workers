@@ -25,10 +25,8 @@ class GenerateClipRequest(BaseModel):
     layoutId: Optional[str] = Field(
         default=None,
         description=(
-            "UUID of a saved layout from the layouts table. "
-            "The worker loads all generation settings (background, video, "
-            "title, captions, quality) from this layout. "
-            "When omitted, built-in defaults are used."
+            "Optional client hint; generation currently resolves the user's "
+            "default layout in the worker."
         ),
     )
 
@@ -45,7 +43,10 @@ class CustomClipRequest(BaseModel):
     )
     layoutId: Optional[str] = Field(
         default=None,
-        description="UUID of a saved layout from the layouts table.",
+        description=(
+            "Optional client hint; generation currently resolves the user's "
+            "default layout in the worker."
+        ),
     )
 
 
