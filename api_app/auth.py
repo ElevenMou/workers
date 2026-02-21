@@ -42,9 +42,8 @@ def _token_claims_are_admin(claims: dict[str, Any]) -> bool:
         if bool(app_metadata.get("is_admin")):
             return True
 
-    user_metadata = claims.get("user_metadata")
-    if isinstance(user_metadata, dict) and bool(user_metadata.get("is_admin")):
-        return True
+    # SECURITY: user_metadata is user-writable and must NEVER be trusted for
+    # authorization. Only app_metadata (set via service role) is safe.
 
     return False
 
@@ -64,7 +63,7 @@ def _fetch_user_from_token(token: str) -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover - network-level failure
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Authentication service unavailable: {exc}",
+            detail="Authentication service unavailable",
         ) from exc
 
     if response.status_code == status.HTTP_401_UNAUTHORIZED:

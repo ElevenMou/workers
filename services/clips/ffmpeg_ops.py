@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from pathlib import Path
 
 import ffmpeg
@@ -10,6 +11,19 @@ from services.clips.constants import normalize_video_scale_mode
 from services.clips.models import QualityPreset
 
 logger = logging.getLogger(__name__)
+
+_VALID_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _sanitize_color(value: str, fallback: str = "#000000") -> str:
+    """Validate that a color value is a safe hex color string.
+
+    Prevents FFmpeg filter injection via user-controlled color parameters.
+    """
+    if isinstance(value, str) and _VALID_HEX_COLOR.match(value):
+        return value
+    logger.warning("Invalid color value %r, using fallback %s", value, fallback)
+    return fallback
 
 
 def safe_remove(path: str) -> None:
@@ -255,8 +269,9 @@ def create_portrait_background(
         probe = ffmpeg.probe(input_path)
         duration = float(probe["format"]["duration"])
 
+        safe_color = _sanitize_color(background_color)
         bg = ffmpeg.input(
-            f"color=c={background_color}:s={canvas_w}x{canvas_h}:d={duration}",
+            f"color=c={safe_color}:s={canvas_w}x{canvas_h}:d={duration}",
             f="lavfi",
         )
         video = _foreground_video_stream()
@@ -313,7 +328,7 @@ def create_portrait_background(
 
     (
         _foreground_video_stream()
-        .filter("pad", canvas_w, canvas_h, vid_x, vid_y, background_color)
+        .filter("pad", canvas_w, canvas_h, vid_x, vid_y, _sanitize_color(background_color))
         .output(
             output_path,
             vcodec="libx264",
@@ -372,7 +387,7 @@ def add_overlays(
                 y=title_bar_y,
                 width=max(2, int(title_bar_w)),
                 height=title_bar_h,
-                color=title_bar_color,
+                color=_sanitize_color(title_bar_color),
                 t="fill",
             )
         try:

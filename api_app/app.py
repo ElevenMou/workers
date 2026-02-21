@@ -2,8 +2,12 @@
 
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from api_app.routers.captions import router as captions_router
 from api_app.routers.clips import router as clips_router
@@ -12,13 +16,36 @@ from api_app.routers.videos import router as videos_router
 from api_app.routers.workers import router as workers_router
 from config import validate_env
 
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(title="Clipry Workers API", version="1.0.0")
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={"error": "Rate limit exceeded. Please try again later."},
+    )
+
+
+# ---------------------------------------------------------------------------
+# CORS
+# ---------------------------------------------------------------------------
 cors_allowed_origins = [
     origin.strip()
     for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
     if origin.strip()
 ]
-if not cors_allowed_origins:
+
+# SECURITY: In production CORS_ALLOWED_ORIGINS must be set to the exact
+# frontend URL. The localhost fallback is only for development.
+cors_origin_regex = os.getenv("CORS_ALLOWED_ORIGIN_REGEX")
+if not cors_allowed_origins and not cors_origin_regex:
     cors_allowed_origins = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
@@ -27,10 +54,7 @@ if not cors_allowed_origins:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_allowed_origins,
-    allow_origin_regex=os.getenv(
-        "CORS_ALLOWED_ORIGIN_REGEX",
-        r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
-    ),
+    allow_origin_regex=cors_origin_regex,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],

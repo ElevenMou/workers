@@ -1,6 +1,9 @@
+import ipaddress
 import logging
 import os
+import socket
 from glob import glob
+from urllib.parse import urlparse
 
 import ffmpeg as ffmpeg_lib
 import yt_dlp
@@ -11,6 +14,79 @@ from config import TEMP_DIR, MAX_VIDEO_SIZE_MB
 _yt_transcript_api = YouTubeTranscriptApi()
 
 logger = logging.getLogger(__name__)
+
+# SECURITY: Only allow known video platform domains to prevent SSRF attacks
+# against internal services (metadata endpoints, Redis, etc.).
+_ALLOWED_DOMAINS: set[str] = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "youtu.be",
+    "vimeo.com",
+    "www.vimeo.com",
+    "player.vimeo.com",
+    "dailymotion.com",
+    "www.dailymotion.com",
+    "twitch.tv",
+    "www.twitch.tv",
+    "clips.twitch.tv",
+    "facebook.com",
+    "www.facebook.com",
+    "fb.watch",
+    "instagram.com",
+    "www.instagram.com",
+    "tiktok.com",
+    "www.tiktok.com",
+    "vm.tiktok.com",
+    "twitter.com",
+    "x.com",
+    "reddit.com",
+    "www.reddit.com",
+    "v.redd.it",
+    "streamable.com",
+    "www.streamable.com",
+}
+
+
+def _validate_url(url: str) -> None:
+    """Validate that a URL targets an allowed video platform.
+
+    Blocks SSRF attempts against internal services, metadata endpoints,
+    private IP ranges, and non-HTTP schemes.
+    """
+    parsed = urlparse(url)
+
+    # Only allow HTTP(S)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
+
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        raise ValueError("URL has no hostname")
+
+    # Block IP addresses entirely (prevents private range probing)
+    try:
+        ip = ipaddress.ip_address(hostname)
+        raise ValueError(f"IP-based URLs are not allowed: {ip}")
+    except ValueError as exc:
+        if "IP-based URLs are not allowed" in str(exc):
+            raise
+
+    # Also resolve the hostname and check for private IPs
+    try:
+        resolved = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for family, _, _, _, addr in resolved:
+            ip = ipaddress.ip_address(addr[0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                raise ValueError(f"URL resolves to a private/reserved IP: {ip}")
+    except socket.gaierror:
+        pass  # DNS resolution failure will be caught by yt-dlp
+
+    # Check domain allowlist
+    if hostname not in _ALLOWED_DOMAINS:
+        raise ValueError(
+            f"Domain '{hostname}' is not in the allowed video platforms list"
+        )
 
 
 class VideoDownloader:
@@ -75,6 +151,7 @@ class VideoDownloader:
 
     def download(self, url: str, video_id: str) -> dict:
         """Download video and return metadata."""
+        _validate_url(url)
         output_path = os.path.join(self.temp_dir, f"{video_id}.mp4")
 
         info = self._download_with_opts(
@@ -125,6 +202,7 @@ class VideoDownloader:
         - does the source expose subtitles/captions?
         - what is the duration for cost calculation?
         """
+        _validate_url(url)
         ydl_opts = self._base_ydl_opts()
         ydl_opts.update(
             {

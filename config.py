@@ -77,7 +77,7 @@ MAX_RETRIES = 3
 # ---------------------------------------------------------------------------
 # Startup validation
 # ---------------------------------------------------------------------------
-_REQUIRED_ENV = ["SUPABASE_URL", "SUPABASE_SERVICE_KEY"]
+_REQUIRED_ENV = ["SUPABASE_URL", "SUPABASE_SERVICE_KEY", "ANTHROPIC_API_KEY"]
 
 
 def validate_env(extra: list[str] | None = None):

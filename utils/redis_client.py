@@ -1,6 +1,10 @@
+import os
+
 import redis
 from rq import Queue
 from config import REDIS_HOST, REDIS_PORT, REDIS_DB, VIDEO_JOB_TIMEOUT, CLIP_JOB_TIMEOUT
+
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 
 # ---------------------------------------------------------------------------
 # Queue configuration - maps queue name → RQ Queue kwargs
@@ -23,6 +27,7 @@ def get_redis_connection() -> redis.Redis:
         host=REDIS_HOST,
         port=REDIS_PORT,
         db=REDIS_DB,
+        password=REDIS_PASSWORD,
         socket_connect_timeout=5,
         # Keep blocking worker operations (BLPOP/PUBSUB) alive.
         socket_timeout=None,

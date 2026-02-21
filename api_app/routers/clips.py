@@ -2,7 +2,11 @@
 
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
 
 from api_app.access_rules import (
     enforce_clip_duration_limit,
@@ -57,7 +61,9 @@ def clip_layout_options() -> ClipLayoutOptionsResponse:
 
 
 @router.post("/clips/generate", response_model=GenerateClipResponse)
+@limiter.limit("20/minute")
 def generate_clip(
+    request: Request,
     payload: GenerateClipRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> GenerateClipResponse:
@@ -148,7 +154,9 @@ def generate_clip(
 
 
 @router.post("/clips/custom", response_model=GenerateClipResponse)
+@limiter.limit("10/minute")
 def custom_clip(
+    request: Request,
     payload: CustomClipRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> GenerateClipResponse:

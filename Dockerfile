@@ -30,8 +30,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # -- Copy application code -------------------------------------------------
 COPY . .
 
-# Ensure the default temp directory exists
-RUN mkdir -p /tmp/video_clipper
+# Create a non-root user for security
+RUN useradd -m -r appuser
+
+# Ensure the default temp directory exists and is writable by appuser
+RUN mkdir -p /tmp/video_clipper && chown appuser:appuser /tmp/video_clipper
+
+# Switch to non-root user
+USER appuser
 
 # Expose the API port
 EXPOSE 8001

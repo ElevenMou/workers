@@ -2,10 +2,14 @@
 
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from api_app.access_rules import enforce_monthly_video_limit, enforce_processing_access_rules
 from api_app.auth import AuthenticatedUser, get_current_user
+
+limiter = Limiter(key_func=get_remote_address)
 from api_app.constants import ANALYZE_TASK_PATH
 from api_app.helpers import enqueue_or_fail, raise_on_error
 from api_app.models import (
@@ -73,7 +77,9 @@ def _raise_if_insufficient_credits(*, user_id: str, required_credits: int):
 
 
 @router.post("/videos/analyze", response_model=AnalyzeVideoResponse)
+@limiter.limit("10/minute")
 def analyze_video(
+    request: Request,
     payload: AnalyzeVideoRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> AnalyzeVideoResponse:
@@ -117,7 +123,10 @@ def analyze_video(
         logger.info("Reusing existing video %s for analyze url", video_id)
     else:
         enforce_monthly_video_limit(user_id, supabase_client=supabase)
-        video_id = payload.videoId or str(uuid4())
+        # SECURITY: Always generate a new UUID for new videos. Never trust
+        # a user-supplied videoId — it could reference another user's video
+        # and the service-role upsert would overwrite it.
+        video_id = str(uuid4())
 
     logger.info(
         "Analyze request - user=%s  video=%s  url=%s  numClips=%d",
@@ -188,7 +197,9 @@ def analyze_video(
 
 
 @router.post("/credits/cost", response_model=CreditsCostByUrlResponse)
+@limiter.limit("15/minute")
 def get_credit_cost_from_url(
+    request: Request,
     payload: CreditsCostByUrlRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> CreditsCostByUrlResponse:

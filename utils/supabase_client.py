@@ -181,9 +181,13 @@ try:
     _patch_client_request_with_retry(_PatchedSyncClient, "gotrue")
     _patch_client_request_with_retry(_postgrest_utils.SyncClient, "postgrest")
     _patch_client_request_with_retry(_storage_utils.SyncClient, "storage")
-except Exception:
-    # If patch fails, let the original error surface; this keeps startup resilient.
-    pass
+except Exception as _patch_exc:
+    # If patch fails, log a warning so operators know retry logic is inactive.
+    logger.warning(
+        "Failed to apply Supabase HTTP retry patches: %s. "
+        "Retry logic will not be active.",
+        _patch_exc,
+    )
 
 validate_env()
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)

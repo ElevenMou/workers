@@ -28,9 +28,10 @@ def get_worker_scale(
             default_clip=NUM_CLIP_WORKERS,
         )
     except Exception as exc:
+        logger.error("Failed to read worker scale target: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Failed to read worker scale target: {exc}",
+            detail="Failed to read worker scale target",
         ) from exc
 
     return WorkerScaleResponse(
@@ -61,9 +62,10 @@ def set_worker_scale(
             default_clip=NUM_CLIP_WORKERS,
         )
     except Exception as exc:
+        logger.error("Failed to update worker scale target: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Failed to update worker scale target: {exc}",
+            detail="Failed to update worker scale target",
         ) from exc
 
     logger.info(
