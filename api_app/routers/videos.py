@@ -6,7 +6,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from api_app.access_rules import enforce_monthly_video_limit, enforce_processing_access_rules
+from api_app.access_rules import (
+    UserAccessContext,
+    enforce_analysis_duration_limit,
+    enforce_monthly_video_limit,
+    enforce_processing_access_rules,
+    get_user_access_context,
+    is_analysis_duration_allowed,
+)
 from api_app.auth import AuthenticatedUser, get_current_user
 
 limiter = Limiter(key_func=get_remote_address)
@@ -24,6 +31,12 @@ from services.video_downloader import VideoDownloader
 from utils.supabase_client import get_credit_balance, has_sufficient_credits, supabase
 
 router = APIRouter()
+_STANDARD_VIDEO_QUEUE = "video-processing"
+_PRIORITY_VIDEO_QUEUE = "video-processing-priority"
+
+
+def _video_queue_for_context(context: UserAccessContext) -> str:
+    return _PRIORITY_VIDEO_QUEUE if context.priority_processing else _STANDARD_VIDEO_QUEUE
 
 
 def _probe_credit_cost_for_url(url_str: str) -> dict:
@@ -36,6 +49,7 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
         return {
             "valid_url": False,
             "analysis_credits": 0,
+            "duration_seconds": 0,
         }
 
     duration_seconds = int(probe.get("duration_seconds") or 0)
@@ -50,12 +64,14 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
         return {
             "valid_url": False,
             "analysis_credits": 0,
+            "duration_seconds": duration_seconds,
         }
 
     analysis_credits = calculate_video_analysis_cost(duration_seconds)
     return {
         "valid_url": True,
         "analysis_credits": analysis_credits,
+        "duration_seconds": duration_seconds,
     }
 
 
@@ -91,7 +107,7 @@ def analyze_video(
     # Fast-fail if user has no credits at all (before URL probing).
     _raise_if_insufficient_credits(user_id=user_id, required_credits=1)
 
-    enforce_processing_access_rules(user_id, supabase_client=supabase)
+    access_context = enforce_processing_access_rules(user_id, supabase_client=supabase)
 
     # Enforce validation gate equivalent to /credits/cost before job enqueue.
     url_probe = _probe_credit_cost_for_url(url_str)
@@ -103,6 +119,12 @@ def analyze_video(
                 "captions (or audio for transcription)."
             ),
         )
+
+    analysis_duration_seconds = int(url_probe.get("duration_seconds") or 0)
+    enforce_analysis_duration_limit(
+        context=access_context,
+        duration_seconds=analysis_duration_seconds,
+    )
 
     _raise_if_insufficient_credits(
         user_id=user_id,
@@ -164,6 +186,7 @@ def analyze_video(
         "url": url_str,
         "numClips": payload.numClips,
         "analysisCredits": int(url_probe["analysis_credits"]),
+        "analysisDurationSeconds": analysis_duration_seconds,
     }
 
     job_resp = (
@@ -184,7 +207,7 @@ def analyze_video(
     raise_on_error(job_resp, "Failed to upsert job")
 
     enqueue_or_fail(
-        queue_name="video-processing",
+        queue_name=_video_queue_for_context(access_context),
         task_path=ANALYZE_TASK_PATH,
         job_data=job_data,
         job_id=job_id,
@@ -206,22 +229,37 @@ def get_credit_cost_from_url(
     """Validate URL for clipping and return analysis credit cost only."""
     url_str = str(payload.url)
     user_id = current_user.id
+    access_context = get_user_access_context(user_id, supabase_client=supabase)
     probe = _probe_credit_cost_for_url(url_str)
+    max_analysis_duration_seconds = access_context.max_analysis_duration_seconds
+    analysis_duration_seconds = int(probe.get("duration_seconds") or 0)
+    duration_limit_exceeded = not is_analysis_duration_allowed(
+        context=access_context,
+        duration_seconds=analysis_duration_seconds,
+    )
+
     if not probe["valid_url"]:
         return CreditsCostByUrlResponse(
             valid_url=False,
             analysisCredits=0,
             totalCredits=0,
+            analysisDurationSeconds=analysis_duration_seconds,
+            maxAnalysisDurationSeconds=max_analysis_duration_seconds,
+            durationLimitExceeded=duration_limit_exceeded,
             currentBalance=get_credit_balance(user_id),
             hasEnoughCredits=False,
         )
 
     analysis_credits = int(probe["analysis_credits"])
     balance = get_credit_balance(user_id)
+    has_enough_credits = balance >= analysis_credits and not duration_limit_exceeded
     return CreditsCostByUrlResponse(
         valid_url=True,
         analysisCredits=analysis_credits,
         totalCredits=analysis_credits,
+        analysisDurationSeconds=analysis_duration_seconds,
+        maxAnalysisDurationSeconds=max_analysis_duration_seconds,
+        durationLimitExceeded=duration_limit_exceeded,
         currentBalance=balance,
-        hasEnoughCredits=balance >= analysis_credits,
+        hasEnoughCredits=has_enough_credits,
     )

@@ -85,6 +85,9 @@ class CreditsCostByUrlResponse(BaseModel):
     valid_url: bool
     analysisCredits: int
     totalCredits: int
+    analysisDurationSeconds: int | None = None
+    maxAnalysisDurationSeconds: int | None = None
+    durationLimitExceeded: bool = False
     currentBalance: Optional[int] = None
     hasEnoughCredits: Optional[bool] = None
 

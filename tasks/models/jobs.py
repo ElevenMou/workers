@@ -10,6 +10,7 @@ class AnalyzeVideoJob(TypedDict):
     url: str
     numClips: NotRequired[int]
     analysisCredits: NotRequired[int]
+    analysisDurationSeconds: NotRequired[int]
 
 
 class GenerateClipJob(TypedDict):
@@ -19,6 +20,7 @@ class GenerateClipJob(TypedDict):
     layoutId: NotRequired[str | None]
     smartCleanupEnabled: NotRequired[bool]
     generationCredits: NotRequired[int]
+    clipRetentionDays: NotRequired[int | None]
 
 
 class CustomClipJob(TypedDict):
@@ -33,3 +35,4 @@ class CustomClipJob(TypedDict):
     layoutId: NotRequired[str | None]
     smartCleanupEnabled: NotRequired[bool]
     generationCredits: NotRequired[int]
+    clipRetentionDays: NotRequired[int | None]

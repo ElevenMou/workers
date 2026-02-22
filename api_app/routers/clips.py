@@ -10,6 +10,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 from api_app.access_rules import (
     UserAccessContext,
+    enforce_custom_clip_access,
     enforce_clip_duration_limit,
     enforce_monthly_video_limit,
     enforce_processing_access_rules,
@@ -30,6 +31,8 @@ from utils.supabase_client import get_credit_balance, has_sufficient_credits, su
 router = APIRouter()
 _ACTIVE_GENERATE_JOB_STATUSES = ("queued", "processing", "retrying")
 _SMART_CLEANUP_ALLOWED_TIERS = {"pro", "enterprise"}
+_STANDARD_CLIP_QUEUE = "clip-generation"
+_PRIORITY_CLIP_QUEUE = "clip-generation-priority"
 
 
 def _raise_if_insufficient_clip_generation_credits(*, user_id: str, required_credits: int):
@@ -62,6 +65,10 @@ def _enforce_smart_cleanup_access(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Smart Cleanup is available for Pro and Enterprise plans only.",
     )
+
+
+def _clip_queue_for_context(context: UserAccessContext) -> str:
+    return _PRIORITY_CLIP_QUEUE if context.priority_processing else _STANDARD_CLIP_QUEUE
 
 
 @router.get("/clips/layout-options", response_model=ClipLayoutOptionsResponse)
@@ -176,6 +183,7 @@ def generate_clip(
         "layoutId": payload.layoutId,
         "smartCleanupEnabled": smart_cleanup_enabled,
         "generationCredits": int(required_credits),
+        "clipRetentionDays": access_context.clip_retention_days,
     }
 
     job_resp = (
@@ -197,7 +205,7 @@ def generate_clip(
     raise_on_error(job_resp, "Failed to upsert job")
 
     enqueue_or_fail(
-        queue_name="clip-generation",
+        queue_name=_clip_queue_for_context(access_context),
         task_path=GENERATE_TASK_PATH,
         job_data=job_data,
         job_id=job_id,
@@ -243,6 +251,7 @@ def custom_clip(
     required_credits = calculate_clip_generation_cost(smart_cleanup_enabled)
 
     access_context = enforce_processing_access_rules(user_id, supabase_client=supabase)
+    enforce_custom_clip_access(context=access_context)
     _enforce_smart_cleanup_access(
         context=access_context,
         smart_cleanup_enabled=smart_cleanup_enabled,
@@ -321,6 +330,7 @@ def custom_clip(
         "layoutId": payload.layoutId,
         "smartCleanupEnabled": smart_cleanup_enabled,
         "generationCredits": int(required_credits),
+        "clipRetentionDays": access_context.clip_retention_days,
     }
 
     job_resp = (
@@ -341,7 +351,7 @@ def custom_clip(
     raise_on_error(job_resp, "Failed to insert job")
 
     enqueue_or_fail(
-        queue_name="clip-generation",
+        queue_name=_clip_queue_for_context(access_context),
         task_path=CUSTOM_CLIP_TASK_PATH,
         job_data=job_data,
         job_id=job_id,

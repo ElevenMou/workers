@@ -18,8 +18,12 @@ from worker_supervisor.startup import (
 )
 from worker_supervisor.state import logger
 
+VIDEO_PRIORITY_QUEUE = "video-processing-priority"
 VIDEO_QUEUE = "video-processing"
+CLIP_PRIORITY_QUEUE = "clip-generation-priority"
 CLIP_QUEUE = "clip-generation"
+VIDEO_QUEUE_ORDER = [VIDEO_PRIORITY_QUEUE, VIDEO_QUEUE]
+CLIP_QUEUE_ORDER = [CLIP_PRIORITY_QUEUE, CLIP_QUEUE]
 VIDEO_PREFIX = "video-worker"
 CLIP_PREFIX = "clip-worker"
 
@@ -27,11 +31,13 @@ CLIP_PREFIX = "clip-worker"
 def run_supervisor() -> int:
     """Run the worker supervisor until interrupted."""
     from config import (
+        CLIP_ASSET_CLEANUP_INTERVAL_SECONDS,
         NUM_CLIP_WORKERS,
         NUM_VIDEO_WORKERS,
         RAW_VIDEO_CLEANUP_INTERVAL_SECONDS,
         validate_env,
     )
+    from tasks.clips.cleanup import cleanup_expired_clip_assets
     from tasks.videos.cleanup import cleanup_expired_raw_videos
     from utils.redis_client import (
         get_redis_connection,
@@ -66,11 +72,16 @@ def run_supervisor() -> int:
         )
 
     for i in range(desired_video_workers):
-        worker_specs[f"{VIDEO_PREFIX}-{i}"] = [VIDEO_QUEUE]
+        worker_specs[f"{VIDEO_PREFIX}-{i}"] = list(VIDEO_QUEUE_ORDER)
     for i in range(desired_clip_workers):
-        worker_specs[f"{CLIP_PREFIX}-{i}"] = [CLIP_QUEUE]
+        worker_specs[f"{CLIP_PREFIX}-{i}"] = list(CLIP_QUEUE_ORDER)
 
-    queue_names = [VIDEO_QUEUE, CLIP_QUEUE]
+    queue_names = [
+        VIDEO_PRIORITY_QUEUE,
+        VIDEO_QUEUE,
+        CLIP_PRIORITY_QUEUE,
+        CLIP_QUEUE,
+    ]
     cleanup_named_workers(startup_conn, set(worker_specs.keys()))
     cleanup_started_jobs_on_start(startup_conn, queue_names)
     recover_processing_rows_on_start()
@@ -98,21 +109,33 @@ def run_supervisor() -> int:
         current_clip_workers,
         total,
     )
-    last_cleanup_run = 0.0
+    last_raw_video_cleanup_run = 0.0
+    last_clip_asset_cleanup_run = 0.0
 
     try:
         while True:
             now = time.monotonic()
             if (
                 RAW_VIDEO_CLEANUP_INTERVAL_SECONDS > 0
-                and now - last_cleanup_run >= RAW_VIDEO_CLEANUP_INTERVAL_SECONDS
+                and now - last_raw_video_cleanup_run >= RAW_VIDEO_CLEANUP_INTERVAL_SECONDS
             ):
                 try:
                     cleanup_expired_raw_videos()
                 except Exception as exc:
                     logger.warning("Expired raw-video cleanup tick failed: %s", exc)
                 finally:
-                    last_cleanup_run = now
+                    last_raw_video_cleanup_run = now
+
+            if (
+                CLIP_ASSET_CLEANUP_INTERVAL_SECONDS > 0
+                and now - last_clip_asset_cleanup_run >= CLIP_ASSET_CLEANUP_INTERVAL_SECONDS
+            ):
+                try:
+                    cleanup_expired_clip_assets()
+                except Exception as exc:
+                    logger.warning("Expired clip-asset cleanup tick failed: %s", exc)
+                finally:
+                    last_clip_asset_cleanup_run = now
 
             try:
                 target_video_workers, target_clip_workers = get_worker_scale_target(
@@ -141,7 +164,7 @@ def run_supervisor() -> int:
                     worker_specs=worker_specs,
                     processes=processes,
                     prefix=VIDEO_PREFIX,
-                    queue_names=[VIDEO_QUEUE],
+                    queue_names=list(VIDEO_QUEUE_ORDER),
                     current_count=current_video_workers,
                     target_count=target_video_workers,
                 )
@@ -150,7 +173,7 @@ def run_supervisor() -> int:
                     worker_specs=worker_specs,
                     processes=processes,
                     prefix=CLIP_PREFIX,
-                    queue_names=[CLIP_QUEUE],
+                    queue_names=list(CLIP_QUEUE_ORDER),
                     current_count=current_clip_workers,
                     target_count=target_clip_workers,
                 )

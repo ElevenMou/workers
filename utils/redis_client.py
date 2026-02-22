@@ -10,7 +10,9 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
 # Queue configuration - maps queue name → RQ Queue kwargs
 # ---------------------------------------------------------------------------
 QUEUE_CONFIG: dict[str, dict] = {
+    "video-processing-priority": {"default_timeout": VIDEO_JOB_TIMEOUT},
     "video-processing": {"default_timeout": VIDEO_JOB_TIMEOUT},
+    "clip-generation-priority": {"default_timeout": CLIP_JOB_TIMEOUT},
     "clip-generation": {"default_timeout": CLIP_JOB_TIMEOUT},
 }
 
@@ -138,5 +140,7 @@ def set_worker_scale_target(
 # Module-level singletons (used by api.py - single process)
 # ---------------------------------------------------------------------------
 redis_conn = get_redis_connection()
+video_priority_queue = get_queue("video-processing-priority", redis_conn)
 video_queue = get_queue("video-processing", redis_conn)
+clip_priority_queue = get_queue("clip-generation-priority", redis_conn)
 clip_queue = get_queue("clip-generation", redis_conn)

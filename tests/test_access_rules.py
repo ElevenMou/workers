@@ -13,13 +13,28 @@ def _context(
     interval: str | None = "month",
     max_videos_per_month: int | None = 60,
     max_clip_duration_seconds: int = 90,
+    max_analysis_duration_seconds: int | None = 45 * 60,
+    max_active_jobs: int | None = None,
+    allow_custom_clips: bool | None = None,
 ) -> access_rules.UserAccessContext:
+    if max_active_jobs is None:
+        resolved_max_active_jobs = (
+            access_rules.FREE_MAX_CONCURRENT_JOBS if tier == "free" else 2
+        )
+    else:
+        resolved_max_active_jobs = max_active_jobs
+    resolved_allow_custom_clips = (
+        tier != "free" if allow_custom_clips is None else allow_custom_clips
+    )
     return access_rules.UserAccessContext(
         tier=tier,
         status=status,
         interval=interval,
         max_videos_per_month=max_videos_per_month,
         max_clip_duration_seconds=max_clip_duration_seconds,
+        max_analysis_duration_seconds=max_analysis_duration_seconds,
+        max_active_jobs=resolved_max_active_jobs,
+        allow_custom_clips=resolved_allow_custom_clips,
     )
 
 
@@ -53,7 +68,7 @@ def test_enforce_processing_rules_blocks_free_parallel_jobs(monkeypatch):
         access_rules.enforce_processing_access_rules("user-1")
 
     assert exc_info.value.status_code == 429
-    assert "one active processing job" in str(exc_info.value.detail).lower()
+    assert "up to 1 active processing jobs" in str(exc_info.value.detail).lower()
 
 
 def test_enforce_monthly_video_limit_blocks_when_limit_reached(monkeypatch):
@@ -87,3 +102,24 @@ def test_enforce_clip_duration_limit_blocks_over_plan_cap(monkeypatch):
 
     assert exc_info.value.status_code == 400
     assert "clips up to 75 seconds" in str(exc_info.value.detail).lower()
+
+
+def test_enforce_custom_clip_access_blocks_when_plan_disallows():
+    with pytest.raises(HTTPException) as exc_info:
+        access_rules.enforce_custom_clip_access(
+            context=_context(tier="free", allow_custom_clips=False),
+        )
+
+    assert exc_info.value.status_code == 403
+    assert "paid plans" in str(exc_info.value.detail).lower()
+
+
+def test_enforce_analysis_duration_limit_blocks_when_over_cap():
+    with pytest.raises(HTTPException) as exc_info:
+        access_rules.enforce_analysis_duration_limit(
+            context=_context(max_analysis_duration_seconds=1200),
+            duration_seconds=1201,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "20 minutes" in str(exc_info.value.detail).lower()

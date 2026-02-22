@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import traceback
+from datetime import datetime, timedelta, timezone
 
 from config import CREDIT_COST_CLIP_GENERATION
 from services.clip_generator import ClipGenerator, compute_video_position
@@ -42,6 +43,22 @@ from utils.supabase_client import (
 logger = logging.getLogger(__name__)
 
 _VIDEO_UPLOAD_OPTIONS = {"content-type": "video/mp4", "cache-control": "3600"}
+
+
+def _parse_retention_days(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _asset_expires_at_iso(retention_days: int | None) -> str | None:
+    if retention_days is None:
+        return None
+    return (datetime.now(timezone.utc) + timedelta(days=retention_days)).isoformat()
 
 
 def _is_duplicate_storage_error(exc: Exception) -> bool:
@@ -127,6 +144,8 @@ def _best_effort_cleanup_uploaded_artifacts(
                         "storage_path": None,
                         "thumbnail_path": None,
                         "file_size_bytes": None,
+                        "asset_expires_at": None,
+                        "asset_expired_at": None,
                     }
                 )
                 .eq("id", clip_id)
@@ -189,6 +208,7 @@ def custom_clip_task(job_data: CustomClipJob):
     layout_id: str | None = None
     layout_should_persist = False
     generation_credits = int(job_data.get("generationCredits") or CREDIT_COST_CLIP_GENERATION)
+    clip_retention_days = _parse_retention_days(job_data.get("clipRetentionDays"))
     smart_cleanup_enabled = bool(job_data.get("smartCleanupEnabled"))
     smart_cleanup_summary = {
         "enabled": smart_cleanup_enabled,
@@ -505,6 +525,8 @@ def custom_clip_task(job_data: CustomClipJob):
             "storage_path": storage_path,
             "thumbnail_path": None,
             "file_size_bytes": result["file_size"],
+            "asset_expires_at": _asset_expires_at_iso(clip_retention_days),
+            "asset_expired_at": None,
         }
         if layout_should_persist and layout_id:
             clip_update["layout_id"] = layout_id

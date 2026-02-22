@@ -35,6 +35,9 @@ CLIP_JOB_TIMEOUT = int(os.getenv("CLIP_JOB_TIMEOUT", 1800))  # 30 min
 RAW_VIDEO_CLEANUP_INTERVAL_SECONDS = int(
     os.getenv("RAW_VIDEO_CLEANUP_INTERVAL_SECONDS", 300)
 )
+CLIP_ASSET_CLEANUP_INTERVAL_SECONDS = int(
+    os.getenv("CLIP_ASSET_CLEANUP_INTERVAL_SECONDS", 300)
+)
 
 # ---------------------------------------------------------------------------
 # Credits - Dynamic pricing based on duration
