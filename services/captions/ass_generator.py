@@ -413,8 +413,16 @@ def _build_events(
     max_lines = _to_int(preset.get("max_lines"), 2)
     uppercase = bool(preset.get("uppercase", False))
     cleanup_punctuation = bool(preset.get("punctuation_cleanup", True))
-    line_delay = max(0.0, _to_float(preset.get("line_delay"), 0.0))
-    style = str(preset.get("style", "grouped"))
+    animation_cfg = preset.get("animation") or {}
+    animation_delay = (
+        _to_float(animation_cfg.get("delay_between_words"), 0.0)
+        if isinstance(animation_cfg, dict)
+        else 0.0
+    )
+    line_delay = max(0.0, _to_float(preset.get("line_delay"), animation_delay))
+    style = str(preset.get("style", "grouped")).strip().lower()
+    if style not in {"grouped", "word_by_word", "karaoke"}:
+        style = "grouped"
     wants_word_highlight = bool(preset.get("word_highlight", False))
     animation_tag = _animation_tag(preset, play_res=play_res)
 

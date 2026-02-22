@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from utils.supabase_client import assert_response_ok, supabase
 
@@ -22,11 +22,71 @@ class LayoutOverrides:
     layout_captions: dict[str, Any] = field(default_factory=dict)
 
 
+LayoutSelectionSource = Literal["requested", "clip", "default", "first_created", "none"]
+
+
+@dataclass(frozen=True)
+class EffectiveLayoutSelection:
+    layout_id: str | None
+    source: LayoutSelectionSource
+
+    @property
+    def should_persist_to_clip(self) -> bool:
+        # Only persist explicit user-requested layout selections.
+        return self.source == "requested"
+
+
 def _normalize_layout_id(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _resolve_user_layout_candidate(
+    *,
+    user_id: str,
+    candidate_layout_id: Any,
+    source: str,
+    job_id: str,
+    logger: logging.Logger,
+) -> str | None:
+    normalized_id = _normalize_layout_id(candidate_layout_id)
+    if not normalized_id:
+        return None
+
+    try:
+        layout_resp = (
+            supabase.table("layouts")
+            .select("id")
+            .eq("id", normalized_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        assert_response_ok(layout_resp, f"Failed to validate {source} layout {normalized_id}")
+    except Exception as exc:
+        logger.warning(
+            "[%s] Failed to validate %s layout %s: %s",
+            job_id,
+            source,
+            normalized_id,
+            exc,
+        )
+        return None
+
+    rows = layout_resp.data or []
+    if not rows:
+        logger.warning(
+            "[%s] Ignoring %s layout %s because it was not found for user %s",
+            job_id,
+            source,
+            normalized_id,
+            user_id,
+        )
+        return None
+
+    return normalized_id
 
 
 def _first_created_layout_id(*, user_id: str) -> str | None:
@@ -56,15 +116,42 @@ def resolve_effective_layout_id(
     user_id: str,
     job_id: str,
     logger: logging.Logger,
-) -> str | None:
+    requested_layout_id: Any = None,
+    clip_layout_id: Any = None,
+) -> EffectiveLayoutSelection:
     """Resolve the layout id to be used for clip rendering.
 
     Priority:
-    1) User default layout (`is_default = true`)
-    2) First created layout (legacy fallback for users without defaults)
-    3) None -> renderer built-in defaults
+    1) Requested layout id from job payload (`layoutId`) if owned by user
+    2) Existing clip layout id if owned by user
+    3) User default layout (`is_default = true`)
+    4) First created layout (legacy fallback for users without defaults)
+    5) None -> renderer built-in defaults
     """
     logger.info("[%s] Resolving effective layout for user %s", job_id, user_id)
+
+    seen_candidate_ids: set[str] = set()
+    for source, candidate in (("requested", requested_layout_id), ("clip", clip_layout_id)):
+        normalized_candidate = _normalize_layout_id(candidate)
+        if not normalized_candidate or normalized_candidate in seen_candidate_ids:
+            continue
+        seen_candidate_ids.add(normalized_candidate)
+
+        resolved_candidate = _resolve_user_layout_candidate(
+            user_id=user_id,
+            candidate_layout_id=normalized_candidate,
+            source=source,
+            job_id=job_id,
+            logger=logger,
+        )
+        if resolved_candidate:
+            logger.info(
+                "[%s] Using %s layout %s",
+                job_id,
+                source,
+                resolved_candidate,
+            )
+            return EffectiveLayoutSelection(layout_id=resolved_candidate, source=source)
 
     try:
         default_layout_resp = (
@@ -81,7 +168,7 @@ def resolve_effective_layout_id(
             default_id = _normalize_layout_id(default_rows[0].get("id"))
             if default_id:
                 logger.info("[%s] Using default layout %s", job_id, default_id)
-                return default_id
+                return EffectiveLayoutSelection(layout_id=default_id, source="default")
     except Exception as exc:
         logger.warning(
             "[%s] Default layout lookup failed, trying fallback strategies: %s",
@@ -92,10 +179,10 @@ def resolve_effective_layout_id(
     first_id = _first_created_layout_id(user_id=user_id)
     if first_id:
         logger.info("[%s] Falling back to first created layout %s", job_id, first_id)
-        return first_id
+        return EffectiveLayoutSelection(layout_id=first_id, source="first_created")
 
     logger.info("[%s] No layout available, using renderer defaults", job_id)
-    return None
+    return EffectiveLayoutSelection(layout_id=None, source="none")
 
 
 def load_layout_overrides(

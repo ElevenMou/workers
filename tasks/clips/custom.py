@@ -42,6 +42,53 @@ logger = logging.getLogger(__name__)
 _VIDEO_UPLOAD_OPTIONS = {"content-type": "video/mp4", "cache-control": "3600"}
 
 
+def _is_duplicate_storage_error(exc: Exception) -> bool:
+    payload = exc.args[0] if getattr(exc, "args", None) else None
+    if isinstance(payload, dict):
+        status_code = payload.get("statusCode")
+        error_name = str(payload.get("error") or "").lower()
+        message = str(payload.get("message") or "").lower()
+        if status_code == 400 and (
+            error_name == "duplicate" or "already exists" in message
+        ):
+            return True
+
+    text = str(exc).lower()
+    return "duplicate" in text or "already exists" in text
+
+
+def _upload_clip_with_replace(
+    *,
+    local_clip_path: str,
+    storage_path: str,
+    job_id: str,
+):
+    with open(local_clip_path, "rb") as file_obj:
+        try:
+            supabase.storage.from_("generated-clips").upload(
+                storage_path,
+                file_obj,
+                file_options=_VIDEO_UPLOAD_OPTIONS,
+            )
+            return
+        except Exception as exc:
+            if not _is_duplicate_storage_error(exc):
+                raise
+
+            logger.warning(
+                "[%s] Storage path %s already exists. Replacing existing artifact.",
+                job_id,
+                storage_path,
+            )
+            supabase.storage.from_("generated-clips").remove([storage_path])
+            file_obj.seek(0)
+            supabase.storage.from_("generated-clips").upload(
+                storage_path,
+                file_obj,
+                file_options=_VIDEO_UPLOAD_OPTIONS,
+            )
+
+
 def _update_clip_job_progress(job_id: str, progress: int, stage: str):
     """Persist custom clip-generation progress plus machine-readable stage."""
     update_job_status(
@@ -127,7 +174,7 @@ def custom_clip_task(job_data: CustomClipJob):
 
     ``job_data`` keys:
         jobId, videoId, clipId, userId, url, startTime, endTime, title,
-        layoutId (optional, ignored in favor of the user's default layout)
+        layoutId (optional, authoritative when valid for the user)
     """
     job_id = job_data["jobId"]
     video_id = job_data["videoId"]
@@ -138,6 +185,7 @@ def custom_clip_task(job_data: CustomClipJob):
     end_time = float(job_data["endTime"])
     title = job_data["title"]
     layout_id: str | None = None
+    layout_should_persist = False
     generation_credits = int(job_data.get("generationCredits") or CREDIT_COST_CLIP_GENERATION)
 
     # -- Per-job working directory ------------------------------------------
@@ -247,11 +295,27 @@ def custom_clip_task(job_data: CustomClipJob):
         assert_response_ok(save_video_resp, f"Failed to save transcript for {video_id}")
 
         # 3. Load layout -------------------------------------------------------
-        layout_id = resolve_effective_layout_id(
+        clip_layout_resp = (
+            supabase.table("clips")
+            .select("layout_id")
+            .eq("id", clip_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        assert_response_ok(clip_layout_resp, f"Failed to load clip layout for {clip_id}")
+        clip_rows = clip_layout_resp.data or []
+        clip_layout_id = clip_rows[0].get("layout_id") if clip_rows else None
+
+        layout_selection = resolve_effective_layout_id(
             user_id=user_id,
             job_id=job_id,
             logger=logger,
+            requested_layout_id=job_data.get("layoutId"),
+            clip_layout_id=clip_layout_id,
         )
+        layout_id = layout_selection.layout_id
+        layout_should_persist = layout_selection.should_persist_to_clip
         layout_overrides = load_layout_overrides(
             user_id=user_id,
             layout_id=layout_id,
@@ -362,12 +426,11 @@ def custom_clip_task(job_data: CustomClipJob):
         _update_clip_job_progress(job_id, 84, "uploading_clip")
         logger.info("[%s] Uploading clip to storage ...", job_id)
 
-        with open(result["clip_path"], "rb") as f:
-            supabase.storage.from_("generated-clips").upload(
-                storage_path,
-                f,
-                file_options=_VIDEO_UPLOAD_OPTIONS,
-            )
+        _upload_clip_with_replace(
+            local_clip_path=result["clip_path"],
+            storage_path=storage_path,
+            job_id=job_id,
+        )
         uploaded_storage_path = storage_path
 
         # 8. Charge credits before finalizing completion state -----------------
@@ -388,7 +451,7 @@ def custom_clip_task(job_data: CustomClipJob):
             "thumbnail_path": None,
             "file_size_bytes": result["file_size"],
         }
-        if layout_id:
+        if layout_should_persist and layout_id:
             clip_update["layout_id"] = layout_id
         clip_update_resp = (
             supabase.table("clips").update(clip_update).eq("id", clip_id).execute()

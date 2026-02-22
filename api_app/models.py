@@ -25,8 +25,8 @@ class GenerateClipRequest(BaseModel):
     layoutId: Optional[str] = Field(
         default=None,
         description=(
-            "Optional client hint; generation currently resolves the user's "
-            "default layout in the worker."
+            "Optional layout id to use for generation. When provided, "
+            "this is authoritative if the layout belongs to the user."
         ),
     )
 
@@ -44,8 +44,8 @@ class CustomClipRequest(BaseModel):
     layoutId: Optional[str] = Field(
         default=None,
         description=(
-            "Optional client hint; generation currently resolves the user's "
-            "default layout in the worker."
+            "Optional layout id to use for generation. When provided, "
+            "this is authoritative if the layout belongs to the user."
         ),
     )
 

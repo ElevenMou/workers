@@ -210,6 +210,16 @@ def _normalize_animation_config(animation: Mapping[str, Any] | None) -> CaptionA
     }
 
 
+def _normalize_style_mode(style: Any, default: str = "grouped") -> str:
+    token = str(style or "").strip().lower()
+    if token in {"grouped", "word_by_word", "karaoke"}:
+        return token
+    fallback = str(default or "grouped").strip().lower()
+    if fallback in {"grouped", "word_by_word", "karaoke"}:
+        return fallback
+    return "grouped"
+
+
 # ---------------------------------------------------------------------------
 # 20 new presets
 # ---------------------------------------------------------------------------
@@ -886,6 +896,7 @@ def _normalize_override_key(key: str) -> str:
         "maxWordsPerLine": "max_words_per_line",
         "maxCharsPerLine": "max_chars_per_line",
         "maxCharsPerCaption": "max_chars_per_line",
+        "linesPerPage": "max_lines",
         "maxLines": "max_lines",
         "safeMarginX": "safe_margin_x",
         "safeMarginY": "safe_margin_y",
@@ -893,6 +904,7 @@ def _normalize_override_key(key: str) -> str:
         "backgroundBox": "background_box",
         "backgroundPadding": "background_padding",
         "lineDelay": "line_delay",
+        "fontCase": "font_case",
         "outlineSize": "outline",
         "shadowSize": "shadow",
     }.get(key, key)
@@ -906,6 +918,11 @@ def resolve_preset(
     base_preset = PRESETS.get(resolved_name) or PRESETS[CAPTION_TEMPLATE_DEFAULTS["presetName"]]
     base = deepcopy(base_preset.to_style_dict())
     if overrides:
+        normalized_override_keys = {
+            _normalize_override_key(str(raw_key))
+            for raw_key in overrides
+        }
+
         for raw_key, value in overrides.items():
             key_name = _normalize_override_key(str(raw_key))
 
@@ -918,6 +935,7 @@ def resolve_preset(
                     current.setdefault("duration", 0.2)
                     current.setdefault("delay_between_words", 0.05)
                     base["animation"] = _normalize_animation_config(current)
+                base["line_delay"] = float((base.get("animation") or {}).get("delay_between_words", 0.0))
                 continue
 
             if key_name in {"primary_color", "secondary_color", "outline_color", "back_color", "highlight_color"}:
@@ -951,7 +969,7 @@ def resolve_preset(
                 if key_name == "margin_h":
                     base["margin_l"] = casted
                     base["margin_r"] = casted
-                if key_name == "max_words_per_line" and "max_chars_per_line" not in overrides:
+                if key_name == "max_words_per_line" and "max_chars_per_line" not in normalized_override_keys:
                     base["max_chars_per_line"] = max(12, casted * 6)
                 continue
 
@@ -970,15 +988,31 @@ def resolve_preset(
 
             if key_name in {"line_delay"}:
                 base[key_name] = max(0.0, _as_float(value, 0.0))
+                animation_cfg = dict(base.get("animation") or {})
+                animation_cfg["delay_between_words"] = base[key_name]
+                base["animation"] = _normalize_animation_config(animation_cfg)
                 continue
 
-            if key_name in {"position", "font_name", "label", "description", "style"}:
+            if key_name in {"font_case"}:
+                case_mode = str(value or "").strip().lower()
+                if case_mode == "uppercase":
+                    base["uppercase"] = True
+                elif case_mode in {"as_typed", "lowercase", "headline"}:
+                    base["uppercase"] = False
+                continue
+
+            if key_name in {"position", "font_name", "label", "description"}:
                 base[key_name] = str(value)
+                continue
+
+            if key_name == "style":
+                base["style"] = _normalize_style_mode(value, default=str(base.get("style", "grouped")))
                 continue
 
             base[key_name] = value
 
-    style_name = str(base.get("style", "grouped")).strip().lower()
+    style_name = _normalize_style_mode(base.get("style"), default="grouped")
+    base["style"] = style_name
     uses_karaoke_fill = style_name == "karaoke" or (
         bool(base.get("word_highlight")) and style_name != "word_by_word"
     )

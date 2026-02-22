@@ -3,7 +3,7 @@
 ## Core API
 
 ```python
-from services.caption_renderer import render_captions
+from services.captions.renderer import render_captions
 
 render_captions(
     video_path="input.mp4",
@@ -13,6 +13,10 @@ render_captions(
     video_aspect_ratio="9:16",
 )
 ```
+
+Compatibility note:
+- `services.caption_renderer` remains as a facade for legacy imports.
+- New code should import from `services.captions.*` modules directly.
 
 ## Preset Example
 

@@ -15,6 +15,8 @@ from services.caption_renderer import (
 )
 from services.captions.positioning import compute_video_anchored_margin_v
 
+_STYLE_MODES = {"grouped", "word_by_word", "karaoke"}
+
 
 def _to_int(value: Any, default: int) -> int:
     try:
@@ -23,8 +25,130 @@ def _to_int(value: Any, default: int) -> int:
         return default
 
 
+def _to_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _clamp(value: int, lower: int, upper: int) -> int:
     return max(lower, min(upper, value))
+
+
+def _as_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _pick_numeric(cap_cfg: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        candidate = _as_number(cap_cfg.get(key))
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _normalize_style_mode(style_value: Any, fallback: Any) -> str:
+    requested = str(style_value or "").strip().lower()
+    if requested in _STYLE_MODES:
+        return requested
+
+    fallback_mode = str(fallback or "").strip().lower()
+    if fallback_mode in _STYLE_MODES:
+        return fallback_mode
+    return "grouped"
+
+
+def _normalize_font_weight_token(value: Any) -> str:
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(int(value))
+    if isinstance(value, str):
+        return value.strip().lower()
+    return ""
+
+
+def _weight_implies_bold(weight_token: str) -> bool | None:
+    if not weight_token:
+        return None
+    if weight_token in {"700", "800", "900", "bold", "black"}:
+        return True
+    if weight_token in {"100", "200", "300", "400", "500", "normal", "regular", "light"}:
+        return False
+    return None
+
+
+def _resolve_ass_font_name(
+    *,
+    font_family: str,
+    font_weight: Any,
+    bold_hint: bool,
+) -> str:
+    raw_family = font_family.strip()
+    if not raw_family:
+        return "Montserrat-Bold"
+
+    # Keep explicit variant names unchanged (for example "Montserrat-Bold").
+    if "-" in raw_family:
+        return raw_family
+
+    normalized_family = raw_family.lower()
+    weight_token = _normalize_font_weight_token(font_weight)
+    weight_is_bold = _weight_implies_bold(weight_token)
+    is_bold = bold_hint if weight_is_bold is None else weight_is_bold
+
+    if normalized_family == "montserrat":
+        if weight_token in {"300", "light"}:
+            return "Montserrat-Light"
+        if weight_token in {"900", "black"}:
+            return "Montserrat-Black"
+        return "Montserrat-Bold" if is_bold else "Montserrat"
+
+    if normalized_family == "poppins":
+        if weight_token in {"900", "black"}:
+            return "Poppins-Black"
+        return "Poppins-Bold" if is_bold else "Poppins"
+
+    if normalized_family == "inter":
+        return "Inter-Bold" if is_bold else "Inter"
+
+    if normalized_family == "roboto":
+        return "Roboto-Bold" if is_bold else "Roboto"
+
+    if normalized_family == "oswald":
+        return "Oswald-Bold" if is_bold else "Oswald"
+
+    if normalized_family == "space mono":
+        return "SpaceMono-Bold" if is_bold else "SpaceMono-Regular"
+
+    return raw_family
+
+
+def _normalize_case_mode(cap_cfg: dict[str, Any], *, preset_defaults: dict[str, Any]) -> bool:
+    case_mode = str(cap_cfg.get("fontCase") or "").strip().lower()
+    if "uppercase" in cap_cfg:
+        return bool(cap_cfg.get("uppercase"))
+    if case_mode:
+        return case_mode == "uppercase"
+    return bool(preset_defaults.get("uppercase", False))
+
+
+def _normalize_word_highlight(
+    cap_cfg: dict[str, Any],
+    *,
+    style_mode: str,
+    preset_defaults: dict[str, Any],
+) -> bool:
+    if "wordHighlight" in cap_cfg:
+        return bool(cap_cfg.get("wordHighlight"))
+    if style_mode == "karaoke":
+        return True
+    return bool(preset_defaults.get("word_highlight", False))
 
 
 def _overrides_from_layout(
@@ -32,9 +156,46 @@ def _overrides_from_layout(
     *,
     canvas_w: int,
     canvas_h: int,
+    preset_name: str = "clean",
 ) -> dict[str, Any]:
-    """Translate layout caption fields into preset override keys."""
+    """Translate layout caption fields into normalized preset override keys."""
     overrides: dict[str, Any] = {}
+    preset_defaults = resolve_preset(preset_name)
+
+    style_mode = _normalize_style_mode(cap_cfg.get("style"), preset_defaults.get("style"))
+    overrides["style"] = style_mode
+    overrides["word_highlight"] = _normalize_word_highlight(
+        cap_cfg,
+        style_mode=style_mode,
+        preset_defaults=preset_defaults,
+    )
+    overrides["uppercase"] = _normalize_case_mode(
+        cap_cfg,
+        preset_defaults=preset_defaults,
+    )
+
+    max_chars = _pick_numeric(cap_cfg, "maxCharsPerCaption", "maxCharsPerLine")
+    if max_chars is None:
+        max_words_per_line = _pick_numeric(cap_cfg, "maxWordsPerLine")
+        if max_words_per_line is not None:
+            max_chars = max_words_per_line * 6.0
+    if max_chars is None:
+        max_chars = float(_to_int(preset_defaults.get("max_chars_per_line"), 30))
+    overrides["max_chars_per_line"] = max(8, int(max_chars))
+
+    max_lines = _pick_numeric(cap_cfg, "linesPerPage", "maxLines")
+    if max_lines is None:
+        max_lines = float(_to_int(preset_defaults.get("max_lines"), 2))
+    overrides["max_lines"] = max(1, int(max_lines))
+
+    line_delay = _pick_numeric(cap_cfg, "lineDelay")
+    if line_delay is None:
+        line_delay = _as_number(preset_defaults.get("line_delay"))
+    if line_delay is None:
+        animation_defaults = preset_defaults.get("animation") or {}
+        if isinstance(animation_defaults, dict):
+            line_delay = _as_number(animation_defaults.get("delay_between_words"))
+    overrides["line_delay"] = max(0.0, _to_float(line_delay, 0.0))
 
     font_size = cap_cfg.get("fontSize")
     if isinstance(font_size, (int, float)):
@@ -42,7 +203,17 @@ def _overrides_from_layout(
 
     font_family = cap_cfg.get("fontFamily")
     if isinstance(font_family, str) and font_family.strip():
-        overrides["font_name"] = font_family.strip()
+        font_weight = cap_cfg.get("fontWeight")
+        bold_hint = bool(overrides.get("uppercase", False))
+        bold_override = _weight_implies_bold(_normalize_font_weight_token(font_weight))
+        if bold_override is not None:
+            overrides["bold"] = bold_override
+            bold_hint = bold_override
+        overrides["font_name"] = _resolve_ass_font_name(
+            font_family=font_family,
+            font_weight=font_weight,
+            bold_hint=bold_hint,
+        )
 
     font_color = cap_cfg.get("fontColor")
     if isinstance(font_color, str) and font_color.strip():
@@ -91,41 +262,12 @@ def _overrides_from_layout(
     elif normalized_position:
         overrides["position"] = normalized_position
 
-    max_chars = cap_cfg.get("maxCharsPerCaption")
-    if isinstance(max_chars, (int, float)):
-        overrides["max_chars_per_line"] = max(8, int(max_chars))
-
-    max_lines = cap_cfg.get("maxLines")
-    if isinstance(max_lines, (int, float)):
-        overrides["max_lines"] = max(1, int(max_lines))
-
-    line_delay = cap_cfg.get("lineDelay")
-    if isinstance(line_delay, (int, float)):
-        overrides["line_delay"] = max(0.0, float(line_delay))
-
-    if "wordHighlight" in cap_cfg:
-        overrides["word_highlight"] = bool(cap_cfg.get("wordHighlight"))
     if "backgroundBox" in cap_cfg:
         overrides["background_box"] = bool(cap_cfg.get("backgroundBox"))
-    if "uppercase" in cap_cfg:
-        overrides["uppercase"] = bool(cap_cfg.get("uppercase"))
-    elif str(cap_cfg.get("fontCase", "")).lower() == "uppercase":
-        overrides["uppercase"] = True
 
     animation = cap_cfg.get("animation")
     if isinstance(animation, str) and animation.strip():
         overrides["animation"] = animation.strip()
-
-    # Map the new style field ("grouped", "word_by_word", "karaoke").
-    # When style is "karaoke", also enable word_highlight so the ASS
-    # generator uses \kf tags for progressive fill.
-    style = cap_cfg.get("style")
-    if isinstance(style, str) and style.strip():
-        normalized_style = style.strip().lower()
-        if normalized_style in {"grouped", "word_by_word", "karaoke"}:
-            overrides["style"] = normalized_style
-            if normalized_style == "karaoke":
-                overrides["word_highlight"] = True
 
     return overrides
 
@@ -172,6 +314,7 @@ def build_caption_ass(
         cap_cfg,
         canvas_w=canvas_w,
         canvas_h=canvas_h,
+        preset_name=preset_name,
     )
     resolved_preset = resolve_preset(preset_name, overrides=overrides)
     requested_position = str(

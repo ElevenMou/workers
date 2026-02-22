@@ -16,7 +16,7 @@ class GenerateClipJob(TypedDict):
     jobId: str
     clipId: str
     userId: str
-    layoutId: NotRequired[str]
+    layoutId: NotRequired[str | None]
     generationCredits: NotRequired[int]
 
 
@@ -29,5 +29,5 @@ class CustomClipJob(TypedDict):
     startTime: float
     endTime: float
     title: str
-    layoutId: NotRequired[str]
+    layoutId: NotRequired[str | None]
     generationCredits: NotRequired[int]
