@@ -1048,11 +1048,19 @@ def resolve_caption_preset(preset: str | None) -> dict[str, Any]:
     # For frontend template payload keep semantic fields:
     # - fontColor = base text
     # - highlightColor = highlight sweep
-    font_color = (
+    font_color_ass = (
         str(cfg.get("secondary_color", CAPTION_TEMPLATE_DEFAULTS["fontColor"]))
         if uses_karaoke_fill
         else str(cfg.get("primary_color", CAPTION_TEMPLATE_DEFAULTS["fontColor"]))
     )
+    highlight_color_ass = str(cfg.get("highlight_color", CAPTION_TEMPLATE_DEFAULTS["highlightColor"]))
+    outline_color_ass = str(cfg.get("outline_color", CAPTION_TEMPLATE_DEFAULTS["strokeColor"]))
+    back_color_ass = str(cfg.get("back_color", CAPTION_TEMPLATE_DEFAULTS["shadowColor"]))
+
+    font_name = str(cfg.get("font_name", CAPTION_TEMPLATE_DEFAULTS["fontFamily"]))
+    is_uppercase = bool(cfg.get("uppercase", CAPTION_TEMPLATE_DEFAULTS["uppercase"]))
+    max_words_per_line = int(cfg.get("max_words_per_line", 4))
+
     return {
         **CAPTION_TEMPLATE_DEFAULTS,
         "show": True,
@@ -1060,19 +1068,29 @@ def resolve_caption_preset(preset: str | None) -> dict[str, Any]:
         "animation": animation.get("type", "none"),
         "position": cfg.get("position", "auto"),
         "fontSize": int(cfg.get("font_size", CAPTION_TEMPLATE_DEFAULTS["fontSize"])),
-        "fontFamily": str(cfg.get("font_name", CAPTION_TEMPLATE_DEFAULTS["fontFamily"])),
-        "fontColor": font_color,
-        "highlightColor": str(cfg.get("highlight_color", CAPTION_TEMPLATE_DEFAULTS["highlightColor"])),
-        "strokeColor": str(cfg.get("outline_color", CAPTION_TEMPLATE_DEFAULTS["strokeColor"])),
-        "shadowColor": str(cfg.get("back_color", CAPTION_TEMPLATE_DEFAULTS["shadowColor"])),
+        "fontFamily": font_name,
+        "fontWeight": _font_weight_from_name(font_name),
+        "fontCase": _font_case_from_uppercase(is_uppercase),
+        "fontColor": _ass_to_hex(font_color_ass),
+        "highlightColor": _ass_to_hex(highlight_color_ass),
+        "strokeColor": _ass_to_hex(outline_color_ass),
+        "strokeThickness": int(cfg.get("outline", 3)),
+        "shadowColor": _ass_to_hex(back_color_ass),
+        "shadowX": int(cfg.get("shadow", 0)),
+        "shadowY": int(cfg.get("shadow", 0)),
+        "shadowBlur": int(cfg.get("shadow", 0)),
+        "italic": bool(cfg.get("italic", False)),
+        "underline": bool(cfg.get("underline", False)),
         "maxCharsPerCaption": int(
             cfg.get("max_chars_per_line", CAPTION_TEMPLATE_DEFAULTS["maxCharsPerCaption"])
         ),
+        "maxWordsPerLine": max_words_per_line,
+        "linesPerPage": int(cfg.get("max_lines", CAPTION_TEMPLATE_DEFAULTS["maxLines"])),
         "maxLines": int(cfg.get("max_lines", CAPTION_TEMPLATE_DEFAULTS["maxLines"])),
         "lineDelay": float(
             animation.get("delay_between_words", cfg.get("line_delay", CAPTION_TEMPLATE_DEFAULTS["lineDelay"]))
         ),
-        "uppercase": bool(cfg.get("uppercase", CAPTION_TEMPLATE_DEFAULTS["uppercase"])),
+        "uppercase": is_uppercase,
         "wordHighlight": bool(cfg.get("word_highlight", CAPTION_TEMPLATE_DEFAULTS["wordHighlight"])),
         "backgroundBox": bool(cfg.get("background_box", CAPTION_TEMPLATE_DEFAULTS["backgroundBox"])),
         "style": cfg.get("style", "grouped"),
@@ -1113,6 +1131,38 @@ def list_caption_presets() -> list[dict[str, Any]]:
             }
         )
     return presets
+
+
+def _ass_to_hex(ass_color: str) -> str:
+    """Convert ASS &HAABBGGRR color to #RRGGBB hex format for frontend use."""
+    if not ass_color or not ass_color.startswith("&H"):
+        return ass_color
+    raw = ass_color[2:].rstrip("&").upper()
+    if len(raw) == 8:
+        # &HAABBGGRR -> #RRGGBB (drop alpha)
+        b, g, r = raw[2:4], raw[4:6], raw[6:8]
+        return f"#{r}{g}{b}"
+    if len(raw) == 6:
+        # &HBBGGRR -> #RRGGBB
+        b, g, r = raw[0:2], raw[2:4], raw[4:6]
+        return f"#{r}{g}{b}"
+    return ass_color
+
+
+def _font_weight_from_name(font_name: str) -> str:
+    """Derive a CSS-like font weight token from an ASS font name."""
+    lower = font_name.lower()
+    if "black" in lower:
+        return "900"
+    if "bold" in lower:
+        return "bold"
+    if "light" in lower:
+        return "300"
+    return "normal"
+
+
+def _font_case_from_uppercase(uppercase: bool) -> str:
+    return "uppercase" if uppercase else "as_typed"
 
 
 def _hex_to_ass(hex_color: str) -> str:

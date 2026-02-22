@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from types import SimpleNamespace
 
 from services.captions.ass_generator import generate_ass_content
@@ -9,6 +10,7 @@ from tasks.clips.helpers.layout import EffectiveLayoutSelection, resolve_effecti
 
 
 LOGGER = logging.getLogger(__name__)
+_DIALOGUE_RE = re.compile(r"^Dialogue:\s*\d+,([^,]+),([^,]+),[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,(.*)$")
 
 
 def _sample_transcript() -> dict:
@@ -26,6 +28,27 @@ def _sample_transcript() -> dict:
             }
         ]
     }
+
+
+def _dialogue_rows(ass_text: str) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for line in ass_text.splitlines():
+        matched = _DIALOGUE_RE.match(line)
+        if not matched:
+            continue
+        rows.append((matched.group(1), matched.group(2), matched.group(3)))
+    return rows
+
+
+def _parse_ass_time(timestamp: str) -> float:
+    hours_raw, minutes_raw, seconds_raw = timestamp.split(":")
+    seconds_token, centis_raw = seconds_raw.split(".")
+    return (
+        int(hours_raw) * 3600
+        + int(minutes_raw) * 60
+        + int(seconds_token)
+        + int(centis_raw) / 100.0
+    )
 
 
 def test_caption_override_precedence_for_chars_lines_and_delay():
@@ -137,6 +160,62 @@ def test_animation_karaoke_does_not_force_karaoke_mode_without_style_or_word_hig
 
     assert ass.count("Dialogue:") == 1
     assert r"{\kf" not in ass
+
+
+def test_word_by_word_events_preserve_page_line_breaks():
+    transcript = {
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 3.5,
+                "text": "ONE TWO THREE FOUR FIVE SIX",
+                "words": [
+                    {"word": "ONE", "start": 0.0, "end": 0.5},
+                    {"word": "TWO", "start": 0.5, "end": 1.0},
+                    {"word": "THREE", "start": 1.0, "end": 1.5},
+                    {"word": "FOUR", "start": 1.5, "end": 2.0},
+                    {"word": "FIVE", "start": 2.0, "end": 2.6},
+                    {"word": "SIX", "start": 2.6, "end": 3.5},
+                ],
+            }
+        ]
+    }
+
+    ass = generate_ass_content(
+        transcript,
+        "mrbeast",
+        overrides={
+            "style": "word_by_word",
+            "max_chars_per_line": 10,
+            "max_lines": 2,
+            "line_delay": 0.0,
+        },
+    )
+
+    dialogue_texts = [row[2] for row in _dialogue_rows(ass)]
+    assert dialogue_texts
+    assert any(r"\N" in text for text in dialogue_texts)
+
+
+def test_word_by_word_line_delay_is_applied_per_event():
+    ass = generate_ass_content(
+        _sample_transcript(),
+        "mrbeast",
+        overrides={
+            "style": "word_by_word",
+            "max_chars_per_line": 120,
+            "max_lines": 2,
+            "line_delay": 0.2,
+        },
+    )
+
+    rows = _dialogue_rows(ass)
+    assert len(rows) >= 2
+    start_0 = _parse_ass_time(rows[0][0])
+    start_1 = _parse_ass_time(rows[1][0])
+    # Source word starts are 0.0, 0.8; per-event delay should push the second start.
+    assert start_0 == 0.0
+    assert start_1 > 0.8
 
 
 class _DefaultLayoutQuery:

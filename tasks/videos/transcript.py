@@ -49,9 +49,33 @@ def transcript_has_word_timing(transcript: dict[str, Any] | None) -> bool:
     return False
 
 
+_WORD_LEVEL_STYLES = {"word_by_word", "karaoke"}
+
+
+def needs_whisper_retranscription(
+    transcript: dict[str, Any] | None,
+    caption_style: str,
+) -> bool:
+    """Return True when the clip needs Whisper for accurate word timing.
+
+    Conditions:
+    1. The transcript source is "youtube" (no word-level timing).
+    2. The caption style requires word-level timing (word_by_word or karaoke).
+    """
+    if caption_style.strip().lower() not in _WORD_LEVEL_STYLES:
+        return False
+    if not isinstance(transcript, dict):
+        return False
+    if transcript.get("source") != "youtube":
+        return False
+    if transcript_has_word_timing(transcript):
+        return False
+    return True
+
+
 def transcribe_clip_window_with_whisper(
     *,
-    audio_path: str,
+    media_path: str,
     work_dir: str,
     clip_id: str,
     start_time: float,
@@ -68,7 +92,7 @@ def transcribe_clip_window_with_whisper(
     window_duration = max(1.0, window_end - window_start)
 
     clip_audio_path = os.path.join(work_dir, f"{clip_id}_window_audio.mp3")
-    ffmpeg_lib.input(audio_path, ss=window_start, t=window_duration).output(
+    ffmpeg_lib.input(media_path, ss=window_start, t=window_duration).output(
         clip_audio_path,
         ac=1,
         ar=16000,

@@ -18,6 +18,19 @@ from services.captions.positioning import compute_video_anchored_margin_v
 _STYLE_MODES = {"grouped", "word_by_word", "karaoke"}
 
 
+def resolve_caption_style_mode(cap_cfg: dict[str, Any]) -> str:
+    """Determine the effective caption style mode from layout config."""
+    requested_preset = (
+        cap_cfg.get("presetName")
+        or cap_cfg.get("preset")
+        or cap_cfg.get("style")
+        or "clean"
+    )
+    preset_name = normalize_caption_style(str(requested_preset))
+    preset_defaults = resolve_preset(preset_name)
+    return _normalize_style_mode(cap_cfg.get("style"), preset_defaults.get("style"))
+
+
 def _to_int(value: Any, default: int) -> int:
     try:
         return int(value)

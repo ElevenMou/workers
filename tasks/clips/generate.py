@@ -7,7 +7,11 @@ from config import CREDIT_COST_CLIP_GENERATION
 from services.clip_generator import ClipGenerator, compute_video_position
 from services.clips.constants import canvas_size_for_aspect_ratio
 from services.video_downloader import VideoDownloader
-from tasks.clips.helpers.captions import build_caption_ass
+from tasks.clips.helpers.captions import build_caption_ass, resolve_caption_style_mode
+from tasks.videos.transcript import (
+    needs_whisper_retranscription,
+    transcribe_clip_window_with_whisper,
+)
 from tasks.clips.helpers.layout import (
     load_layout_overrides,
     maybe_download_layout_background_image,
@@ -339,10 +343,49 @@ def generate_clip_task(job_data: GenerateClipJob):
         )
 
         _update_clip_job_progress(job_id, 40, "preparing_captions")
+
+        # -- Whisper re-transcription for word-level caption styles -----------
+        # Prefer clip-level Whisper transcript (from a previous generation),
+        # fall back to the video-level transcript (YouTube or Whisper).
+        transcript = clip.get("transcript") or clip["videos"].get("transcript")
+        caption_style = resolve_caption_style_mode(cap_cfg)
+
+        if needs_whisper_retranscription(transcript, caption_style):
+            logger.info(
+                "[%s] YouTube transcript lacks word timing; "
+                "re-transcribing clip segment with Whisper for '%s' style",
+                job_id,
+                caption_style,
+            )
+            _update_clip_job_progress(job_id, 42, "retranscribing_with_whisper")
+            video_duration = clip["videos"].get("duration_seconds") or (end_time + 10)
+            transcript = transcribe_clip_window_with_whisper(
+                media_path=video_file,
+                work_dir=work_dir,
+                clip_id=clip_id,
+                start_time=start_time,
+                end_time=end_time,
+                video_duration_seconds=float(video_duration),
+            )
+            # Store the Whisper transcript on the clip row for reuse
+            try:
+                supabase.table("clips").update(
+                    {"transcript": transcript}
+                ).eq("id", clip_id).execute()
+                logger.info("[%s] Stored Whisper transcript on clip %s", job_id, clip_id)
+            except Exception:
+                logger.warning(
+                    "[%s] Failed to store Whisper transcript in DB; "
+                    "continuing with ephemeral transcript",
+                    job_id,
+                    exc_info=True,
+                )
+            _update_clip_job_progress(job_id, 50, "preparing_captions")
+
         caption_ass_path = build_caption_ass(
             job_id=job_id,
             clip_id=clip_id,
-            transcript=clip["videos"].get("transcript"),
+            transcript=transcript,
             cap_cfg=cap_cfg,
             start_time=start_time,
             end_time=end_time,

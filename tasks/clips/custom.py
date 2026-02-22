@@ -273,7 +273,7 @@ def custom_clip_task(job_data: CustomClipJob):
 
             _update_clip_job_progress(job_id, 45, "transcribing_audio")
             transcript = transcribe_clip_window_with_whisper(
-                audio_path=audio_path,
+                media_path=audio_path,
                 work_dir=work_dir,
                 clip_id=clip_id,
                 start_time=start_time,

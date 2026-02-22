@@ -40,5 +40,6 @@ def test_word_by_word_does_not_swap_primary_and_secondary():
 
 def test_frontend_caption_payload_keeps_font_color_semantics_for_karaoke():
     payload = resolve_caption_preset("karaoke_gold")
-    assert payload["fontColor"] == "&H00FFFFFF"
-    assert payload["highlightColor"] == "&H0000D7FF"
+    # resolve_caption_preset now returns hex colors for frontend consumption
+    assert payload["fontColor"] == "#FFFFFF"
+    assert payload["highlightColor"] == "#FFD700"

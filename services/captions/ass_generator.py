@@ -360,6 +360,7 @@ def _build_word_by_word_events(
 ) -> list[DialogueEvent]:
     """Generate accumulating word-by-word events for each page."""
     events: list[DialogueEvent] = []
+    generated_events = 0
 
     for page in pages:
         flat_words = [word for line in page for word in line]
@@ -369,27 +370,38 @@ def _build_word_by_word_events(
         page_start, page_end = _page_start_end(page, segment)
 
         for word_idx, word in enumerate(flat_words):
-            # Each event shows all words up to current, with animation on the newest
-            accumulated = flat_words[:word_idx + 1]
-
-            event_start = word.start + (event_index * line_delay)
+            # Use page-scoped word_idx instead of global event_offset to
+            # prevent cumulative timing drift across the entire clip.
+            event_start = word.start + (word_idx * line_delay)
             # Event lasts until next word starts or page ends
             if word_idx + 1 < len(flat_words):
-                event_end = flat_words[word_idx + 1].start + (event_index * line_delay)
+                event_end = flat_words[word_idx + 1].start + (word_idx * line_delay)
             else:
-                event_end = page_end + (event_index * line_delay)
+                event_end = page_end + (word_idx * line_delay)
 
             if event_end <= event_start:
                 event_end = event_start + _MIN_EVENT_DURATION_SECONDS
 
-            # Build text: previous words plain, current word gets animation tag
-            parts: list[str] = []
-            for i, w in enumerate(accumulated):
-                token = _line_text([w], uppercase=uppercase, cleanup_punctuation=cleanup_punctuation)
+            # Preserve wrapped page lines while accumulating words.
+            remaining_words = word_idx + 1
+            line_parts: list[str] = []
+            for line_words in page:
+                if remaining_words <= 0:
+                    break
+                take = min(len(line_words), remaining_words)
+                if take <= 0:
+                    continue
+                token = _line_text(
+                    line_words[:take],
+                    uppercase=uppercase,
+                    cleanup_punctuation=cleanup_punctuation,
+                )
                 escaped = _escape_ass_text(token)
-                parts.append(escaped)
+                if escaped:
+                    line_parts.append(escaped)
+                remaining_words -= take
 
-            text = " ".join(parts)
+            text = r"\N".join(line_parts)
             if not text:
                 continue
 
@@ -399,6 +411,7 @@ def _build_word_by_word_events(
                 text=text,
                 animation_tag=animation_tag,
             ))
+            generated_events += 1
 
     return events
 
@@ -439,20 +452,22 @@ def _build_events(
 
         if style == "word_by_word":
             # Each word appears individually with animation
-            events.extend(_build_word_by_word_events(
+            word_events = _build_word_by_word_events(
                 pages, segment, preset,
                 uppercase=uppercase,
                 cleanup_punctuation=cleanup_punctuation,
                 animation_tag=animation_tag,
                 line_delay=line_delay,
                 event_index=event_index,
-            ))
-            event_index += sum(len(line) for page in pages for line in page)
+            )
+            events.extend(word_events)
+            event_index += len(word_events)
         elif style == "karaoke" or (wants_word_highlight and bool(words)):
-            # All words visible but use \kf tags for progressive fill
-            for page in pages:
+            # All words visible but use \kf tags for progressive fill.
+            # Use segment-scoped page_idx to prevent cumulative drift.
+            for page_idx, page in enumerate(pages):
                 start, end = _page_start_end(page, segment)
-                delay_seconds = event_index * line_delay
+                delay_seconds = page_idx * line_delay
                 start += delay_seconds
                 end += delay_seconds
                 if end <= start:
@@ -462,10 +477,11 @@ def _build_events(
                     events.append(DialogueEvent(start=start, end=end, text=text, animation_tag=animation_tag))
                     event_index += 1
         else:
-            # grouped (default): one event per page
-            for page in pages:
+            # grouped (default): one event per page.
+            # Use segment-scoped page_idx to prevent cumulative drift.
+            for page_idx, page in enumerate(pages):
                 start, end = _page_start_end(page, segment)
-                delay_seconds = event_index * line_delay
+                delay_seconds = page_idx * line_delay
                 start += delay_seconds
                 end += delay_seconds
                 if end <= start:
@@ -532,7 +548,7 @@ def generate_ass_content(
         "ScaledBorderAndShadow: yes",
         f"PlayResX: {play_res[0]}",
         f"PlayResY: {play_res[1]}",
-        "WrapStyle: 2",
+        "WrapStyle: 0",
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
