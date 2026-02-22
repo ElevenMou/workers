@@ -12,6 +12,7 @@ transformers==4.45.0
 anthropic==0.39.0
 youtube-transcript-api==1.2.4
 openai-whisper==20250625
+stopwordsiso==0.6.1
 fastapi==0.115.0
 uvicorn==0.32.0
 slowapi==0.1.9

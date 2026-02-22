@@ -9,6 +9,7 @@ from slowapi.util import get_remote_address
 limiter = Limiter(key_func=get_remote_address)
 
 from api_app.access_rules import (
+    UserAccessContext,
     enforce_clip_duration_limit,
     enforce_monthly_video_limit,
     enforce_processing_access_rules,
@@ -23,15 +24,16 @@ from api_app.models import (
     GenerateClipResponse,
 )
 from api_app.state import logger
-from config import CREDIT_COST_CLIP_GENERATION
+from config import calculate_clip_generation_cost
 from utils.supabase_client import get_credit_balance, has_sufficient_credits, supabase
 
 router = APIRouter()
 _ACTIVE_GENERATE_JOB_STATUSES = ("queued", "processing", "retrying")
+_SMART_CLEANUP_ALLOWED_TIERS = {"pro", "enterprise"}
 
 
-def _raise_if_insufficient_clip_generation_credits(*, user_id: str):
-    required = int(CREDIT_COST_CLIP_GENERATION)
+def _raise_if_insufficient_clip_generation_credits(*, user_id: str, required_credits: int):
+    required = int(required_credits)
     if has_sufficient_credits(user_id=user_id, amount=required):
         return
 
@@ -42,6 +44,23 @@ def _raise_if_insufficient_clip_generation_credits(*, user_id: str):
             "Insufficient credits for clip generation. "
             f"Required: {required}, available: {balance}."
         ),
+    )
+
+
+def _enforce_smart_cleanup_access(
+    *,
+    context: UserAccessContext,
+    smart_cleanup_enabled: bool,
+):
+    if not smart_cleanup_enabled:
+        return
+
+    if context.tier in _SMART_CLEANUP_ALLOWED_TIERS:
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Smart Cleanup is available for Pro and Enterprise plans only.",
     )
 
 
@@ -71,11 +90,14 @@ def generate_clip(
     """Enqueue generation for an existing suggested clip."""
     job_id = str(uuid4())
     user_id = current_user.id
+    smart_cleanup_enabled = bool(payload.smartCleanupEnabled)
+    required_credits = calculate_clip_generation_cost(smart_cleanup_enabled)
 
     logger.info(
-        "Generate clip request - user=%s  clip=%s",
+        "Generate clip request - user=%s clip=%s smart_cleanup=%s",
         user_id,
         payload.clipId,
+        smart_cleanup_enabled,
     )
 
     clip_resp = (
@@ -137,15 +159,23 @@ def generate_clip(
             status=active_job["status"],
         )
 
-    _raise_if_insufficient_clip_generation_credits(user_id=user_id)
-    enforce_processing_access_rules(user_id, supabase_client=supabase)
+    access_context = enforce_processing_access_rules(user_id, supabase_client=supabase)
+    _enforce_smart_cleanup_access(
+        context=access_context,
+        smart_cleanup_enabled=smart_cleanup_enabled,
+    )
+    _raise_if_insufficient_clip_generation_credits(
+        user_id=user_id,
+        required_credits=required_credits,
+    )
 
     job_data = {
         "jobId": job_id,
         "clipId": payload.clipId,
         "userId": user_id,
         "layoutId": payload.layoutId,
-        "generationCredits": int(CREDIT_COST_CLIP_GENERATION),
+        "smartCleanupEnabled": smart_cleanup_enabled,
+        "generationCredits": int(required_credits),
     }
 
     job_resp = (
@@ -209,8 +239,18 @@ def custom_clip(
     job_id = str(uuid4())
     url_str = str(payload.url)
     user_id = current_user.id
-    _raise_if_insufficient_clip_generation_credits(user_id=user_id)
-    enforce_processing_access_rules(user_id, supabase_client=supabase)
+    smart_cleanup_enabled = bool(payload.smartCleanupEnabled)
+    required_credits = calculate_clip_generation_cost(smart_cleanup_enabled)
+
+    access_context = enforce_processing_access_rules(user_id, supabase_client=supabase)
+    _enforce_smart_cleanup_access(
+        context=access_context,
+        smart_cleanup_enabled=smart_cleanup_enabled,
+    )
+    _raise_if_insufficient_clip_generation_credits(
+        user_id=user_id,
+        required_credits=required_credits,
+    )
     enforce_clip_duration_limit(
         user_id=user_id,
         duration_seconds=duration,
@@ -218,11 +258,12 @@ def custom_clip(
     )
 
     logger.info(
-        "Custom clip request - user=%s  url=%s  %.2f-%.2f",
+        "Custom clip request - user=%s url=%s %.2f-%.2f smart_cleanup=%s",
         user_id,
         url_str,
         payload.startTime,
         payload.endTime,
+        smart_cleanup_enabled,
     )
 
     existing = (
@@ -278,7 +319,8 @@ def custom_clip(
         "endTime": payload.endTime,
         "title": payload.title,
         "layoutId": payload.layoutId,
-        "generationCredits": int(CREDIT_COST_CLIP_GENERATION),
+        "smartCleanupEnabled": smart_cleanup_enabled,
+        "generationCredits": int(required_credits),
     }
 
     job_resp = (

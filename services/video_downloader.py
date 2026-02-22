@@ -282,7 +282,13 @@ class VideoDownloader:
 
         full_text = " ".join(s["text"] for s in segments)
 
-        return {"text": full_text, "segments": segments, "source": "youtube"}
+        return {
+            "text": full_text,
+            "segments": segments,
+            "source": "youtube",
+            "language": fetched.language_code,
+            "languageCode": fetched.language_code,
+        }
 
     def extract_audio(self, video_path: str) -> str:
         """Extract audio from video for Whisper transcription."""

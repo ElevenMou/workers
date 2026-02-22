@@ -33,4 +33,10 @@ class Transcriber:
         """Transcribe audio with word-level timestamps."""
         logger.info("Transcribing %s", audio_path)
         result = self.model.transcribe(audio_path, word_timestamps=True, language="en")
-        return {"text": result["text"], "segments": result["segments"]}
+        language = str(result.get("language") or "en").strip().lower()
+        return {
+            "text": result["text"],
+            "segments": result["segments"],
+            "language": language,
+            "languageCode": language,
+        }

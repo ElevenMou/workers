@@ -29,6 +29,13 @@ class GenerateClipRequest(BaseModel):
             "this is authoritative if the layout belongs to the user."
         ),
     )
+    smartCleanupEnabled: bool = Field(
+        default=False,
+        description=(
+            "Whether to apply Smart Cleanup (remove filler words and long silences). "
+            "Available for pro/enterprise tiers only."
+        ),
+    )
 
 
 class CustomClipRequest(BaseModel):
@@ -46,6 +53,13 @@ class CustomClipRequest(BaseModel):
         description=(
             "Optional layout id to use for generation. When provided, "
             "this is authoritative if the layout belongs to the user."
+        ),
+    )
+    smartCleanupEnabled: bool = Field(
+        default=False,
+        description=(
+            "Whether to apply Smart Cleanup (remove filler words and long silences). "
+            "Available for pro/enterprise tiers only."
         ),
     )
 

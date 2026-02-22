@@ -66,6 +66,16 @@ def calculate_video_analysis_cost(duration_seconds: int) -> int:
 
 
 CREDIT_COST_CLIP_GENERATION = 2
+CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE = 2
+
+
+def calculate_clip_generation_cost(smart_cleanup_enabled: bool) -> int:
+    """Return clip generation credit cost with optional Smart Cleanup surcharge."""
+    return int(CREDIT_COST_CLIP_GENERATION) + (
+        int(CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE)
+        if smart_cleanup_enabled
+        else 0
+    )
 
 # ---------------------------------------------------------------------------
 # Processing

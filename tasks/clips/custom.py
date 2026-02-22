@@ -21,9 +21,11 @@ from tasks.clips.helpers.layout import (
     resolve_effective_layout_id,
 )
 from tasks.clips.helpers.media import probe_video_size
+from tasks.clips.helpers.smart_cleanup import apply_balanced_smart_cleanup
 from tasks.models.jobs import CustomClipJob
 from tasks.models.layout import merge_layout_configs
 from tasks.videos.transcript import (
+    transcript_has_word_timing,
     transcribe_clip_window_with_whisper,
 )
 from utils.workdirs import create_work_dir
@@ -187,6 +189,14 @@ def custom_clip_task(job_data: CustomClipJob):
     layout_id: str | None = None
     layout_should_persist = False
     generation_credits = int(job_data.get("generationCredits") or CREDIT_COST_CLIP_GENERATION)
+    smart_cleanup_enabled = bool(job_data.get("smartCleanupEnabled"))
+    smart_cleanup_summary = {
+        "enabled": smart_cleanup_enabled,
+        "stopwords_removed": 0,
+        "silence_seconds_removed": 0.0,
+        "original_duration_seconds": 0.0,
+        "output_duration_seconds": 0.0,
+    }
 
     # -- Per-job working directory ------------------------------------------
     work_dir = create_work_dir(f"custom_{clip_id}")
@@ -282,6 +292,22 @@ def custom_clip_task(job_data: CustomClipJob):
             )
             partial_transcript = True
 
+        if smart_cleanup_enabled and not transcript_has_word_timing(transcript):
+            _update_clip_job_progress(job_id, 45, "transcribing_audio")
+            logger.info(
+                "[%s] Re-transcribing with Whisper because Smart Cleanup requires word timing",
+                job_id,
+            )
+            transcript = transcribe_clip_window_with_whisper(
+                media_path=video_path,
+                work_dir=work_dir,
+                clip_id=clip_id,
+                start_time=start_time,
+                end_time=end_time,
+                video_duration_seconds=duration_seconds,
+            )
+            partial_transcript = True
+
         _update_clip_job_progress(job_id, 52, "loading_layout")
 
         # Save transcript on video row only when it represents the full video.
@@ -343,6 +369,35 @@ def custom_clip_task(job_data: CustomClipJob):
             job_id=job_id,
             logger=logger,
         )
+
+        if smart_cleanup_enabled:
+            _update_clip_job_progress(job_id, 60, "applying_smart_cleanup")
+            cleanup_result = apply_balanced_smart_cleanup(
+                transcript=transcript,
+                video_path=video_path,
+                clip_id=clip_id,
+                work_dir=work_dir,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            video_path = cleanup_result["video_path"]
+            transcript = cleanup_result["transcript"]
+            summary = cleanup_result["summary"]
+            smart_cleanup_summary = {
+                "enabled": True,
+                "stopwords_removed": int(summary.get("stopwords_removed", 0)),
+                "silence_seconds_removed": float(
+                    summary.get("silence_seconds_removed", 0.0)
+                ),
+                "original_duration_seconds": float(
+                    summary.get("original_duration_seconds", 0.0)
+                ),
+                "output_duration_seconds": float(
+                    summary.get("output_duration_seconds", 0.0)
+                ),
+            }
+            start_time = 0.0
+            end_time = float(smart_cleanup_summary["output_duration_seconds"])
 
         # 4. Compute video position for caption placement ----------------------
         src_w, src_h = probe_video_size(video_path)
@@ -466,6 +521,7 @@ def custom_clip_task(job_data: CustomClipJob):
                 "stage": "completed",
                 "storage_path": storage_path,
                 "file_size": result["file_size"],
+                "smart_cleanup": smart_cleanup_summary,
             },
         )
         logger.info("[%s] Custom clip completed: %s", job_id, clip_id)

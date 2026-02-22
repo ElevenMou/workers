@@ -8,8 +8,10 @@ from services.clip_generator import ClipGenerator, compute_video_position
 from services.clips.constants import canvas_size_for_aspect_ratio
 from services.video_downloader import VideoDownloader
 from tasks.clips.helpers.captions import build_caption_ass, resolve_caption_style_mode
+from tasks.clips.helpers.smart_cleanup import apply_balanced_smart_cleanup
 from tasks.videos.transcript import (
     needs_whisper_retranscription,
+    transcript_has_word_timing,
     transcribe_clip_window_with_whisper,
 )
 from tasks.clips.helpers.layout import (
@@ -202,6 +204,14 @@ def generate_clip_task(job_data: GenerateClipJob):
     layout_id: str | None = None
     layout_should_persist = False
     generation_credits = int(job_data.get("generationCredits") or CREDIT_COST_CLIP_GENERATION)
+    smart_cleanup_enabled = bool(job_data.get("smartCleanupEnabled"))
+    smart_cleanup_summary = {
+        "enabled": smart_cleanup_enabled,
+        "stopwords_removed": 0,
+        "silence_seconds_removed": 0.0,
+        "original_duration_seconds": 0.0,
+        "output_duration_seconds": 0.0,
+    }
 
     # -- Per-clip working directory for isolation -------------------------
     work_dir = create_work_dir(f"clip_{clip_id}")
@@ -349,13 +359,23 @@ def generate_clip_task(job_data: GenerateClipJob):
         # fall back to the video-level transcript (YouTube or Whisper).
         transcript = clip.get("transcript") or clip["videos"].get("transcript")
         caption_style = resolve_caption_style_mode(cap_cfg)
+        should_retranscribe_for_captions = needs_whisper_retranscription(
+            transcript, caption_style
+        )
+        should_retranscribe_for_smart_cleanup = (
+            smart_cleanup_enabled and not transcript_has_word_timing(transcript)
+        )
 
-        if needs_whisper_retranscription(transcript, caption_style):
+        if should_retranscribe_for_captions or should_retranscribe_for_smart_cleanup:
+            retranscribe_reason = (
+                f"caption style '{caption_style}' requires word timing"
+                if should_retranscribe_for_captions
+                else "Smart Cleanup requires word timing"
+            )
             logger.info(
-                "[%s] YouTube transcript lacks word timing; "
-                "re-transcribing clip segment with Whisper for '%s' style",
+                "[%s] Re-transcribing clip segment with Whisper (%s)",
                 job_id,
-                caption_style,
+                retranscribe_reason,
             )
             _update_clip_job_progress(job_id, 42, "retranscribing_with_whisper")
             video_duration = clip["videos"].get("duration_seconds") or (end_time + 10)
@@ -381,6 +401,36 @@ def generate_clip_task(job_data: GenerateClipJob):
                     exc_info=True,
                 )
             _update_clip_job_progress(job_id, 50, "preparing_captions")
+
+        if smart_cleanup_enabled:
+            _update_clip_job_progress(job_id, 54, "applying_smart_cleanup")
+            cleanup_result = apply_balanced_smart_cleanup(
+                transcript=transcript,
+                video_path=video_file,
+                clip_id=clip_id,
+                work_dir=work_dir,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            video_file = cleanup_result["video_path"]
+            transcript = cleanup_result["transcript"]
+            summary = cleanup_result["summary"]
+            smart_cleanup_summary = {
+                "enabled": True,
+                "stopwords_removed": int(summary.get("stopwords_removed", 0)),
+                "silence_seconds_removed": float(
+                    summary.get("silence_seconds_removed", 0.0)
+                ),
+                "original_duration_seconds": float(
+                    summary.get("original_duration_seconds", 0.0)
+                ),
+                "output_duration_seconds": float(
+                    summary.get("output_duration_seconds", 0.0)
+                ),
+            }
+            start_time = 0.0
+            end_time = float(smart_cleanup_summary["output_duration_seconds"])
+            _update_clip_job_progress(job_id, 58, "preparing_captions")
 
         caption_ass_path = build_caption_ass(
             job_id=job_id,
@@ -504,6 +554,7 @@ def generate_clip_task(job_data: GenerateClipJob):
                 "stage": "completed",
                 "storage_path": storage_path,
                 "file_size": result["file_size"],
+                "smart_cleanup": smart_cleanup_summary,
             },
         )
         logger.info("[%s] Clip generation completed: %s", job_id, clip_id)
