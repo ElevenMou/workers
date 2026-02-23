@@ -82,6 +82,9 @@ class _FakeGenerateJobsQuery:
     def eq(self, *_args, **_kwargs):
         return self
 
+    def is_(self, *_args, **_kwargs):
+        return self
+
     def in_(self, *_args, **_kwargs):
         return self
 
@@ -257,18 +260,27 @@ def test_credit_cost_endpoint_returns_explicit_fields(client, monkeypatch):
 
     response = client.post(
         "/credits/cost",
-        json={"url": "https://www.youtube.com/watch?v=FWkVBjcVw18"},
+        json={
+            "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
+            "numClips": 8,
+        },
     )
     assert response.status_code == 200
     payload = response.json()
     assert payload["valid_url"] is True
     assert payload["analysisCredits"] >= 0
     assert payload["totalCredits"] == payload["analysisCredits"]
+    assert payload["requestedClipCount"] == 8
+    assert payload["clipGenerationCreditsPerClip"] == 2
+    assert payload["estimatedGenerationCredits"] == 16
+    assert payload["estimatedTotalCredits"] == payload["analysisCredits"] + 16
+    assert payload["smartCleanupSurchargePerClip"] == 1
     assert payload["analysisDurationSeconds"] == 120
     assert payload["maxAnalysisDurationSeconds"] is not None
     assert payload["durationLimitExceeded"] is False
     assert payload["currentBalance"] == 25
     assert payload["hasEnoughCredits"] is True
+    assert payload["hasEnoughCreditsForEstimatedTotal"] is True
 
 
 def test_credit_cost_endpoint_flags_duration_limit_exceeded(client, monkeypatch):
@@ -308,7 +320,10 @@ def test_credit_cost_endpoint_flags_duration_limit_exceeded(client, monkeypatch)
 
     response = client.post(
         "/credits/cost",
-        json={"url": "https://www.youtube.com/watch?v=FWkVBjcVw18"},
+        json={
+            "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
+            "numClips": 6,
+        },
     )
     assert response.status_code == 200
     payload = response.json()
@@ -316,6 +331,59 @@ def test_credit_cost_endpoint_flags_duration_limit_exceeded(client, monkeypatch)
     assert payload["durationLimitExceeded"] is True
     assert payload["maxAnalysisDurationSeconds"] == 1200
     assert payload["hasEnoughCredits"] is False
+    assert payload["hasEnoughCreditsForEstimatedTotal"] is False
+
+
+def test_credit_cost_endpoint_tracks_estimated_total_balance_separately(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+
+    def _fake_probe(_self, _url: str):
+        return {
+            "duration_seconds": 120,
+            "can_download": True,
+            "has_captions": False,
+            "has_audio": True,
+        }
+
+    monkeypatch.setattr(videos_router.VideoDownloader, "probe_url", _fake_probe)
+    monkeypatch.setattr(videos_router, "whisper_ready", lambda: True)
+    monkeypatch.setattr(videos_router, "get_credit_balance", lambda _user_id: 12)
+    monkeypatch.setattr(
+        videos_router,
+        "get_user_access_context",
+        lambda *_args, **_kwargs: access_rules.UserAccessContext(
+            tier="basic",
+            status="active",
+            interval="month",
+            max_videos_per_month=60,
+            max_clip_duration_seconds=90,
+            max_analysis_duration_seconds=45 * 60,
+            allow_custom_clips=True,
+            max_active_jobs=2,
+        ),
+    )
+
+    response = client.post(
+        "/credits/cost",
+        json={
+            "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
+            "numClips": 5,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["analysisCredits"] == 3
+    assert payload["estimatedGenerationCredits"] == 10
+    assert payload["estimatedTotalCredits"] == 13
+    assert payload["hasEnoughCredits"] is True
+    assert payload["hasEnoughCreditsForEstimatedTotal"] is False
 
 
 def test_analyze_video_fails_early_when_no_credits(client, monkeypatch):
@@ -506,7 +574,7 @@ def test_custom_clip_rejects_smart_cleanup_for_basic_tier(client, monkeypatch):
     ]
 
 
-def test_generate_clip_sets_four_credits_for_pro_smart_cleanup(client, monkeypatch):
+def test_generate_clip_sets_three_credits_for_pro_smart_cleanup(client, monkeypatch):
     from api_app.app import app
 
     app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
@@ -555,10 +623,10 @@ def test_generate_clip_sets_four_credits_for_pro_smart_cleanup(client, monkeypat
     )
 
     assert response.status_code == 200
-    assert checked_amounts[-1] == 4
+    assert checked_amounts[-1] == 3
     assert enqueued_job_data is not None
     assert enqueued_queue_name == "clip-generation-priority"
-    assert enqueued_job_data["generationCredits"] == 4
+    assert enqueued_job_data["generationCredits"] == 3
     assert enqueued_job_data["smartCleanupEnabled"] is True
 
 

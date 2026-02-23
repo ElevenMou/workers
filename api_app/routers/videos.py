@@ -26,7 +26,11 @@ from api_app.models import (
     CreditsCostByUrlResponse,
 )
 from api_app.state import logger, whisper_ready
-from config import calculate_video_analysis_cost
+from config import (
+    CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE,
+    calculate_clip_generation_cost,
+    calculate_video_analysis_cost,
+)
 from services.video_downloader import VideoDownloader
 from utils.supabase_client import (
     get_credit_balance,
@@ -268,8 +272,11 @@ def get_credit_cost_from_url(
     payload: CreditsCostByUrlRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> CreditsCostByUrlResponse:
-    """Validate URL for clipping and return analysis credit cost only."""
+    """Validate URL and return analysis cost plus clip-generation estimate."""
     url_str = str(payload.url)
+    requested_clip_count = int(payload.numClips)
+    clip_generation_credits_per_clip = calculate_clip_generation_cost(False)
+    smart_cleanup_surcharge_per_clip = int(CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE)
     user_id = current_user.id
     access_context = get_user_access_context(user_id, supabase_client=supabase)
     probe = _probe_credit_cost_for_url(url_str)
@@ -291,22 +298,39 @@ def get_credit_cost_from_url(
             valid_url=False,
             analysisCredits=0,
             totalCredits=0,
+            requestedClipCount=requested_clip_count,
+            clipGenerationCreditsPerClip=clip_generation_credits_per_clip,
+            estimatedGenerationCredits=0,
+            smartCleanupSurchargePerClip=smart_cleanup_surcharge_per_clip,
+            estimatedTotalCredits=0,
             analysisDurationSeconds=analysis_duration_seconds,
             maxAnalysisDurationSeconds=max_analysis_duration_seconds,
             durationLimitExceeded=duration_limit_exceeded,
             currentBalance=current_balance,
             hasEnoughCredits=False,
+            hasEnoughCreditsForEstimatedTotal=False,
         )
 
     analysis_credits = int(probe["analysis_credits"])
+    estimated_generation_credits = requested_clip_count * clip_generation_credits_per_clip
+    estimated_total_credits = analysis_credits + estimated_generation_credits
     has_enough_credits = current_balance >= analysis_credits and not duration_limit_exceeded
+    has_enough_credits_for_estimated_total = (
+        current_balance >= estimated_total_credits and not duration_limit_exceeded
+    )
     return CreditsCostByUrlResponse(
         valid_url=True,
         analysisCredits=analysis_credits,
         totalCredits=analysis_credits,
+        requestedClipCount=requested_clip_count,
+        clipGenerationCreditsPerClip=clip_generation_credits_per_clip,
+        estimatedGenerationCredits=estimated_generation_credits,
+        smartCleanupSurchargePerClip=smart_cleanup_surcharge_per_clip,
+        estimatedTotalCredits=estimated_total_credits,
         analysisDurationSeconds=analysis_duration_seconds,
         maxAnalysisDurationSeconds=max_analysis_duration_seconds,
         durationLimitExceeded=duration_limit_exceeded,
         currentBalance=current_balance,
         hasEnoughCredits=has_enough_credits,
+        hasEnoughCreditsForEstimatedTotal=has_enough_credits_for_estimated_total,
     )

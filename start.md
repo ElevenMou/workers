@@ -67,12 +67,21 @@ PURGE_QUEUED_JOBS_ON_START=false
 FAIL_STARTED_JOBS_ON_START=true
 FAIL_PROCESSING_ROWS_ON_START=true
 RAW_VIDEO_CLEANUP_INTERVAL_SECONDS=300
+POLAR_ACCESS_TOKEN=polar_org_token_with_events_write_scope
+POLAR_ENV=sandbox
+POLAR_USAGE_EVENTS_ENABLED=true
+POLAR_USAGE_EVENT_ANALYSIS_NAME=clipscut.analysis.usage
+POLAR_USAGE_EVENT_GENERATION_NAME=clipscut.generation.usage
+POLAR_USAGE_EVENT_TIMEOUT_SECONDS=5
+# Optional when not using an organization token:
+# POLAR_ORGANIZATION_ID=org_xxx
 ```
 
 Notes:
 - `PURGE_QUEUED_JOBS_ON_START` now defaults to `false` and should stay `false` in production.
 - Use `WORKER_SCALE_ADMIN_USER_IDS` (comma-separated) to allow `/workers/scale` admin access.
 - Mutating API routes (`/videos/analyze`, `/clips/generate`, `/clips/custom`, `/workers/scale`) now require a valid `Authorization: Bearer <supabase-jwt>` header.
+- Polar usage event ingestion is non-blocking. If Polar is unavailable, jobs still complete and credits are still charged.
 
 ### 7) Test database connection
 

@@ -91,17 +91,29 @@ class ClipLayoutOptionsResponse(BaseModel):
 
 class CreditsCostByUrlRequest(BaseModel):
     url: HttpUrl
+    numClips: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Estimated number of clips for generation cost projection.",
+    )
 
 
 class CreditsCostByUrlResponse(BaseModel):
     valid_url: bool
     analysisCredits: int
     totalCredits: int
+    requestedClipCount: int = 0
+    clipGenerationCreditsPerClip: int = 0
+    estimatedGenerationCredits: int = 0
+    smartCleanupSurchargePerClip: int = 0
+    estimatedTotalCredits: int = 0
     analysisDurationSeconds: int | None = None
     maxAnalysisDurationSeconds: int | None = None
     durationLimitExceeded: bool = False
     currentBalance: Optional[int] = None
     hasEnoughCredits: Optional[bool] = None
+    hasEnoughCreditsForEstimatedTotal: Optional[bool] = None
 
 
 class CaptionModesResponse(BaseModel):

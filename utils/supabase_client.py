@@ -9,7 +9,14 @@ from typing import Any
 
 from supabase import Client, create_client
 
-from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, validate_env
+from config import (
+    POLAR_USAGE_EVENT_ANALYSIS_NAME,
+    POLAR_USAGE_EVENT_GENERATION_NAME,
+    SUPABASE_SERVICE_KEY,
+    SUPABASE_URL,
+    validate_env,
+)
+from utils.polar_usage import emit_polar_usage_event
 
 logger = logging.getLogger(__name__)
 _FREE_RESET_RPC_AVAILABLE: bool | None = None
@@ -385,6 +392,63 @@ def has_sufficient_credits(
     return bool(response.data)
 
 
+def _build_usage_external_id(
+    *,
+    category: str,
+    owner_user_id: str,
+    amount: int,
+    job_id: str | None,
+    video_id: str | None,
+    clip_id: str | None,
+) -> str:
+    stable_ref = job_id or clip_id or video_id or owner_user_id
+    return f"{category}:{stable_ref}:{owner_user_id}:{amount}"
+
+
+def _emit_usage_event_after_charge(
+    *,
+    event_name: str,
+    category: str,
+    owner_user_id: str,
+    actor_user_id: str,
+    amount: int,
+    charge_source: str,
+    team_id: str | None,
+    job_id: str | None,
+    video_id: str | None,
+    clip_id: str | None,
+    usage_metadata: dict[str, Any] | None,
+) -> None:
+    external_id = _build_usage_external_id(
+        category=category,
+        owner_user_id=owner_user_id,
+        amount=amount,
+        job_id=job_id,
+        video_id=video_id,
+        clip_id=clip_id,
+    )
+    metadata: dict[str, Any] = {
+        "units": int(amount),
+        "transaction_type": category,
+        "charge_source": charge_source,
+        "team_id": team_id,
+        "job_id": job_id,
+        "video_id": video_id,
+        "clip_id": clip_id,
+        "billing_owner_user_id": owner_user_id,
+        "actor_user_id": actor_user_id,
+    }
+    if usage_metadata:
+        metadata.update(usage_metadata)
+
+    emit_polar_usage_event(
+        event_name=event_name,
+        external_customer_id=owner_user_id,
+        external_id=external_id,
+        metadata=metadata,
+    )
+
+
 def charge_clip_generation_credits(
     *,
     user_id: str,
@@ -397,6 +461,7 @@ def charge_clip_generation_credits(
     billing_owner_user_id: str | None = None,
     actor_user_id: str | None = None,
     job_id: str | None = None,
+    usage_metadata: dict[str, Any] | None = None,
 ):
     owner_user_id = billing_owner_user_id or user_id
     actor_id = actor_user_id or user_id
@@ -415,6 +480,19 @@ def charge_clip_generation_credits(
             job_id=job_id,
             context="Failed to charge clip-generation credits",
         )
+        _emit_usage_event_after_charge(
+            event_name=POLAR_USAGE_EVENT_GENERATION_NAME,
+            category="clip_generation",
+            owner_user_id=owner_user_id,
+            actor_user_id=actor_id,
+            amount=amount,
+            charge_source=charge_source,
+            team_id=team_id,
+            job_id=job_id,
+            video_id=video_id,
+            clip_id=clip_id,
+            usage_metadata=usage_metadata,
+        )
         return
 
     _charge_credits_or_raise(
@@ -425,6 +503,19 @@ def charge_clip_generation_credits(
         video_id=video_id,
         clip_id=clip_id,
         context="Failed to charge clip-generation credits",
+    )
+    _emit_usage_event_after_charge(
+        event_name=POLAR_USAGE_EVENT_GENERATION_NAME,
+        category="clip_generation",
+        owner_user_id=owner_user_id,
+        actor_user_id=actor_id,
+        amount=amount,
+        charge_source=charge_source,
+        team_id=team_id,
+        job_id=job_id,
+        video_id=video_id,
+        clip_id=clip_id,
+        usage_metadata=usage_metadata,
     )
 
 
@@ -439,6 +530,7 @@ def charge_video_analysis_credits(
     billing_owner_user_id: str | None = None,
     actor_user_id: str | None = None,
     job_id: str | None = None,
+    usage_metadata: dict[str, Any] | None = None,
 ):
     owner_user_id = billing_owner_user_id or user_id
     actor_id = actor_user_id or user_id
@@ -457,6 +549,19 @@ def charge_video_analysis_credits(
             job_id=job_id,
             context="Failed to charge video-analysis credits",
         )
+        _emit_usage_event_after_charge(
+            event_name=POLAR_USAGE_EVENT_ANALYSIS_NAME,
+            category="video_analysis",
+            owner_user_id=owner_user_id,
+            actor_user_id=actor_id,
+            amount=amount,
+            charge_source=charge_source,
+            team_id=team_id,
+            job_id=job_id,
+            video_id=video_id,
+            clip_id=None,
+            usage_metadata=usage_metadata,
+        )
         return
 
     _charge_credits_or_raise(
@@ -467,6 +572,19 @@ def charge_video_analysis_credits(
         video_id=video_id,
         clip_id=None,
         context="Failed to charge video-analysis credits",
+    )
+    _emit_usage_event_after_charge(
+        event_name=POLAR_USAGE_EVENT_ANALYSIS_NAME,
+        category="video_analysis",
+        owner_user_id=owner_user_id,
+        actor_user_id=actor_id,
+        amount=amount,
+        charge_source=charge_source,
+        team_id=team_id,
+        job_id=job_id,
+        video_id=video_id,
+        clip_id=None,
+        usage_metadata=usage_metadata,
     )
 
 

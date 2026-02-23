@@ -275,6 +275,13 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             billing_owner_user_id=billing_owner_user_id,
             actor_user_id=user_id,
             job_id=job_id,
+            usage_metadata={
+                "analyses_count": 1,
+                "video_duration_seconds": duration_seconds,
+                "requested_clip_count": num_clips,
+                "suggested_clip_count": inserted_count,
+                "platform": video_data.get("platform"),
+            },
         )
 
         finalize_video_resp = supabase.table("videos").update(

@@ -569,6 +569,13 @@ def generate_clip_task(job_data: GenerateClipJob):
             billing_owner_user_id=billing_owner_user_id,
             actor_user_id=user_id,
             job_id=job_id,
+            usage_metadata={
+                "units_generated": 1,
+                "smart_cleanup_enabled": smart_cleanup_enabled,
+                "clip_duration_seconds": max(0.0, end_time - start_time),
+                "workspace_role": workspace_role,
+                "generation_flow": "suggested",
+            },
         )
 
         # Update clip record

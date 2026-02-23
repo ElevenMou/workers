@@ -6,6 +6,14 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # Supabase
 # ---------------------------------------------------------------------------
@@ -69,7 +77,7 @@ def calculate_video_analysis_cost(duration_seconds: int) -> int:
 
 
 CREDIT_COST_CLIP_GENERATION = 2
-CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE = 2
+CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE = 1
 
 
 def calculate_clip_generation_cost(smart_cleanup_enabled: bool) -> int:
@@ -79,6 +87,26 @@ def calculate_clip_generation_cost(smart_cleanup_enabled: bool) -> int:
         if smart_cleanup_enabled
         else 0
     )
+
+
+# ---------------------------------------------------------------------------
+# Polar usage events (optional)
+# ---------------------------------------------------------------------------
+POLAR_ENV = os.getenv("POLAR_ENV", "sandbox")
+POLAR_ACCESS_TOKEN = os.getenv("POLAR_ACCESS_TOKEN")
+POLAR_ORGANIZATION_ID = os.getenv("POLAR_ORGANIZATION_ID")
+POLAR_USAGE_EVENTS_ENABLED = _env_bool("POLAR_USAGE_EVENTS_ENABLED", True)
+POLAR_USAGE_EVENT_TIMEOUT_SECONDS = float(
+    os.getenv("POLAR_USAGE_EVENT_TIMEOUT_SECONDS", "5")
+)
+POLAR_USAGE_EVENT_ANALYSIS_NAME = os.getenv(
+    "POLAR_USAGE_EVENT_ANALYSIS_NAME",
+    "clipscut.analysis.usage",
+)
+POLAR_USAGE_EVENT_GENERATION_NAME = os.getenv(
+    "POLAR_USAGE_EVENT_GENERATION_NAME",
+    "clipscut.generation.usage",
+)
 
 # ---------------------------------------------------------------------------
 # Processing
