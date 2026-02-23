@@ -46,6 +46,8 @@ def _normalize_layout_id(value: Any) -> str | None:
 def _resolve_user_layout_candidate(
     *,
     user_id: str,
+    workspace_team_id: str | None,
+    workspace_role: str,
     candidate_layout_id: Any,
     source: str,
     job_id: str,
@@ -56,14 +58,12 @@ def _resolve_user_layout_candidate(
         return None
 
     try:
-        layout_resp = (
-            supabase.table("layouts")
-            .select("id")
-            .eq("id", normalized_id)
-            .eq("user_id", user_id)
-            .limit(1)
-            .execute()
-        )
+        layout_query = supabase.table("layouts").select("id").eq("id", normalized_id)
+        if workspace_team_id:
+            layout_query = layout_query.eq("team_id", workspace_team_id)
+        else:
+            layout_query = layout_query.eq("user_id", user_id).is_("team_id", "null")
+        layout_resp = layout_query.limit(1).execute()
         assert_response_ok(layout_resp, f"Failed to validate {source} layout {normalized_id}")
     except Exception as exc:
         logger.warning(
@@ -78,22 +78,24 @@ def _resolve_user_layout_candidate(
     rows = layout_resp.data or []
     if not rows:
         logger.warning(
-            "[%s] Ignoring %s layout %s because it was not found for user %s",
+            "[%s] Ignoring %s layout %s because it was not found in active workspace",
             job_id,
             source,
             normalized_id,
-            user_id,
         )
         return None
 
     return normalized_id
 
 
-def _first_created_layout_id(*, user_id: str) -> str | None:
+def _first_created_layout_id(*, user_id: str, workspace_team_id: str | None) -> str | None:
+    first_layout_query = supabase.table("layouts").select("id")
+    if workspace_team_id:
+        first_layout_query = first_layout_query.eq("team_id", workspace_team_id)
+    else:
+        first_layout_query = first_layout_query.eq("user_id", user_id).is_("team_id", "null")
     first_layout_resp = (
-        supabase.table("layouts")
-        .select("id")
-        .eq("user_id", user_id)
+        first_layout_query
         .order("created_at", desc=False)
         .order("id", desc=False)
         .limit(1)
@@ -114,6 +116,8 @@ def _first_created_layout_id(*, user_id: str) -> str | None:
 def resolve_effective_layout_id(
     *,
     user_id: str,
+    workspace_team_id: str | None = None,
+    workspace_role: str = "owner",
     job_id: str,
     logger: logging.Logger,
     requested_layout_id: Any = None,
@@ -139,6 +143,8 @@ def resolve_effective_layout_id(
 
         resolved_candidate = _resolve_user_layout_candidate(
             user_id=user_id,
+            workspace_team_id=workspace_team_id,
+            workspace_role=workspace_role,
             candidate_layout_id=normalized_candidate,
             source=source,
             job_id=job_id,
@@ -154,14 +160,19 @@ def resolve_effective_layout_id(
             return EffectiveLayoutSelection(layout_id=resolved_candidate, source=source)
 
     try:
-        default_layout_resp = (
+        default_layout_query = (
             supabase.table("layouts")
             .select("id")
-            .eq("user_id", user_id)
             .eq("is_default", True)
-            .limit(1)
-            .execute()
         )
+        if workspace_team_id:
+            default_layout_query = default_layout_query.eq("team_id", workspace_team_id)
+        else:
+            default_layout_query = default_layout_query.eq("user_id", user_id).is_(
+                "team_id",
+                "null",
+            )
+        default_layout_resp = default_layout_query.limit(1).execute()
         assert_response_ok(default_layout_resp, "Failed to load default layout")
         default_rows = default_layout_resp.data or []
         if default_rows:
@@ -176,7 +187,10 @@ def resolve_effective_layout_id(
             exc,
         )
 
-    first_id = _first_created_layout_id(user_id=user_id)
+    first_id = _first_created_layout_id(
+        user_id=user_id,
+        workspace_team_id=workspace_team_id,
+    )
     if first_id:
         logger.info("[%s] Falling back to first created layout %s", job_id, first_id)
         return EffectiveLayoutSelection(layout_id=first_id, source="first_created")
@@ -188,6 +202,8 @@ def resolve_effective_layout_id(
 def load_layout_overrides(
     *,
     user_id: str,
+    workspace_team_id: str | None = None,
+    workspace_role: str = "owner",
     layout_id: str | None,
     job_id: str,
     logger: logging.Logger,
@@ -198,14 +214,12 @@ def load_layout_overrides(
         return overrides
 
     logger.info("[%s] Loading layout %s ...", job_id, layout_id)
-    layout_resp = (
-        supabase.table("layouts")
-        .select("*")
-        .eq("id", layout_id)
-        .eq("user_id", user_id)
-        .single()
-        .execute()
-    )
+    layout_query = supabase.table("layouts").select("*").eq("id", layout_id)
+    if workspace_team_id:
+        layout_query = layout_query.eq("team_id", workspace_team_id)
+    else:
+        layout_query = layout_query.eq("user_id", user_id).is_("team_id", "null")
+    layout_resp = layout_query.single().execute()
     assert_response_ok(layout_resp, f"Failed to load layout {layout_id}")
 
     layout = layout_resp.data

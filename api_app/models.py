@@ -12,6 +12,10 @@ class AnalyzeVideoRequest(BaseModel):
         default=None,
         description="Optional existing video id to reuse",
     )
+    workspaceTeamId: Optional[str] = Field(
+        default=None,
+        description="Optional workspace team id hint (server resolves active workspace).",
+    )
 
 
 class AnalyzeVideoResponse(BaseModel):
@@ -35,6 +39,10 @@ class GenerateClipRequest(BaseModel):
             "Whether to apply Smart Cleanup (remove filler words and long silences). "
             "Available for pro/enterprise tiers only."
         ),
+    )
+    workspaceTeamId: Optional[str] = Field(
+        default=None,
+        description="Optional workspace team id hint (server resolves active workspace).",
     )
 
 
@@ -61,6 +69,10 @@ class CustomClipRequest(BaseModel):
             "Whether to apply Smart Cleanup (remove filler words and long silences). "
             "Available for pro/enterprise tiers only."
         ),
+    )
+    workspaceTeamId: Optional[str] = Field(
+        default=None,
+        description="Optional workspace team id hint (server resolves active workspace).",
     )
 
 

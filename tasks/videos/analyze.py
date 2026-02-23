@@ -13,6 +13,7 @@ from utils.supabase_client import (
     assert_response_ok,
     charge_video_analysis_credits,
     get_credit_balance,
+    get_team_wallet_balance,
     has_sufficient_credits,
     supabase,
     update_job_status,
@@ -54,6 +55,9 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
     job_id = job_data["jobId"]
     video_id = job_data["videoId"]
     user_id = job_data["userId"]
+    workspace_team_id = job_data.get("workspaceTeamId")
+    billing_owner_user_id = job_data.get("billingOwnerUserId") or user_id
+    charge_source = str(job_data.get("chargeSource") or "owner_wallet")
     url = job_data["url"]
     num_clips = job_data.get("numClips", 5)
     expected_credits = int(job_data.get("analysisCredits") or 0)
@@ -72,10 +76,16 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         _update_analysis_job_progress(job_id, 0, "starting")
 
         if expected_credits > 0 and not has_sufficient_credits(
-            user_id=user_id,
+            user_id=billing_owner_user_id,
             amount=expected_credits,
+            charge_source=charge_source,
+            team_id=workspace_team_id,
         ):
-            available = get_credit_balance(user_id)
+            available = (
+                get_team_wallet_balance(workspace_team_id)
+                if charge_source == "team_wallet" and workspace_team_id
+                else get_credit_balance(billing_owner_user_id)
+            )
             raise RuntimeError(
                 "Insufficient credits for analysis before processing starts: "
                 f"required={expected_credits}, available={available}"
@@ -233,6 +243,8 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 {
                     "video_id": video_id,
                     "user_id": user_id,
+                    "team_id": workspace_team_id,
+                    "billing_owner_user_id": billing_owner_user_id,
                     "start_time": start,
                     "end_time": end,
                     "title": clip["title"],
@@ -258,6 +270,11 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 f'{video_data["title"][:50]}'
             ),
             video_id=video_id,
+            charge_source=charge_source,
+            team_id=workspace_team_id,
+            billing_owner_user_id=billing_owner_user_id,
+            actor_user_id=user_id,
+            job_id=job_id,
         )
 
         finalize_video_resp = supabase.table("videos").update(

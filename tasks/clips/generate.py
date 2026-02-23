@@ -28,6 +28,7 @@ from utils.supabase_client import (
     assert_response_ok,
     charge_clip_generation_credits,
     get_credit_balance,
+    get_team_wallet_balance,
     has_sufficient_credits,
     supabase,
     update_job_status,
@@ -225,6 +226,10 @@ def generate_clip_task(job_data: GenerateClipJob):
     generation_credits = int(job_data.get("generationCredits") or CREDIT_COST_CLIP_GENERATION)
     clip_retention_days = _parse_retention_days(job_data.get("clipRetentionDays"))
     smart_cleanup_enabled = bool(job_data.get("smartCleanupEnabled"))
+    workspace_team_id = job_data.get("workspaceTeamId")
+    billing_owner_user_id = job_data.get("billingOwnerUserId") or user_id
+    charge_source = str(job_data.get("chargeSource") or "owner_wallet")
+    workspace_role = str(job_data.get("workspaceRole") or "owner")
     smart_cleanup_summary = {
         "enabled": smart_cleanup_enabled,
         "stopwords_removed": 0,
@@ -245,10 +250,16 @@ def generate_clip_task(job_data: GenerateClipJob):
         _update_clip_job_progress(job_id, 0, "starting")
 
         if generation_credits > 0 and not has_sufficient_credits(
-            user_id=user_id,
+            user_id=billing_owner_user_id,
             amount=generation_credits,
+            charge_source=charge_source,
+            team_id=workspace_team_id,
         ):
-            available = get_credit_balance(user_id)
+            available = (
+                get_team_wallet_balance(workspace_team_id)
+                if charge_source == "team_wallet" and workspace_team_id
+                else get_credit_balance(billing_owner_user_id)
+            )
             raise RuntimeError(
                 "Insufficient credits for clip generation before processing starts: "
                 f"required={generation_credits}, available={available}"
@@ -287,6 +298,8 @@ def generate_clip_task(job_data: GenerateClipJob):
         _update_clip_job_progress(job_id, 12, "loading_layout")
         layout_selection = resolve_effective_layout_id(
             user_id=user_id,
+            workspace_team_id=workspace_team_id,
+            workspace_role=workspace_role,
             job_id=job_id,
             logger=logger,
             requested_layout_id=job_data.get("layoutId"),
@@ -296,6 +309,8 @@ def generate_clip_task(job_data: GenerateClipJob):
         layout_should_persist = layout_selection.should_persist_to_clip
         layout_overrides = load_layout_overrides(
             user_id=user_id,
+            workspace_team_id=workspace_team_id,
+            workspace_role=workspace_role,
             layout_id=layout_id,
             job_id=job_id,
             logger=logger,
@@ -549,6 +564,11 @@ def generate_clip_task(job_data: GenerateClipJob):
             description=f'Clip generation: {clip["title"][:50]}',
             video_id=clip["video_id"],
             clip_id=clip_id,
+            charge_source=charge_source,
+            team_id=workspace_team_id,
+            billing_owner_user_id=billing_owner_user_id,
+            actor_user_id=user_id,
+            job_id=job_id,
         )
 
         # Update clip record

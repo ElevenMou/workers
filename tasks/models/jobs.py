@@ -11,6 +11,10 @@ class AnalyzeVideoJob(TypedDict):
     numClips: NotRequired[int]
     analysisCredits: NotRequired[int]
     analysisDurationSeconds: NotRequired[int]
+    workspaceTeamId: NotRequired[str | None]
+    billingOwnerUserId: NotRequired[str | None]
+    chargeSource: NotRequired[str]
+    workspaceRole: NotRequired[str]
 
 
 class GenerateClipJob(TypedDict):
@@ -21,6 +25,10 @@ class GenerateClipJob(TypedDict):
     smartCleanupEnabled: NotRequired[bool]
     generationCredits: NotRequired[int]
     clipRetentionDays: NotRequired[int | None]
+    workspaceTeamId: NotRequired[str | None]
+    billingOwnerUserId: NotRequired[str | None]
+    chargeSource: NotRequired[str]
+    workspaceRole: NotRequired[str]
 
 
 class CustomClipJob(TypedDict):
@@ -36,3 +44,7 @@ class CustomClipJob(TypedDict):
     smartCleanupEnabled: NotRequired[bool]
     generationCredits: NotRequired[int]
     clipRetentionDays: NotRequired[int | None]
+    workspaceTeamId: NotRequired[str | None]
+    billingOwnerUserId: NotRequired[str | None]
+    chargeSource: NotRequired[str]
+    workspaceRole: NotRequired[str]

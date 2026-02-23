@@ -28,7 +28,12 @@ from api_app.models import (
 from api_app.state import logger, whisper_ready
 from config import calculate_video_analysis_cost
 from services.video_downloader import VideoDownloader
-from utils.supabase_client import get_credit_balance, has_sufficient_credits, supabase
+from utils.supabase_client import (
+    get_credit_balance,
+    get_team_wallet_balance,
+    has_sufficient_credits,
+    supabase,
+)
 
 router = APIRouter()
 _STANDARD_VIDEO_QUEUE = "video-processing"
@@ -75,20 +80,47 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
     }
 
 
-def _raise_if_insufficient_credits(*, user_id: str, required_credits: int):
+def _raise_if_insufficient_credits(
+    *,
+    context: UserAccessContext,
+    actor_user_id: str,
+    required_credits: int,
+):
     if required_credits <= 0:
         return
 
-    if has_sufficient_credits(user_id=user_id, amount=required_credits):
+    owner_user_id = context.billing_owner_user_id or actor_user_id
+    if context.charge_source == "team_wallet" and context.workspace_team_id:
+        has_credits = has_sufficient_credits(
+            user_id=owner_user_id,
+            amount=required_credits,
+            charge_source=context.charge_source,
+            team_id=context.workspace_team_id,
+        )
+    else:
+        has_credits = has_sufficient_credits(
+            user_id=owner_user_id,
+            amount=required_credits,
+        )
+    if has_credits:
         return
 
-    balance = get_credit_balance(user_id)
-    raise HTTPException(
-        status_code=status.HTTP_402_PAYMENT_REQUIRED,
-        detail=(
+    if context.charge_source == "team_wallet" and context.workspace_team_id:
+        balance = get_team_wallet_balance(context.workspace_team_id)
+        detail = (
+            "Insufficient team credits for analysis. "
+            f"Required: {required_credits}, team wallet available: {balance}."
+        )
+    else:
+        balance = get_credit_balance(owner_user_id)
+        detail = (
             "Insufficient credits for analysis. "
             f"Required: {required_credits}, available: {balance}."
-        ),
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail=detail,
     )
 
 
@@ -103,11 +135,14 @@ def analyze_video(
     job_id = str(uuid4())
     url_str = str(payload.url)
     user_id = current_user.id
+    access_context = enforce_processing_access_rules(user_id, supabase_client=supabase)
 
     # Fast-fail if user has no credits at all (before URL probing).
-    _raise_if_insufficient_credits(user_id=user_id, required_credits=1)
-
-    access_context = enforce_processing_access_rules(user_id, supabase_client=supabase)
+    _raise_if_insufficient_credits(
+        context=access_context,
+        actor_user_id=user_id,
+        required_credits=1,
+    )
 
     # Enforce validation gate equivalent to /credits/cost before job enqueue.
     url_probe = _probe_credit_cost_for_url(url_str)
@@ -127,18 +162,17 @@ def analyze_video(
     )
 
     _raise_if_insufficient_credits(
-        user_id=user_id,
+        context=access_context,
+        actor_user_id=user_id,
         required_credits=int(url_probe["analysis_credits"]),
     )
 
-    existing = (
-        supabase.table("videos")
-        .select("id")
-        .eq("url", url_str)
-        .eq("user_id", user_id)
-        .limit(1)
-        .execute()
-    )
+    existing_query = supabase.table("videos").select("id").eq("url", url_str)
+    if access_context.workspace_team_id:
+        existing_query = existing_query.eq("team_id", access_context.workspace_team_id)
+    else:
+        existing_query = existing_query.eq("user_id", user_id).is_("team_id", "null")
+    existing = existing_query.limit(1).execute()
     raise_on_error(existing, "Failed to query existing video")
     if existing.data and len(existing.data) > 0:
         video_id = existing.data[0]["id"]
@@ -170,6 +204,8 @@ def analyze_video(
             {
                 "id": video_id,
                 "user_id": user_id,
+                "team_id": access_context.workspace_team_id,
+                "billing_owner_user_id": access_context.billing_owner_user_id or user_id,
                 "url": url_str,
                 "status": "pending",
             },
@@ -187,6 +223,10 @@ def analyze_video(
         "numClips": payload.numClips,
         "analysisCredits": int(url_probe["analysis_credits"]),
         "analysisDurationSeconds": analysis_duration_seconds,
+        "workspaceTeamId": access_context.workspace_team_id,
+        "billingOwnerUserId": access_context.billing_owner_user_id or user_id,
+        "chargeSource": access_context.charge_source,
+        "workspaceRole": access_context.workspace_role,
     }
 
     job_resp = (
@@ -195,6 +235,8 @@ def analyze_video(
             {
                 "id": job_id,
                 "user_id": user_id,
+                "team_id": access_context.workspace_team_id,
+                "billing_owner_user_id": access_context.billing_owner_user_id or user_id,
                 "video_id": video_id,
                 "type": "analyze_video",
                 "status": "queued",
@@ -237,6 +279,12 @@ def get_credit_cost_from_url(
         context=access_context,
         duration_seconds=analysis_duration_seconds,
     )
+    balance_owner_user_id = access_context.billing_owner_user_id or user_id
+    current_balance = (
+        get_team_wallet_balance(access_context.workspace_team_id)
+        if access_context.charge_source == "team_wallet" and access_context.workspace_team_id
+        else get_credit_balance(balance_owner_user_id)
+    )
 
     if not probe["valid_url"]:
         return CreditsCostByUrlResponse(
@@ -246,13 +294,12 @@ def get_credit_cost_from_url(
             analysisDurationSeconds=analysis_duration_seconds,
             maxAnalysisDurationSeconds=max_analysis_duration_seconds,
             durationLimitExceeded=duration_limit_exceeded,
-            currentBalance=get_credit_balance(user_id),
+            currentBalance=current_balance,
             hasEnoughCredits=False,
         )
 
     analysis_credits = int(probe["analysis_credits"])
-    balance = get_credit_balance(user_id)
-    has_enough_credits = balance >= analysis_credits and not duration_limit_exceeded
+    has_enough_credits = current_balance >= analysis_credits and not duration_limit_exceeded
     return CreditsCostByUrlResponse(
         valid_url=True,
         analysisCredits=analysis_credits,
@@ -260,6 +307,6 @@ def get_credit_cost_from_url(
         analysisDurationSeconds=analysis_duration_seconds,
         maxAnalysisDurationSeconds=max_analysis_duration_seconds,
         durationLimitExceeded=duration_limit_exceeded,
-        currentBalance=balance,
+        currentBalance=current_balance,
         hasEnoughCredits=has_enough_credits,
     )

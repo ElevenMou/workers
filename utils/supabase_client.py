@@ -272,6 +272,39 @@ def _charge_credits_or_raise(
         raise RuntimeError(f"{context}: insufficient credits")
 
 
+def _charge_team_credits_or_raise(
+    *,
+    owner_user_id: str,
+    team_id: str,
+    amount: int,
+    owner_tx_type: str,
+    description: str,
+    actor_user_id: str,
+    video_id: str | None = None,
+    clip_id: str | None = None,
+    job_id: str | None = None,
+    context: str,
+):
+    """Atomically charge a team wallet and write owner/team audit transactions."""
+    resp = supabase.rpc(
+        "charge_team_credits",
+        {
+            "p_owner_user_id": owner_user_id,
+            "p_team_id": team_id,
+            "p_amount": amount,
+            "p_owner_transaction_type": owner_tx_type,
+            "p_description": description,
+            "p_actor_user_id": actor_user_id,
+            "p_video_id": video_id,
+            "p_clip_id": clip_id,
+            "p_job_id": job_id,
+        },
+    ).execute()
+    assert_response_ok(resp, context)
+    if not resp.data:
+        raise RuntimeError(f"{context}: insufficient team wallet credits")
+
+
 def get_credit_balance(user_id: str) -> int:
     """Return current user credit balance (0 when missing)."""
     response = (
@@ -293,10 +326,50 @@ def get_credit_balance(user_id: str) -> int:
         return 0
 
 
-def has_sufficient_credits(*, user_id: str, amount: int) -> bool:
-    """Check whether user has at least `amount` credits."""
+def get_team_wallet_balance(team_id: str) -> int:
+    """Return team wallet balance (0 when missing)."""
+    response = (
+        supabase.table("team_wallets")
+        .select("balance")
+        .eq("team_id", team_id)
+        .limit(1)
+        .execute()
+    )
+    assert_response_ok(response, f"Failed to load team wallet balance for {team_id}")
+
+    rows = response.data or []
+    if not rows:
+        return 0
+
+    try:
+        return int(rows[0].get("balance") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def has_sufficient_credits(
+    *,
+    user_id: str,
+    amount: int,
+    charge_source: str = "owner_wallet",
+    team_id: str | None = None,
+) -> bool:
+    """Check whether owner or team wallet has at least `amount` credits."""
     if amount <= 0:
         return True
+
+    if charge_source == "team_wallet":
+        if not team_id:
+            return False
+        response = supabase.rpc(
+            "has_team_credits",
+            {
+                "p_team_id": team_id,
+                "p_amount": amount,
+            },
+        ).execute()
+        assert_response_ok(response, f"Failed to check team credits for {team_id}")
+        return bool(response.data)
 
     _refresh_free_monthly_credits_if_needed(user_id)
 
@@ -319,9 +392,33 @@ def charge_clip_generation_credits(
     description: str,
     video_id: str,
     clip_id: str,
+    charge_source: str = "owner_wallet",
+    team_id: str | None = None,
+    billing_owner_user_id: str | None = None,
+    actor_user_id: str | None = None,
+    job_id: str | None = None,
 ):
+    owner_user_id = billing_owner_user_id or user_id
+    actor_id = actor_user_id or user_id
+    if charge_source == "team_wallet":
+        if not team_id:
+            raise RuntimeError("Failed to charge clip-generation credits: missing team_id")
+        _charge_team_credits_or_raise(
+            owner_user_id=owner_user_id,
+            team_id=team_id,
+            amount=amount,
+            owner_tx_type="clip_generation",
+            description=description,
+            actor_user_id=actor_id,
+            video_id=video_id,
+            clip_id=clip_id,
+            job_id=job_id,
+            context="Failed to charge clip-generation credits",
+        )
+        return
+
     _charge_credits_or_raise(
-        user_id=user_id,
+        user_id=owner_user_id,
         amount=amount,
         tx_type="clip_generation",
         description=description,
@@ -337,9 +434,33 @@ def charge_video_analysis_credits(
     amount: int,
     description: str,
     video_id: str,
+    charge_source: str = "owner_wallet",
+    team_id: str | None = None,
+    billing_owner_user_id: str | None = None,
+    actor_user_id: str | None = None,
+    job_id: str | None = None,
 ):
+    owner_user_id = billing_owner_user_id or user_id
+    actor_id = actor_user_id or user_id
+    if charge_source == "team_wallet":
+        if not team_id:
+            raise RuntimeError("Failed to charge video-analysis credits: missing team_id")
+        _charge_team_credits_or_raise(
+            owner_user_id=owner_user_id,
+            team_id=team_id,
+            amount=amount,
+            owner_tx_type="video_analysis",
+            description=description,
+            actor_user_id=actor_id,
+            video_id=video_id,
+            clip_id=None,
+            job_id=job_id,
+            context="Failed to charge video-analysis credits",
+        )
+        return
+
     _charge_credits_or_raise(
-        user_id=user_id,
+        user_id=owner_user_id,
         amount=amount,
         tx_type="video_analysis",
         description=description,

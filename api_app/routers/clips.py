@@ -26,7 +26,12 @@ from api_app.models import (
 )
 from api_app.state import logger
 from config import calculate_clip_generation_cost
-from utils.supabase_client import get_credit_balance, has_sufficient_credits, supabase
+from utils.supabase_client import (
+    get_credit_balance,
+    get_team_wallet_balance,
+    has_sufficient_credits,
+    supabase,
+)
 
 router = APIRouter()
 _ACTIVE_GENERATE_JOB_STATUSES = ("queued", "processing", "retrying")
@@ -35,18 +40,45 @@ _STANDARD_CLIP_QUEUE = "clip-generation"
 _PRIORITY_CLIP_QUEUE = "clip-generation-priority"
 
 
-def _raise_if_insufficient_clip_generation_credits(*, user_id: str, required_credits: int):
+def _raise_if_insufficient_clip_generation_credits(
+    *,
+    context: UserAccessContext,
+    actor_user_id: str,
+    required_credits: int,
+):
     required = int(required_credits)
-    if has_sufficient_credits(user_id=user_id, amount=required):
+    owner_user_id = context.billing_owner_user_id or actor_user_id
+    if context.charge_source == "team_wallet" and context.workspace_team_id:
+        has_credits = has_sufficient_credits(
+            user_id=owner_user_id,
+            amount=required,
+            charge_source=context.charge_source,
+            team_id=context.workspace_team_id,
+        )
+    else:
+        has_credits = has_sufficient_credits(
+            user_id=owner_user_id,
+            amount=required,
+        )
+    if has_credits:
         return
 
-    balance = get_credit_balance(user_id)
-    raise HTTPException(
-        status_code=status.HTTP_402_PAYMENT_REQUIRED,
-        detail=(
+    if context.charge_source == "team_wallet" and context.workspace_team_id:
+        balance = get_team_wallet_balance(context.workspace_team_id)
+        detail = (
+            "Insufficient team credits for clip generation. "
+            f"Required: {required}, team wallet available: {balance}."
+        )
+    else:
+        balance = get_credit_balance(owner_user_id)
+        detail = (
             "Insufficient credits for clip generation. "
             f"Required: {required}, available: {balance}."
-        ),
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_402_PAYMENT_REQUIRED,
+        detail=detail,
     )
 
 
@@ -106,10 +138,11 @@ def generate_clip(
         payload.clipId,
         smart_cleanup_enabled,
     )
+    access_context = enforce_processing_access_rules(user_id, supabase_client=supabase)
 
     clip_resp = (
         supabase.table("clips")
-        .select("id, video_id, user_id, start_time, end_time")
+        .select("id, video_id, user_id, team_id, billing_owner_user_id, start_time, end_time")
         .eq("id", payload.clipId)
         .execute()
     )
@@ -123,26 +156,44 @@ def generate_clip(
             detail="Clip not found",
         )
 
-    if clip["user_id"] != user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Clip does not belong to this user",
-        )
+    clip_team_id = clip.get("team_id")
+    if access_context.workspace_team_id:
+        if clip_team_id != access_context.workspace_team_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Clip does not belong to the active team workspace",
+            )
 
-    clip_duration = float(clip["end_time"]) - float(clip["start_time"])
-    enforce_clip_duration_limit(
-        user_id=user_id,
-        duration_seconds=clip_duration,
-        supabase_client=supabase,
-    )
+        if access_context.workspace_role != "owner" and clip["user_id"] != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Team members can only generate clips they created.",
+            )
+    else:
+        if clip_team_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Clip belongs to a team workspace. Switch to that workspace first.",
+            )
+        if clip["user_id"] != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Clip does not belong to this user",
+            )
 
-    active_job_resp = (
+    active_job_query = (
         supabase.table("jobs")
         .select("id, status")
-        .eq("user_id", user_id)
         .eq("clip_id", payload.clipId)
         .eq("type", "generate_clip")
         .in_("status", list(_ACTIVE_GENERATE_JOB_STATUSES))
+    )
+    if access_context.workspace_team_id:
+        active_job_query = active_job_query.eq("team_id", access_context.workspace_team_id)
+    else:
+        active_job_query = active_job_query.eq("user_id", user_id).is_("team_id", "null")
+    active_job_resp = (
+        active_job_query
         .order("created_at", desc=True)
         .limit(1)
         .execute()
@@ -166,16 +217,24 @@ def generate_clip(
             status=active_job["status"],
         )
 
-    access_context = enforce_processing_access_rules(user_id, supabase_client=supabase)
+    clip_duration = float(clip["end_time"]) - float(clip["start_time"])
+    enforce_clip_duration_limit(
+        user_id=user_id,
+        duration_seconds=clip_duration,
+        supabase_client=supabase,
+    )
+
     _enforce_smart_cleanup_access(
         context=access_context,
         smart_cleanup_enabled=smart_cleanup_enabled,
     )
     _raise_if_insufficient_clip_generation_credits(
-        user_id=user_id,
+        context=access_context,
+        actor_user_id=user_id,
         required_credits=required_credits,
     )
 
+    billing_owner_user_id = access_context.billing_owner_user_id or user_id
     job_data = {
         "jobId": job_id,
         "clipId": payload.clipId,
@@ -184,6 +243,10 @@ def generate_clip(
         "smartCleanupEnabled": smart_cleanup_enabled,
         "generationCredits": int(required_credits),
         "clipRetentionDays": access_context.clip_retention_days,
+        "workspaceTeamId": access_context.workspace_team_id,
+        "billingOwnerUserId": billing_owner_user_id,
+        "chargeSource": access_context.charge_source,
+        "workspaceRole": access_context.workspace_role,
     }
 
     job_resp = (
@@ -192,6 +255,8 @@ def generate_clip(
             {
                 "id": job_id,
                 "user_id": user_id,
+                "team_id": access_context.workspace_team_id,
+                "billing_owner_user_id": billing_owner_user_id,
                 "video_id": clip["video_id"],
                 "clip_id": payload.clipId,
                 "type": "generate_clip",
@@ -257,7 +322,8 @@ def custom_clip(
         smart_cleanup_enabled=smart_cleanup_enabled,
     )
     _raise_if_insufficient_clip_generation_credits(
-        user_id=user_id,
+        context=access_context,
+        actor_user_id=user_id,
         required_credits=required_credits,
     )
     enforce_clip_duration_limit(
@@ -275,15 +341,14 @@ def custom_clip(
         smart_cleanup_enabled,
     )
 
-    existing = (
-        supabase.table("videos")
-        .select("id")
-        .eq("url", url_str)
-        .eq("user_id", user_id)
-        .limit(1)
-        .execute()
-    )
+    existing_query = supabase.table("videos").select("id").eq("url", url_str)
+    if access_context.workspace_team_id:
+        existing_query = existing_query.eq("team_id", access_context.workspace_team_id)
+    else:
+        existing_query = existing_query.eq("user_id", user_id).is_("team_id", "null")
+    existing = existing_query.limit(1).execute()
     raise_on_error(existing, "Failed to query existing video")
+    billing_owner_user_id = access_context.billing_owner_user_id or user_id
     if existing.data and len(existing.data) > 0:
         video_id = existing.data[0]["id"]
         logger.info("Reusing existing video %s for url", video_id)
@@ -296,6 +361,8 @@ def custom_clip(
                 {
                     "id": video_id,
                     "user_id": user_id,
+                    "team_id": access_context.workspace_team_id,
+                    "billing_owner_user_id": billing_owner_user_id,
                     "url": url_str,
                     "status": "pending",
                 }
@@ -308,6 +375,8 @@ def custom_clip(
         "id": clip_id,
         "video_id": video_id,
         "user_id": user_id,
+        "team_id": access_context.workspace_team_id,
+        "billing_owner_user_id": billing_owner_user_id,
         "start_time": payload.startTime,
         "end_time": payload.endTime,
         "title": payload.title,
@@ -331,6 +400,10 @@ def custom_clip(
         "smartCleanupEnabled": smart_cleanup_enabled,
         "generationCredits": int(required_credits),
         "clipRetentionDays": access_context.clip_retention_days,
+        "workspaceTeamId": access_context.workspace_team_id,
+        "billingOwnerUserId": billing_owner_user_id,
+        "chargeSource": access_context.charge_source,
+        "workspaceRole": access_context.workspace_role,
     }
 
     job_resp = (
@@ -339,6 +412,8 @@ def custom_clip(
             {
                 "id": job_id,
                 "user_id": user_id,
+                "team_id": access_context.workspace_team_id,
+                "billing_owner_user_id": billing_owner_user_id,
                 "video_id": video_id,
                 "clip_id": clip_id,
                 "type": "generate_clip",
