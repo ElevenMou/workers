@@ -232,10 +232,16 @@ def generate_clip_task(job_data: GenerateClipJob):
     workspace_role = str(job_data.get("workspaceRole") or "owner")
     smart_cleanup_summary = {
         "enabled": smart_cleanup_enabled,
+        "profile": "balanced",
         "stopwords_removed": 0,
         "silence_seconds_removed": 0.0,
         "original_duration_seconds": 0.0,
         "output_duration_seconds": 0.0,
+        "requested_window_start": 0.0,
+        "requested_window_end": 0.0,
+        "effective_window_start": 0.0,
+        "effective_window_end": 0.0,
+        "dropped_partial_words": 0,
     }
 
     # -- Per-clip working directory for isolation -------------------------
@@ -397,15 +403,13 @@ def generate_clip_task(job_data: GenerateClipJob):
         should_retranscribe_for_captions = needs_whisper_retranscription(
             transcript, caption_style
         )
-        should_retranscribe_for_smart_cleanup = (
-            smart_cleanup_enabled and not transcript_has_word_timing(transcript)
-        )
+        should_retranscribe_for_smart_cleanup = smart_cleanup_enabled
 
         if should_retranscribe_for_captions or should_retranscribe_for_smart_cleanup:
             retranscribe_reason = (
-                f"caption style '{caption_style}' requires word timing"
-                if should_retranscribe_for_captions
-                else "Smart Cleanup requires word timing"
+                "Smart Cleanup requires fresh Whisper word timing"
+                if should_retranscribe_for_smart_cleanup
+                else f"caption style '{caption_style}' requires word timing"
             )
             logger.info(
                 "[%s] Re-transcribing clip segment with Whisper (%s)",
@@ -436,6 +440,10 @@ def generate_clip_task(job_data: GenerateClipJob):
                     exc_info=True,
                 )
             _update_clip_job_progress(job_id, 50, "preparing_captions")
+        if smart_cleanup_enabled and not transcript_has_word_timing(transcript):
+            raise RuntimeError(
+                "Smart Cleanup requires Whisper word-level timings, but no usable words were returned."
+            )
 
         if smart_cleanup_enabled:
             _update_clip_job_progress(job_id, 54, "applying_smart_cleanup")
@@ -452,6 +460,7 @@ def generate_clip_task(job_data: GenerateClipJob):
             summary = cleanup_result["summary"]
             smart_cleanup_summary = {
                 "enabled": True,
+                "profile": str(summary.get("profile", "balanced")),
                 "stopwords_removed": int(summary.get("stopwords_removed", 0)),
                 "silence_seconds_removed": float(
                     summary.get("silence_seconds_removed", 0.0)
@@ -462,6 +471,19 @@ def generate_clip_task(job_data: GenerateClipJob):
                 "output_duration_seconds": float(
                     summary.get("output_duration_seconds", 0.0)
                 ),
+                "requested_window_start": float(
+                    summary.get("requested_window_start", start_time)
+                ),
+                "requested_window_end": float(
+                    summary.get("requested_window_end", end_time)
+                ),
+                "effective_window_start": float(
+                    summary.get("effective_window_start", start_time)
+                ),
+                "effective_window_end": float(
+                    summary.get("effective_window_end", end_time)
+                ),
+                "dropped_partial_words": int(summary.get("dropped_partial_words", 0)),
             }
             start_time = 0.0
             end_time = float(smart_cleanup_summary["output_duration_seconds"])

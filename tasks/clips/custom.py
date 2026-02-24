@@ -217,10 +217,16 @@ def custom_clip_task(job_data: CustomClipJob):
     workspace_role = str(job_data.get("workspaceRole") or "owner")
     smart_cleanup_summary = {
         "enabled": smart_cleanup_enabled,
+        "profile": "balanced",
         "stopwords_removed": 0,
         "silence_seconds_removed": 0.0,
         "original_duration_seconds": 0.0,
         "output_duration_seconds": 0.0,
+        "requested_window_start": float(start_time),
+        "requested_window_end": float(end_time),
+        "effective_window_start": float(start_time),
+        "effective_window_end": float(end_time),
+        "dropped_partial_words": 0,
     }
 
     # -- Per-job working directory ------------------------------------------
@@ -323,10 +329,10 @@ def custom_clip_task(job_data: CustomClipJob):
             )
             partial_transcript = True
 
-        if smart_cleanup_enabled and not transcript_has_word_timing(transcript):
+        if smart_cleanup_enabled:
             _update_clip_job_progress(job_id, 45, "transcribing_audio")
             logger.info(
-                "[%s] Re-transcribing with Whisper because Smart Cleanup requires word timing",
+                "[%s] Re-transcribing with Whisper for Smart Cleanup (fresh word timing)",
                 job_id,
             )
             transcript = transcribe_clip_window_with_whisper(
@@ -338,6 +344,10 @@ def custom_clip_task(job_data: CustomClipJob):
                 video_duration_seconds=duration_seconds,
             )
             partial_transcript = True
+            if not transcript_has_word_timing(transcript):
+                raise RuntimeError(
+                    "Smart Cleanup requires Whisper word-level timings, but no usable words were returned."
+                )
 
         _update_clip_job_progress(job_id, 52, "loading_layout")
 
@@ -420,6 +430,7 @@ def custom_clip_task(job_data: CustomClipJob):
             summary = cleanup_result["summary"]
             smart_cleanup_summary = {
                 "enabled": True,
+                "profile": str(summary.get("profile", "balanced")),
                 "stopwords_removed": int(summary.get("stopwords_removed", 0)),
                 "silence_seconds_removed": float(
                     summary.get("silence_seconds_removed", 0.0)
@@ -430,6 +441,19 @@ def custom_clip_task(job_data: CustomClipJob):
                 "output_duration_seconds": float(
                     summary.get("output_duration_seconds", 0.0)
                 ),
+                "requested_window_start": float(
+                    summary.get("requested_window_start", start_time)
+                ),
+                "requested_window_end": float(
+                    summary.get("requested_window_end", end_time)
+                ),
+                "effective_window_start": float(
+                    summary.get("effective_window_start", start_time)
+                ),
+                "effective_window_end": float(
+                    summary.get("effective_window_end", end_time)
+                ),
+                "dropped_partial_words": int(summary.get("dropped_partial_words", 0)),
             }
             start_time = 0.0
             end_time = float(smart_cleanup_summary["output_duration_seconds"])

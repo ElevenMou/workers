@@ -83,10 +83,16 @@ class TimelineSegment(TypedDict):
 
 
 class SmartCleanupSummary(TypedDict):
+    profile: str
     stopwords_removed: int
     silence_seconds_removed: float
     original_duration_seconds: float
     output_duration_seconds: float
+    requested_window_start: float
+    requested_window_end: float
+    effective_window_start: float
+    effective_window_end: float
+    dropped_partial_words: int
 
 
 class SmartCleanupPlan(TypedDict):
@@ -308,11 +314,107 @@ def _sum_intervals(intervals: Iterable[tuple[float, float]]) -> float:
     return total
 
 
+def _interval_overlaps_word(
+    *,
+    interval_start: float,
+    interval_end: float,
+    word_start: float,
+    word_end: float,
+) -> bool:
+    return float(word_end) > float(interval_start) and float(word_start) < float(interval_end)
+
+
+def _snap_interval_to_word_boundaries(
+    *,
+    start: float,
+    end: float,
+    words: list[dict[str, Any]],
+    window_start: float,
+    window_end: float,
+) -> tuple[float, float]:
+    snapped_start = max(float(window_start), float(start))
+    snapped_end = min(float(window_end), float(end))
+    if snapped_end - snapped_start < _MIN_INTERVAL_SECONDS:
+        return (snapped_start, snapped_end)
+
+    overlapped_words = [
+        word
+        for word in words
+        if _interval_overlaps_word(
+            interval_start=snapped_start,
+            interval_end=snapped_end,
+            word_start=float(word["start"]),
+            word_end=float(word["end"]),
+        )
+    ]
+    if not overlapped_words:
+        return (snapped_start, snapped_end)
+
+    return (
+        max(float(window_start), min(float(word["start"]) for word in overlapped_words)),
+        min(float(window_end), max(float(word["end"]) for word in overlapped_words)),
+    )
+
+
+def _expand_window_to_word_boundaries(
+    *,
+    words: list[dict[str, Any]],
+    requested_start: float,
+    requested_end: float,
+) -> tuple[float, float]:
+    effective_start = float(requested_start)
+    effective_end = float(requested_end)
+
+    start_overlaps = [
+        word
+        for word in words
+        if float(word["start"]) < requested_start < float(word["end"])
+    ]
+    if start_overlaps:
+        effective_start = min(float(word["start"]) for word in start_overlaps)
+
+    end_overlaps = [
+        word
+        for word in words
+        if float(word["start"]) < requested_end < float(word["end"])
+    ]
+    if end_overlaps:
+        effective_end = max(float(word["end"]) for word in end_overlaps)
+
+    return (effective_start, effective_end)
+
+
+def _transcript_has_usable_word_timing(transcript: dict[str, Any]) -> bool:
+    segments = transcript.get("segments")
+    if not isinstance(segments, list):
+        return False
+
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        words = seg.get("words")
+        if not isinstance(words, list) or not words:
+            continue
+        for word in words:
+            if not isinstance(word, dict):
+                continue
+            token = str(word.get("word", word.get("text", ""))).strip()
+            if not token:
+                continue
+            if _as_float(word.get("start")) is None or _as_float(word.get("end")) is None:
+                continue
+            return True
+
+    return False
+
+
 def _extract_words_in_window(
     *,
     transcript: dict[str, Any],
     window_start: float,
     window_end: float,
+    clamp_to_window: bool = True,
+    require_word_timing: bool = False,
 ) -> list[dict[str, Any]]:
     raw_words: list[dict[str, Any]] = []
     segments = transcript.get("segments") if isinstance(transcript, dict) else None
@@ -330,11 +432,6 @@ def _extract_words_in_window(
         if seg_end <= window_start or seg_start >= window_end:
             continue
 
-        seg_clamped_start = max(window_start, seg_start)
-        seg_clamped_end = min(window_end, seg_end)
-        if seg_clamped_end - seg_clamped_start < _MIN_INTERVAL_SECONDS:
-            continue
-
         raw_seg_words = seg.get("words")
         if isinstance(raw_seg_words, list) and raw_seg_words:
             for word_index, item in enumerate(raw_seg_words):
@@ -349,22 +446,30 @@ def _extract_words_in_window(
                 end_value = _as_float(item.get("end"))
                 if start_value is None or end_value is None:
                     continue
-
-                clamped_start = max(window_start, start_value)
-                clamped_end = min(window_end, end_value)
-                if clamped_end - clamped_start < _MIN_INTERVAL_SECONDS:
+                if end_value <= window_start or start_value >= window_end:
+                    continue
+                if clamp_to_window:
+                    token_start = max(window_start, start_value)
+                    token_end = min(window_end, end_value)
+                else:
+                    token_start = start_value
+                    token_end = end_value
+                if token_end - token_start < _MIN_INTERVAL_SECONDS:
                     continue
 
                 raw_words.append(
                     {
                         "word": token,
                         "normalized": normalized,
-                        "start": clamped_start,
-                        "end": clamped_end,
+                        "start": token_start,
+                        "end": token_end,
                         "segment_index": seg_index,
                         "word_index": word_index,
                     }
                 )
+            continue
+
+        if require_word_timing:
             continue
 
         # Fallback for segment-level transcripts (for example, YouTube).
@@ -383,17 +488,23 @@ def _extract_words_in_window(
 
             word_start = seg_start + (word_index * per_word)
             word_end = seg_start + ((word_index + 1) * per_word)
-            clamped_start = max(window_start, word_start)
-            clamped_end = min(window_end, word_end)
-            if clamped_end - clamped_start < _MIN_INTERVAL_SECONDS:
+            if word_end <= window_start or word_start >= window_end:
+                continue
+            if clamp_to_window:
+                token_start = max(window_start, word_start)
+                token_end = min(window_end, word_end)
+            else:
+                token_start = word_start
+                token_end = word_end
+            if token_end - token_start < _MIN_INTERVAL_SECONDS:
                 continue
 
             raw_words.append(
                 {
                     "word": token,
                     "normalized": normalized,
-                    "start": clamped_start,
-                    "end": clamped_end,
+                    "start": token_start,
+                    "end": token_end,
                     "segment_index": seg_index,
                     "word_index": word_index,
                 }
@@ -403,10 +514,16 @@ def _extract_words_in_window(
 
     # De-overlap and enforce monotonic timings.
     normalized_words: list[dict[str, Any]] = []
-    cursor = float(window_start)
+    cursor = (
+        float(window_start)
+        if clamp_to_window
+        else (float(raw_words[0]["start"]) if raw_words else float(window_start))
+    )
     for word in raw_words:
         start = max(float(word["start"]), cursor)
-        end = min(float(word["end"]), float(window_end))
+        end = float(word["end"])
+        if clamp_to_window:
+            end = min(end, float(window_end))
         if end - start < _MIN_INTERVAL_SECONDS:
             continue
         normalized_words.append({**word, "start": start, "end": end})
@@ -471,7 +588,17 @@ def _build_stopword_intervals(
             if end - start < _MIN_INTERVAL_SECONDS:
                 continue
 
-            stopword_intervals.append((start, end))
+            snapped_start, snapped_end = _snap_interval_to_word_boundaries(
+                start=start,
+                end=end,
+                words=words,
+                window_start=window_start,
+                window_end=window_end,
+            )
+            if snapped_end - snapped_start < _MIN_INTERVAL_SECONDS:
+                continue
+
+            stopword_intervals.append((snapped_start, snapped_end))
             stopwords_removed += 1
             covered_indices.update(phrase_indices)
             break
@@ -533,7 +660,17 @@ def _build_stopword_intervals(
         if end - start < _MIN_INTERVAL_SECONDS:
             continue
 
-        stopword_intervals.append((start, end))
+        snapped_start, snapped_end = _snap_interval_to_word_boundaries(
+            start=start,
+            end=end,
+            words=words,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        if snapped_end - snapped_start < _MIN_INTERVAL_SECONDS:
+            continue
+
+        stopword_intervals.append((snapped_start, snapped_end))
         stopwords_removed += 1
 
     return stopword_intervals, stopwords_removed
@@ -572,57 +709,79 @@ def _build_silence_removal_intervals(
     return silence_intervals
 
 
-def _clip_word_to_timeline(
+def _word_partially_overlaps_timeline(
+    *,
+    word_start: float,
+    word_end: float,
+    timeline_map: list[TimelineSegment],
+) -> bool:
+    for segment in timeline_map:
+        if _interval_overlaps_word(
+            interval_start=segment["source_start"],
+            interval_end=segment["source_end"],
+            word_start=word_start,
+            word_end=word_end,
+        ):
+            if (
+                word_start >= (segment["source_start"] - 1e-6)
+                and word_end <= (segment["source_end"] + 1e-6)
+            ):
+                return False
+            return True
+    return False
+
+
+def _map_word_to_output_if_fully_preserved(
     *,
     word_start: float,
     word_end: float,
     timeline_map: list[TimelineSegment],
 ) -> tuple[float, float] | None:
-    mapped_start: float | None = None
-    mapped_end: float | None = None
-
     for segment in timeline_map:
-        source_start = segment["source_start"]
-        source_end = segment["source_end"]
-        overlap_start = max(float(word_start), source_start)
-        overlap_end = min(float(word_end), source_end)
-        if overlap_end - overlap_start < _MIN_INTERVAL_SECONDS:
+        source_start = float(segment["source_start"])
+        source_end = float(segment["source_end"])
+        if word_start < source_start - 1e-6:
+            continue
+        if word_end > source_end + 1e-6:
             continue
 
-        out_start = segment["output_start"] + (overlap_start - source_start)
-        out_end = segment["output_start"] + (overlap_end - source_start)
-        if mapped_start is None:
-            mapped_start = out_start
-        mapped_end = out_end
+        out_start = float(segment["output_start"]) + (word_start - source_start)
+        out_end = float(segment["output_start"]) + (word_end - source_start)
+        if out_end - out_start < _MIN_INTERVAL_SECONDS:
+            return None
+        return (out_start, out_end)
 
-    if mapped_start is None or mapped_end is None:
-        return None
-
-    if mapped_end - mapped_start < _MIN_INTERVAL_SECONDS:
-        return None
-
-    return (mapped_start, mapped_end)
+    return None
 
 
 def _build_cleaned_transcript(
     *,
     source_words: list[dict[str, Any]],
     timeline_map: list[TimelineSegment],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], int]:
     mapped_words: list[dict[str, Any]] = []
+    dropped_partial_words = 0
     for word in source_words:
-        clipped = _clip_word_to_timeline(
-            word_start=float(word["start"]),
-            word_end=float(word["end"]),
+        word_start = float(word["start"])
+        word_end = float(word["end"])
+        mapped = _map_word_to_output_if_fully_preserved(
+            word_start=word_start,
+            word_end=word_end,
             timeline_map=timeline_map,
         )
-        if not clipped:
+        if not mapped:
+            if _word_partially_overlaps_timeline(
+                word_start=word_start,
+                word_end=word_end,
+                timeline_map=timeline_map,
+            ):
+                dropped_partial_words += 1
             continue
         mapped_words.append(
             {
                 "word": str(word["word"]).strip(),
-                "start": clipped[0],
-                "end": clipped[1],
+                "start": mapped[0],
+                "end": mapped[1],
             }
         )
 
@@ -661,11 +820,14 @@ def _build_cleaned_transcript(
         )
 
     full_text = " ".join(segment["text"] for segment in segments if segment.get("text")).strip()
-    return {
-        "source": "smart_cleanup",
-        "text": full_text,
-        "segments": segments,
-    }
+    return (
+        {
+            "source": "smart_cleanup",
+            "text": full_text,
+            "segments": segments,
+        },
+        dropped_partial_words,
+    )
 
 
 def plan_balanced_smart_cleanup(
@@ -677,18 +839,41 @@ def plan_balanced_smart_cleanup(
     if not isinstance(transcript, dict):
         raise RuntimeError("Smart Cleanup requires a transcript with word-level timings.")
 
-    window_start = float(start_time)
-    window_end = float(end_time)
-    if window_end <= window_start:
+    requested_window_start = float(start_time)
+    requested_window_end = float(end_time)
+    if requested_window_end <= requested_window_start:
         raise RuntimeError("Invalid cleanup window: end time must be greater than start time.")
+    if not _transcript_has_usable_word_timing(transcript):
+        raise RuntimeError(
+            "Smart Cleanup requires Whisper word-level timings with start/end timestamps."
+        )
 
+    boundary_words = _extract_words_in_window(
+        transcript=transcript,
+        window_start=requested_window_start,
+        window_end=requested_window_end,
+        clamp_to_window=False,
+        require_word_timing=True,
+    )
+    if not boundary_words:
+        raise RuntimeError("Smart Cleanup could not find words in the requested clip window.")
+
+    effective_window_start, effective_window_end = _expand_window_to_word_boundaries(
+        words=boundary_words,
+        requested_start=requested_window_start,
+        requested_end=requested_window_end,
+    )
     words = _extract_words_in_window(
         transcript=transcript,
-        window_start=window_start,
-        window_end=window_end,
+        window_start=effective_window_start,
+        window_end=effective_window_end,
+        clamp_to_window=False,
+        require_word_timing=True,
     )
     if not words:
-        raise RuntimeError("Smart Cleanup could not find words in the requested clip window.")
+        raise RuntimeError(
+            "Smart Cleanup could not find words in the expanded clip window after boundary alignment."
+        )
 
     languages = _resolve_transcript_languages(transcript)
     stopwords = _load_multilingual_stopwords(languages)
@@ -696,8 +881,8 @@ def plan_balanced_smart_cleanup(
 
     stopword_intervals, stopwords_removed = _build_stopword_intervals(
         words=words,
-        window_start=window_start,
-        window_end=window_end,
+        window_start=effective_window_start,
+        window_end=effective_window_end,
         padding_seconds=BALANCED_STOPWORD_PADDING_SECONDS,
         stopwords=stopwords,
         filler_tokens=filler_tokens,
@@ -711,17 +896,29 @@ def plan_balanced_smart_cleanup(
 
     merged_silence_intervals = merge_intervals(
         silence_intervals,
-        min_start=window_start,
-        max_end=window_end,
+        min_start=effective_window_start,
+        max_end=effective_window_end,
     )
+    word_safe_intervals: list[tuple[float, float]] = []
+    for interval_start, interval_end in [*stopword_intervals, *silence_intervals]:
+        snapped_start, snapped_end = _snap_interval_to_word_boundaries(
+            start=interval_start,
+            end=interval_end,
+            words=words,
+            window_start=effective_window_start,
+            window_end=effective_window_end,
+        )
+        if snapped_end - snapped_start >= _MIN_INTERVAL_SECONDS:
+            word_safe_intervals.append((snapped_start, snapped_end))
+
     removal_intervals = merge_intervals(
-        [*stopword_intervals, *silence_intervals],
-        min_start=window_start,
-        max_end=window_end,
+        word_safe_intervals,
+        min_start=effective_window_start,
+        max_end=effective_window_end,
     )
     keep_intervals = build_keep_intervals(
-        window_start=window_start,
-        window_end=window_end,
+        window_start=effective_window_start,
+        window_end=effective_window_end,
         removal_intervals=removal_intervals,
     )
     if not keep_intervals:
@@ -732,7 +929,7 @@ def plan_balanced_smart_cleanup(
         raise RuntimeError("Smart Cleanup failed to build timeline mapping.")
 
     output_duration = float(timeline_map[-1]["output_end"])
-    cleaned_transcript = _build_cleaned_transcript(
+    cleaned_transcript, dropped_partial_words = _build_cleaned_transcript(
         source_words=words,
         timeline_map=timeline_map,
     )
@@ -740,10 +937,18 @@ def plan_balanced_smart_cleanup(
         raise RuntimeError("Smart Cleanup produced an empty transcript after filtering.")
 
     summary: SmartCleanupSummary = {
+        "profile": "balanced",
         "stopwords_removed": int(stopwords_removed),
         "silence_seconds_removed": round(_sum_intervals(merged_silence_intervals), 3),
-        "original_duration_seconds": round(window_end - window_start, 3),
+        "original_duration_seconds": round(
+            requested_window_end - requested_window_start, 3
+        ),
         "output_duration_seconds": round(output_duration, 3),
+        "requested_window_start": round(requested_window_start, 6),
+        "requested_window_end": round(requested_window_end, 6),
+        "effective_window_start": round(effective_window_start, 6),
+        "effective_window_end": round(effective_window_end, 6),
+        "dropped_partial_words": int(dropped_partial_words),
     }
 
     return {
@@ -782,10 +987,13 @@ def render_condensed_video_from_keep_intervals(
             continue
 
         segment_path = os.path.join(work_dir, f"smart_cleanup_segment_{index:03d}.mp4")
+        # Keep `ss` on the output side for frame-accurate cuts at word boundaries.
         (
-            ffmpeg_lib.input(input_video_path, ss=float(start), t=duration)
+            ffmpeg_lib.input(input_video_path)
             .output(
                 segment_path,
+                ss=float(start),
+                t=duration,
                 vcodec="libx264",
                 acodec="aac",
                 crf=crf,
