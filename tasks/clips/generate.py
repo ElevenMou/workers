@@ -4,7 +4,7 @@ import shutil
 import traceback
 from datetime import datetime, timedelta, timezone
 
-from config import CREDIT_COST_CLIP_GENERATION
+from config import normalize_clip_generation_credits
 from services.clip_generator import ClipGenerator, compute_video_position
 from services.clips.constants import canvas_size_for_aspect_ratio
 from services.video_downloader import VideoDownloader
@@ -223,7 +223,10 @@ def generate_clip_task(job_data: GenerateClipJob):
     user_id = job_data["userId"]
     layout_id: str | None = None
     layout_should_persist = False
-    generation_credits = int(job_data.get("generationCredits") or CREDIT_COST_CLIP_GENERATION)
+    generation_credits = normalize_clip_generation_credits(
+        job_data.get("generationCredits"),
+        minimum_credits=0,
+    )
     clip_retention_days = _parse_retention_days(job_data.get("clipRetentionDays"))
     smart_cleanup_enabled = bool(job_data.get("smartCleanupEnabled"))
     workspace_team_id = job_data.get("workspaceTeamId")

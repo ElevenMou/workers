@@ -27,8 +27,6 @@ from api_app.models import (
 )
 from api_app.state import logger, whisper_ready
 from config import (
-    CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE,
-    calculate_clip_generation_cost,
     calculate_video_analysis_cost,
 )
 from services.video_downloader import VideoDownloader
@@ -82,6 +80,15 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
         "analysis_credits": analysis_credits,
         "duration_seconds": duration_seconds,
     }
+
+
+def _max_clip_count_for_duration(duration_seconds: int) -> int:
+    """
+    Enforce AI analyze clip density:
+    maximum 1 requested clip per 3 minutes of source duration.
+    """
+    seconds = max(int(duration_seconds), 0)
+    return max(1, seconds // 180)
 
 
 def _raise_if_insufficient_credits(
@@ -164,6 +171,15 @@ def analyze_video(
         context=access_context,
         duration_seconds=analysis_duration_seconds,
     )
+    max_clip_count = _max_clip_count_for_duration(analysis_duration_seconds)
+    if payload.numClips > max_clip_count:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Too many clips requested for this video length. Maximum: {max_clip_count} "
+                "(1 clip every 3 minutes)."
+            ),
+        )
 
     _raise_if_insufficient_credits(
         context=access_context,
@@ -272,13 +288,14 @@ def get_credit_cost_from_url(
     payload: CreditsCostByUrlRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> CreditsCostByUrlResponse:
-    """Validate URL and return analysis cost plus clip-generation estimate."""
+    """Validate URL and return analysis cost plus first-generation estimate."""
     url_str = str(payload.url)
     requested_clip_count = int(payload.numClips)
-    clip_generation_credits_per_clip = calculate_clip_generation_cost(False)
-    smart_cleanup_surcharge_per_clip = int(CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE)
     user_id = current_user.id
     access_context = get_user_access_context(user_id, supabase_client=supabase)
+    # Suggested clips created from AI analysis are free on first generation.
+    clip_generation_credits_per_clip = 0
+    smart_cleanup_surcharge_per_clip = 0
     probe = _probe_credit_cost_for_url(url_str)
     max_analysis_duration_seconds = access_context.max_analysis_duration_seconds
     analysis_duration_seconds = int(probe.get("duration_seconds") or 0)

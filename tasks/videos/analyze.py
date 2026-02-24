@@ -100,9 +100,18 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         video_path = video_data["path"]
         _update_analysis_job_progress(job_id, 20, "downloading_video")
 
-        # Calculate credits based on duration
+        # Calculate credits based on duration (fallback).
         duration_seconds = int(video_data["duration"])
-        credits_required = calculate_video_analysis_cost(duration_seconds)
+        calculated_credits = calculate_video_analysis_cost(duration_seconds)
+        credits_required = expected_credits if expected_credits > 0 else calculated_credits
+        if expected_credits > 0 and expected_credits != calculated_credits:
+            logger.warning(
+                "[%s] Analysis credit mismatch detected: queued=%d calculated=%d. "
+                "Charging queued amount for deterministic billing.",
+                job_id,
+                expected_credits,
+                calculated_credits,
+            )
 
         logger.info(
             "[%s] Video duration: %ds (~%.1f min) - credits required: %d",

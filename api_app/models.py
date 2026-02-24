@@ -37,7 +37,7 @@ class GenerateClipRequest(BaseModel):
         default=False,
         description=(
             "Whether to apply Smart Cleanup (remove filler words and long silences). "
-            "Available for pro/enterprise tiers only."
+            "Available for basic/pro/enterprise tiers only."
         ),
     )
     workspaceTeamId: Optional[str] = Field(
@@ -67,7 +67,7 @@ class CustomClipRequest(BaseModel):
         default=False,
         description=(
             "Whether to apply Smart Cleanup (remove filler words and long silences). "
-            "Available for pro/enterprise tiers only."
+            "Available for basic/pro/enterprise tiers only."
         ),
     )
     workspaceTeamId: Optional[str] = Field(

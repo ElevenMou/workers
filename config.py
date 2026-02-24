@@ -1,5 +1,6 @@
 import os
 import logging
+from math import ceil
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -48,45 +49,85 @@ CLIP_ASSET_CLEANUP_INTERVAL_SECONDS = int(
 )
 
 # ---------------------------------------------------------------------------
-# Credits - Dynamic pricing based on duration
+# Credits - Billing pricing rules
 # ---------------------------------------------------------------------------
 
 
 def calculate_video_analysis_cost(duration_seconds: int) -> int:
     """
-    Calculate credits based on video duration.
+    Calculate analysis credits based on video duration.
 
-    - 0-5 min:   3 credits
-    - 5-15 min:  5 credits
-    - 15-30 min: 8 credits
-    - 30-60 min: 12 credits
-    - 60+ min:   15 credits
+    Rule: 1 credit per started minute (rounded up).
     """
-    minutes = duration_seconds / 60
-
-    if minutes <= 5:
-        return 3
-    elif minutes <= 15:
-        return 5
-    elif minutes <= 30:
-        return 8
-    elif minutes <= 60:
-        return 12
-    else:
-        return 15
+    seconds = max(int(duration_seconds), 0)
+    if seconds <= 0:
+        return 0
+    return int(ceil(seconds / 60))
 
 
-CREDIT_COST_CLIP_GENERATION = 2
+CREDIT_COST_CLIP_GENERATION = 3
 CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE = 1
+_SMART_CLEANUP_SURCHARGE_WAIVED_TIERS = {"basic", "pro", "enterprise"}
 
 
-def calculate_clip_generation_cost(smart_cleanup_enabled: bool) -> int:
-    """Return clip generation credit cost with optional Smart Cleanup surcharge."""
-    return int(CREDIT_COST_CLIP_GENERATION) + (
-        int(CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE)
-        if smart_cleanup_enabled
-        else 0
+def smart_cleanup_surcharge_for_tier(tier: str | None) -> int:
+    normalized_tier = str(tier or "").strip().lower()
+    if normalized_tier in _SMART_CLEANUP_SURCHARGE_WAIVED_TIERS:
+        return 0
+    return int(CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE)
+
+
+def calculate_clip_generation_cost(
+    smart_cleanup_enabled: bool,
+    tier: str | None = None,
+) -> int:
+    """Return clip generation credit cost with optional tier-aware Smart Cleanup surcharge."""
+    surcharge = smart_cleanup_surcharge_for_tier(tier) if smart_cleanup_enabled else 0
+    return int(CREDIT_COST_CLIP_GENERATION) + surcharge
+
+
+def normalize_clip_generation_credits(
+    raw_credits: object,
+    *,
+    minimum_credits: int | None = None,
+) -> int:
+    """
+    Normalize queued generation credits and enforce a minimum billable amount.
+
+    This protects generation tasks from stale/tampered queued payloads that
+    might otherwise resolve to zero/negative values.
+    """
+    try:
+        parsed = int(raw_credits)
+    except (TypeError, ValueError):
+        parsed = 0
+
+    minimum = int(
+        CREDIT_COST_CLIP_GENERATION if minimum_credits is None else minimum_credits
     )
+    return max(minimum, parsed)
+
+
+def normalize_custom_clip_generation_credits(raw_credits: object) -> int:
+    """
+    Enforce that custom clips always consume credits.
+
+    Custom clip generation should never resolve to zero (or negative) credits,
+    even if a queued payload is stale or tampered.
+    """
+    return normalize_clip_generation_credits(raw_credits)
+
+
+def calculate_custom_clip_generation_cost(
+    smart_cleanup_enabled: bool,
+    tier: str | None = None,
+) -> int:
+    """Return a custom-clip cost that is guaranteed to stay credit-consuming."""
+    calculated = calculate_clip_generation_cost(
+        smart_cleanup_enabled=smart_cleanup_enabled,
+        tier=tier,
+    )
+    return normalize_custom_clip_generation_credits(calculated)
 
 
 # ---------------------------------------------------------------------------

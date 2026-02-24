@@ -25,7 +25,10 @@ from api_app.models import (
     GenerateClipResponse,
 )
 from api_app.state import logger
-from config import calculate_clip_generation_cost
+from config import (
+    calculate_clip_generation_cost,
+    calculate_custom_clip_generation_cost,
+)
 from utils.supabase_client import (
     get_credit_balance,
     get_team_wallet_balance,
@@ -35,7 +38,8 @@ from utils.supabase_client import (
 
 router = APIRouter()
 _ACTIVE_GENERATE_JOB_STATUSES = ("queued", "processing", "retrying")
-_SMART_CLEANUP_ALLOWED_TIERS = {"pro", "enterprise"}
+_TERMINAL_GENERATE_JOB_STATUSES = ("completed", "failed")
+_SMART_CLEANUP_ALLOWED_TIERS = {"basic", "pro", "enterprise"}
 _STANDARD_CLIP_QUEUE = "clip-generation"
 _PRIORITY_CLIP_QUEUE = "clip-generation-priority"
 
@@ -47,6 +51,9 @@ def _raise_if_insufficient_clip_generation_credits(
     required_credits: int,
 ):
     required = int(required_credits)
+    if required <= 0:
+        return
+
     owner_user_id = context.billing_owner_user_id or actor_user_id
     if context.charge_source == "team_wallet" and context.workspace_team_id:
         has_credits = has_sufficient_credits(
@@ -82,6 +89,46 @@ def _raise_if_insufficient_clip_generation_credits(
     )
 
 
+def _is_ai_suggested_clip(clip: dict) -> bool:
+    if clip.get("ai_score") is not None:
+        return True
+
+    return clip.get("transcript_excerpt") is not None
+
+
+def _clip_has_prior_generation(
+    *,
+    clip: dict,
+    clip_id: str,
+    access_context: UserAccessContext,
+    actor_user_id: str,
+) -> bool:
+    clip_status = str(clip.get("status") or "").strip().lower()
+    if clip_status in _TERMINAL_GENERATE_JOB_STATUSES:
+        return True
+
+    if clip.get("storage_path") or clip.get("thumbnail_path"):
+        return True
+
+    prior_job_query = (
+        supabase.table("jobs")
+        .select("id")
+        .eq("clip_id", clip_id)
+        .eq("type", "generate_clip")
+        .in_("status", list(_TERMINAL_GENERATE_JOB_STATUSES))
+        .order("created_at", desc=True)
+        .limit(1)
+    )
+    if access_context.workspace_team_id:
+        prior_job_query = prior_job_query.eq("team_id", access_context.workspace_team_id)
+    else:
+        prior_job_query = prior_job_query.eq("user_id", actor_user_id).is_("team_id", "null")
+
+    prior_job_resp = prior_job_query.execute()
+    raise_on_error(prior_job_resp, "Failed to check prior generation jobs")
+    return bool(prior_job_resp.data or [])
+
+
 def _enforce_smart_cleanup_access(
     *,
     context: UserAccessContext,
@@ -95,7 +142,7 @@ def _enforce_smart_cleanup_access(
 
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
-        detail="Smart Cleanup is available for Pro and Enterprise plans only.",
+        detail="Smart Cleanup is available for Basic, Pro, and Enterprise plans only.",
     )
 
 
@@ -130,7 +177,6 @@ def generate_clip(
     job_id = str(uuid4())
     user_id = current_user.id
     smart_cleanup_enabled = bool(payload.smartCleanupEnabled)
-    required_credits = calculate_clip_generation_cost(smart_cleanup_enabled)
 
     logger.info(
         "Generate clip request - user=%s clip=%s smart_cleanup=%s",
@@ -142,7 +188,10 @@ def generate_clip(
 
     clip_resp = (
         supabase.table("clips")
-        .select("id, video_id, user_id, team_id, billing_owner_user_id, start_time, end_time")
+        .select(
+            "id, video_id, user_id, team_id, billing_owner_user_id, start_time, end_time, "
+            "status, storage_path, thumbnail_path, ai_score, transcript_excerpt"
+        )
         .eq("id", payload.clipId)
         .execute()
     )
@@ -224,6 +273,22 @@ def generate_clip(
         supabase_client=supabase,
     )
 
+    is_ai_suggested = _is_ai_suggested_clip(clip)
+    has_prior_generation = _clip_has_prior_generation(
+        clip=clip,
+        clip_id=payload.clipId,
+        access_context=access_context,
+        actor_user_id=user_id,
+    )
+    required_credits = (
+        0
+        if is_ai_suggested and not has_prior_generation
+        else calculate_clip_generation_cost(
+            smart_cleanup_enabled,
+            access_context.tier,
+        )
+    )
+
     _enforce_smart_cleanup_access(
         context=access_context,
         smart_cleanup_enabled=smart_cleanup_enabled,
@@ -232,6 +297,14 @@ def generate_clip(
         context=access_context,
         actor_user_id=user_id,
         required_credits=required_credits,
+    )
+    logger.info(
+        "Clip generation credits resolved - user=%s clip=%s ai_suggested=%s prior_generation=%s required=%s",
+        user_id,
+        payload.clipId,
+        is_ai_suggested,
+        has_prior_generation,
+        required_credits,
     )
 
     billing_owner_user_id = access_context.billing_owner_user_id or user_id
@@ -295,7 +368,7 @@ def custom_clip(
     payload: CustomClipRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> GenerateClipResponse:
-    """Create a clip from a URL + start/end time in one step."""
+    """Create a clip from a URL + start/end time in one step (always credit-consuming)."""
     if payload.endTime <= payload.startTime:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -313,9 +386,12 @@ def custom_clip(
     url_str = str(payload.url)
     user_id = current_user.id
     smart_cleanup_enabled = bool(payload.smartCleanupEnabled)
-    required_credits = calculate_clip_generation_cost(smart_cleanup_enabled)
 
     access_context = enforce_processing_access_rules(user_id, supabase_client=supabase)
+    required_credits = calculate_custom_clip_generation_cost(
+        smart_cleanup_enabled,
+        access_context.tier,
+    )
     enforce_custom_clip_access(context=access_context)
     _enforce_smart_cleanup_access(
         context=access_context,
