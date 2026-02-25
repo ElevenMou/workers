@@ -1,7 +1,10 @@
 import logging
 import os
+import re
 import traceback
 from datetime import datetime, timedelta, timezone
+from math import ceil
+from typing import Any
 
 from config import calculate_video_analysis_cost
 from services.ai_analyzer import AIAnalyzer
@@ -11,10 +14,15 @@ from tasks.models.jobs import AnalyzeVideoJob
 from utils.workdirs import create_work_dir
 from utils.supabase_client import (
     assert_response_ok,
+    capture_credit_reservation,
     charge_video_analysis_credits,
+    emit_video_analysis_usage_event,
     get_credit_balance,
     get_team_wallet_balance,
     has_sufficient_credits,
+    has_team_wallet_charge_for_job,
+    release_credit_reservation,
+    reserve_credits,
     supabase,
     update_job_status,
     update_video_status,
@@ -22,14 +30,293 @@ from utils.supabase_client import (
 
 logger = logging.getLogger(__name__)
 
+_MIN_CLIP_SECONDS = 10
+_BOUNDARY_ALIGNMENT_TOLERANCE_SECONDS = 0.35
+try:
+    _LOW_AI_SCORE_THRESHOLD = max(
+        0.0,
+        min(1.0, float(os.getenv("ANALYZER_MIN_AI_SCORE", "0.45"))),
+    )
+except (TypeError, ValueError):
+    _LOW_AI_SCORE_THRESHOLD = 0.45
 
-def _update_analysis_job_progress(job_id: str, progress: int, stage: str):
+_INTRO_OUTRO_PATTERNS = (
+    re.compile(r"\b(welcome\s+back|welcome\s+to\s+my\s+channel)\b", re.IGNORECASE),
+    re.compile(r"\b(hey|hi|hello)\s+(guys|everyone|folks|friends)\b", re.IGNORECASE),
+    re.compile(r"\b(in\s+this\s+(video|episode)|today\s+(i|we)'?re?\s+going\s+to)\b", re.IGNORECASE),
+    re.compile(r"\b(before\s+we\s+get\s+started|quick\s+announcement)\b", re.IGNORECASE),
+    re.compile(r"\b(let'?s\s+(get\s+into|dive\s+in|jump\s+in))\b", re.IGNORECASE),
+    re.compile(r"\b(thanks?\s+for\s+watching|see\s+you\s+in\s+the\s+next)\b", re.IGNORECASE),
+    re.compile(r"\b(that'?s\s+it\s+for\s+today|hope\s+you\s+enjoyed)\b", re.IGNORECASE),
+)
+
+_NON_VIRAL_PATTERNS = (
+    re.compile(r"\b(like\s+and\s+subscribe|hit\s+the\s+bell)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(don'?t\s+forget\s+to|be\s+sure\s+to)\s+(like|subscribe|follow|comment|share)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(subscribe|follow\s+me|follow\s+for\s+more|share\s+this)\b", re.IGNORECASE),
+    re.compile(r"\b(link\s+in\s+(bio|description)|check\s+the\s+description)\b", re.IGNORECASE),
+    re.compile(r"\b(this\s+video\s+is\s+sponsored\s+by|sponsor(ed|ship)?)\b", re.IGNORECASE),
+    re.compile(r"\b(use\s+code\s+\w+|promo\s+code|affiliate\s+link)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(quick\s+disclaimer|not\s+financial\s+advice|for\s+educational\s+purposes)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(let\s+me\s+know\s+in\s+the\s+comments)\b", re.IGNORECASE),
+    re.compile(r"\b(apologies?\s+for|technical\s+difficult(y|ies)|audio\s+issue)\b", re.IGNORECASE),
+)
+
+
+def _resolve_legacy_clip_range(clip_length_seconds: int | None) -> tuple[int, int]:
+    selected_max = max(_MIN_CLIP_SECONDS, int(clip_length_seconds or 60))
+    if selected_max <= 60:
+        selected_min = _MIN_CLIP_SECONDS
+    elif selected_max <= 90:
+        selected_min = 60
+    elif selected_max <= 120:
+        selected_min = 90
+    else:
+        selected_min = 120
+
+    selected_min = min(selected_min, selected_max)
+    selected_min = max(_MIN_CLIP_SECONDS, selected_min)
+    return selected_min, selected_max
+
+
+def _resolve_requested_clip_range(job_data: AnalyzeVideoJob) -> tuple[int, int, int | None]:
+    clip_length_seconds_raw = job_data.get("clipLengthSeconds")
+    clip_length_seconds = (
+        int(clip_length_seconds_raw) if clip_length_seconds_raw is not None else None
+    )
+    clip_length_min_raw = job_data.get("clipLengthMinSeconds")
+    clip_length_max_raw = job_data.get("clipLengthMaxSeconds")
+
+    if (clip_length_min_raw is None) != (clip_length_max_raw is None):
+        raise RuntimeError(
+            "Invalid clip-length payload: clipLengthMinSeconds and clipLengthMaxSeconds must be provided together."
+        )
+
+    if clip_length_min_raw is not None and clip_length_max_raw is not None:
+        min_clip_seconds = int(clip_length_min_raw)
+        max_clip_seconds = int(clip_length_max_raw)
+    else:
+        min_clip_seconds, max_clip_seconds = _resolve_legacy_clip_range(
+            clip_length_seconds
+        )
+
+    if min_clip_seconds < _MIN_CLIP_SECONDS:
+        raise RuntimeError(
+            f"Invalid minimum clip length ({min_clip_seconds}s). Minimum allowed is {_MIN_CLIP_SECONDS}s."
+        )
+    if max_clip_seconds < min_clip_seconds:
+        raise RuntimeError(
+            "Invalid clip-length range: minimum cannot be greater than maximum."
+        )
+
+    selected_clip_length_seconds = (
+        clip_length_seconds if clip_length_seconds is not None else max_clip_seconds
+    )
+    return min_clip_seconds, max_clip_seconds, selected_clip_length_seconds
+
+
+def _as_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clip_transcript_for_analysis_window(
+    *,
+    transcript: dict[str, Any],
+    processing_start_seconds: float,
+    processing_end_seconds: float,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """
+    Build a strict analysis transcript within [processing_start_seconds, processing_end_seconds].
+
+    For segments with no word timing, partial boundary overlaps are dropped to avoid leaking
+    ambiguous out-of-window text.
+    """
+    input_segments = transcript.get("segments") or []
+    stats = {
+        "segments_total": len(input_segments),
+        "segments_used": 0,
+        "segments_dropped_partial_without_words": 0,
+        "segments_dropped_invalid": 0,
+        "segments_clipped_with_words": 0,
+    }
+
+    clipped_segments: list[dict[str, Any]] = []
+    for segment in input_segments:
+        seg_start = _as_float(segment.get("start"))
+        seg_end = _as_float(segment.get("end"))
+        text = str(segment.get("text") or "").strip()
+        if (
+            seg_start is None
+            or seg_end is None
+            or seg_end <= seg_start
+            or not text
+        ):
+            stats["segments_dropped_invalid"] += 1
+            continue
+
+        if seg_end <= processing_start_seconds or seg_start >= processing_end_seconds:
+            continue
+
+        overlap_start = max(seg_start, processing_start_seconds)
+        overlap_end = min(seg_end, processing_end_seconds)
+        if overlap_end <= overlap_start:
+            continue
+
+        is_partial = overlap_start > seg_start or overlap_end < seg_end
+        words = segment.get("words")
+        clipped_segment: dict[str, Any] | None = None
+        if isinstance(words, list) and words:
+            clipped_words: list[dict[str, Any]] = []
+            for word in words:
+                ws = _as_float(word.get("start"))
+                we = _as_float(word.get("end"))
+                token = str(word.get("word", word.get("text", "")) or "").strip()
+                if (
+                    ws is None
+                    or we is None
+                    or we <= ws
+                    or not token
+                    or we <= overlap_start
+                    or ws >= overlap_end
+                ):
+                    continue
+
+                clipped_ws = max(ws, overlap_start)
+                clipped_we = min(we, overlap_end)
+                if clipped_we <= clipped_ws:
+                    continue
+                clipped_words.append(
+                    {
+                        "word": token,
+                        "start": clipped_ws,
+                        "end": clipped_we,
+                    }
+                )
+
+            if not clipped_words:
+                continue
+
+            clipped_words.sort(key=lambda item: (float(item["start"]), float(item["end"])))
+            clipped_segment = {
+                "start": float(clipped_words[0]["start"]),
+                "end": float(clipped_words[-1]["end"]),
+                "text": " ".join(str(word["word"]) for word in clipped_words).strip(),
+                "words": clipped_words,
+            }
+            stats["segments_clipped_with_words"] += 1
+        else:
+            if is_partial:
+                stats["segments_dropped_partial_without_words"] += 1
+                continue
+            clipped_segment = {
+                "start": seg_start,
+                "end": seg_end,
+                "text": text,
+            }
+
+        if (
+            clipped_segment is None
+            or clipped_segment["end"] <= clipped_segment["start"]
+            or not str(clipped_segment.get("text") or "").strip()
+        ):
+            continue
+        clipped_segments.append(clipped_segment)
+        stats["segments_used"] += 1
+
+    clipped_segments.sort(key=lambda item: float(item["start"]))
+    return clipped_segments, stats
+
+
+def _nearest_boundary(
+    *,
+    value: float,
+    candidates: list[float],
+    tolerance: float,
+) -> float | None:
+    if not candidates:
+        return None
+    nearest = min(candidates, key=lambda candidate: abs(candidate - value))
+    if abs(nearest - value) <= tolerance:
+        return nearest
+    return None
+
+
+def _collect_clip_transcript_text(
+    *,
+    segments: list[dict[str, Any]],
+    start: float,
+    end: float,
+) -> str:
+    parts: list[str] = []
+    tolerance = _BOUNDARY_ALIGNMENT_TOLERANCE_SECONDS
+    for segment in segments:
+        seg_start = _as_float(segment.get("start"))
+        seg_end = _as_float(segment.get("end"))
+        if seg_start is None or seg_end is None:
+            continue
+        if seg_start < start - tolerance or seg_end > end + tolerance:
+            continue
+
+        text = str(segment.get("text") or "").strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts).strip()
+
+
+def _looks_low_viral_potential(
+    *,
+    text: str,
+    start: float,
+    end: float,
+    video_duration_seconds: float,
+) -> bool:
+    normalized = " ".join(str(text or "").lower().split())
+    if not normalized:
+        return True
+
+    if any(pattern.search(normalized) for pattern in _NON_VIRAL_PATTERNS):
+        return True
+
+    if video_duration_seconds <= 0:
+        return any(pattern.search(normalized) for pattern in _INTRO_OUTRO_PATTERNS)
+
+    edge_window = max(60.0, video_duration_seconds * 0.08)
+    in_intro_or_outro_zone = (
+        start <= edge_window
+        or end >= max(0.0, video_duration_seconds - edge_window)
+    )
+    if in_intro_or_outro_zone and any(
+        pattern.search(normalized) for pattern in _INTRO_OUTRO_PATTERNS
+    ):
+        return True
+
+    return False
+
+
+def _update_analysis_job_progress(
+    job_id: str,
+    progress: int,
+    stage: str,
+    billing_state: dict[str, Any] | None = None,
+):
     """Persist progress percentage plus a machine-readable stage label."""
+    result_data: dict[str, Any] = {"stage": stage}
+    if billing_state:
+        result_data["billing"] = dict(billing_state)
     update_job_status(
         job_id,
         "processing",
         progress,
-        result_data={"stage": stage},
+        result_data=result_data,
     )
 
 
@@ -43,6 +330,20 @@ def _best_effort_mark_failed(*, job_id: str, video_id: str, error_msg: str):
         update_video_status(video_id, "failed", error_message=error_msg)
     except Exception as exc:
         logger.warning("[%s] Failed to mark video %s failed: %s", job_id, video_id, exc)
+
+
+def _count_video_clips(video_id: str) -> int:
+    response = (
+        supabase.table("clips")
+        .select("id", count="exact")
+        .eq("video_id", video_id)
+        .execute()
+    )
+    assert_response_ok(response, f"Failed to count clips for {video_id}")
+    count_value = getattr(response, "count", None)
+    if isinstance(count_value, int):
+        return count_value
+    return len(response.data or [])
 
 
 def analyze_video_task(job_data: AnalyzeVideoJob):
@@ -60,20 +361,62 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
     charge_source = str(job_data.get("chargeSource") or "owner_wallet")
     url = job_data["url"]
     num_clips = job_data.get("numClips", 5)
+    min_clip_seconds, max_clip_seconds, selected_clip_length_seconds = (
+        _resolve_requested_clip_range(job_data)
+    )
+    processing_start_seconds = max(
+        0.0,
+        float(job_data.get("processingStartSeconds") or 0.0),
+    )
+    raw_processing_end_seconds = job_data.get("processingEndSeconds")
+    processing_end_seconds: float | None = (
+        float(raw_processing_end_seconds)
+        if raw_processing_end_seconds is not None
+        else None
+    )
+    extra_prompt = str(job_data.get("extraPrompt") or "").strip() or None
     expected_credits = int(job_data.get("analysisCredits") or 0)
 
-    # -- Per-job working directory for isolation --------------------------
-    work_dir = create_work_dir(f"analyze_{job_id}")
+    work_dir: str | None = None
+    downloader: VideoDownloader | None = None
+    analyzer: AIAnalyzer | None = None
+    video_path: str | None = None
+    audio_path: str | None = None
+    credits_required = expected_credits if expected_credits > 0 else 0
+    duration_seconds = 0
+    inserted_count = 0
+    transcript_window_stats: dict[str, int] = {
+        "segments_total": 0,
+        "segments_used": 0,
+        "segments_dropped_partial_without_words": 0,
+        "segments_dropped_invalid": 0,
+        "segments_clipped_with_words": 0,
+    }
+    clip_validation_stats: dict[str, int] = {
+        "returned_by_ai": 0,
+        "accepted": 0,
+        "skipped_invalid_payload": 0,
+        "skipped_outside_window": 0,
+        "skipped_not_boundary_aligned": 0,
+        "skipped_duration_out_of_range": 0,
+        "skipped_low_score": 0,
+        "skipped_non_viral_content": 0,
+        "skipped_duplicate": 0,
+    }
 
-    downloader = VideoDownloader(work_dir=work_dir)
-    transcriber = Transcriber()
-    analyzer = AIAnalyzer()
-
-    video_path = None
-    audio_path = None
+    billing_state: dict[str, Any] = {
+        "mode": "owner_wallet_reservation"
+        if charge_source == "owner_wallet"
+        else "team_wallet",
+        "status": "pending",
+    }
+    reservation_key = f"video_analysis:{job_id}"
+    reservation_id: str | None = None
+    reservation_captured = False
+    team_wallet_already_charged = False
 
     try:
-        _update_analysis_job_progress(job_id, 0, "starting")
+        _update_analysis_job_progress(job_id, 0, "starting", billing_state=billing_state)
 
         if expected_credits > 0 and not has_sufficient_credits(
             user_id=billing_owner_user_id,
@@ -91,35 +434,128 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 f"required={expected_credits}, available={available}"
             )
 
+        # -- Per-job working directory for isolation ----------------------
+        work_dir = create_work_dir(f"analyze_{job_id}")
+        downloader = VideoDownloader(work_dir=work_dir)
+        analyzer = AIAnalyzer()
+
+        if charge_source == "owner_wallet" and expected_credits > 0:
+            reservation_id = reserve_credits(
+                user_id=billing_owner_user_id,
+                amount=expected_credits,
+                reason=f"Video analysis reservation ({job_id})",
+                reservation_key=reservation_key,
+                video_id=video_id,
+            )
+            if not reservation_id:
+                raise RuntimeError(
+                    "Insufficient credits for analysis before processing starts: "
+                    f"required={expected_credits}"
+                )
+            billing_state.update(
+                {
+                    "reservation_key": reservation_key,
+                    "reservation_id": reservation_id,
+                    "status": "reserved",
+                }
+            )
+            _update_analysis_job_progress(
+                job_id,
+                1,
+                "reserving_credits",
+                billing_state=billing_state,
+            )
+
         update_video_status(video_id, "downloading")
 
         # 1. Download video --------------------------------------------------
-        _update_analysis_job_progress(job_id, 5, "downloading_video")
+        _update_analysis_job_progress(
+            job_id,
+            5,
+            "downloading_video",
+            billing_state=billing_state,
+        )
         logger.info("[%s] Downloading video: %s", job_id, url)
         video_data = downloader.download(url, video_id)
         video_path = video_data["path"]
-        _update_analysis_job_progress(job_id, 20, "downloading_video")
+        _update_analysis_job_progress(
+            job_id,
+            20,
+            "downloading_video",
+            billing_state=billing_state,
+        )
 
-        # Calculate credits based on duration (fallback).
-        duration_seconds = int(video_data["duration"])
-        calculated_credits = calculate_video_analysis_cost(duration_seconds)
+        # Calculate credits based on billed processing window (fallback).
+        duration_seconds = int(video_data.get("duration") or 0)
+
+        processing_end_seconds = (
+            min(float(duration_seconds), processing_end_seconds)
+            if processing_end_seconds is not None
+            else float(duration_seconds)
+        )
+        processing_start_seconds = min(processing_start_seconds, processing_end_seconds)
+        if processing_end_seconds <= processing_start_seconds:
+            raise RuntimeError(
+                "Invalid processing timeframe: end must be greater than start "
+                f"(start={processing_start_seconds}, end={processing_end_seconds})"
+            )
+        processing_window_seconds = processing_end_seconds - processing_start_seconds
+        if processing_window_seconds < float(min_clip_seconds):
+            raise RuntimeError(
+                "Invalid processing timeframe: window is shorter than requested clip length "
+                f"(window={processing_window_seconds:.2f}s, clip_length={min_clip_seconds}s)"
+            )
+        calculated_credits = calculate_video_analysis_cost(
+            int(ceil(processing_window_seconds))
+        )
         credits_required = expected_credits if expected_credits > 0 else calculated_credits
         if expected_credits > 0 and expected_credits != calculated_credits:
             logger.warning(
-                "[%s] Analysis credit mismatch detected: queued=%d calculated=%d. "
-                "Charging queued amount for deterministic billing.",
+                "[%s] Analysis credit mismatch detected: queued=%d calculated=%d "
+                "(window=%.2fs). Charging queued amount for deterministic billing.",
                 job_id,
                 expected_credits,
                 calculated_credits,
+                processing_window_seconds,
             )
 
         logger.info(
-            "[%s] Video duration: %ds (~%.1f min) - credits required: %d",
+            "[%s] Video duration: %ds (~%.1f min), billed window: %.2fs (~%.1f min) - credits required: %d",
             job_id,
             duration_seconds,
             duration_seconds / 60,
+            processing_window_seconds,
+            processing_window_seconds / 60,
             credits_required,
         )
+
+        if charge_source == "owner_wallet" and not reservation_id and credits_required > 0:
+            reservation_id = reserve_credits(
+                user_id=billing_owner_user_id,
+                amount=credits_required,
+                reason=f"Video analysis reservation ({job_id})",
+                reservation_key=reservation_key,
+                video_id=video_id,
+            )
+            if not reservation_id:
+                available = get_credit_balance(billing_owner_user_id)
+                raise RuntimeError(
+                    "Insufficient credits for analysis before processing starts: "
+                    f"required={credits_required}, available={available}"
+                )
+            billing_state.update(
+                {
+                    "reservation_key": reservation_key,
+                    "reservation_id": reservation_id,
+                    "status": "reserved",
+                }
+            )
+            _update_analysis_job_progress(
+                job_id,
+                21,
+                "reserving_credits",
+                billing_state=billing_state,
+            )
 
         # Update video metadata (keep raw_video_path for later clip generation)
         update_video_status(
@@ -139,30 +575,90 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         # 2. Get transcript ---------------------------------------------------
         transcript = None
         if video_data["platform"] == "youtube" and video_data.get("external_id"):
-            _update_analysis_job_progress(job_id, 35, "fetching_source_captions")
+            _update_analysis_job_progress(
+                job_id,
+                35,
+                "fetching_source_captions",
+                billing_state=billing_state,
+            )
             logger.info("[%s] Attempting to get YouTube transcript ...", job_id)
             transcript = downloader.get_youtube_transcript(video_data["external_id"])
             if transcript:
                 logger.info("[%s] Got transcript from YouTube", job_id)
-                _update_analysis_job_progress(job_id, 60, "fetching_source_captions")
+                _update_analysis_job_progress(
+                    job_id,
+                    60,
+                    "fetching_source_captions",
+                    billing_state=billing_state,
+                )
 
         if not transcript:
-            _update_analysis_job_progress(job_id, 35, "extracting_audio")
+            _update_analysis_job_progress(
+                job_id,
+                35,
+                "extracting_audio",
+                billing_state=billing_state,
+            )
             logger.info("[%s] Extracting audio for Whisper transcription ...", job_id)
             audio_path = downloader.extract_audio(video_path)
-            _update_analysis_job_progress(job_id, 40, "extracting_audio")
+            _update_analysis_job_progress(
+                job_id,
+                40,
+                "extracting_audio",
+                billing_state=billing_state,
+            )
 
-            _update_analysis_job_progress(job_id, 50, "transcribing_audio")
+            _update_analysis_job_progress(
+                job_id,
+                50,
+                "transcribing_audio",
+                billing_state=billing_state,
+            )
             logger.info("[%s] Transcribing with Whisper ...", job_id)
+            transcriber = Transcriber()
             transcript = transcriber.transcribe(audio_path)
             transcript["source"] = "whisper"
-            _update_analysis_job_progress(job_id, 60, "transcribing_audio")
+            _update_analysis_job_progress(
+                job_id,
+                60,
+                "transcribing_audio",
+                billing_state=billing_state,
+            )
+
+        analysis_segments, transcript_window_stats = _clip_transcript_for_analysis_window(
+            transcript=transcript,
+            processing_start_seconds=processing_start_seconds,
+            processing_end_seconds=processing_end_seconds,
+        )
+        if not analysis_segments:
+            raise RuntimeError(
+                "No transcript content found in the selected processing timeframe: "
+                f"{processing_start_seconds:.2f}-{processing_end_seconds:.2f}s"
+            )
+        transcript_for_analysis = dict(transcript)
+        transcript_for_analysis["segments"] = analysis_segments
 
         # 3. Analyse with Claude -----------------------------------------------
-        _update_analysis_job_progress(job_id, 70, "analyzing_transcript")
+        _update_analysis_job_progress(
+            job_id,
+            70,
+            "analyzing_transcript",
+            billing_state=billing_state,
+        )
         logger.info("[%s] Analysing for %d clips with Claude ...", job_id, num_clips)
-        clips = analyzer.find_best_clips(transcript, num_clips=num_clips)
-        _update_analysis_job_progress(job_id, 90, "saving_results")
+        clips = analyzer.find_best_clips(
+            transcript_for_analysis,
+            num_clips=num_clips,
+            min_duration=min_clip_seconds,
+            max_duration=max_clip_seconds,
+            extra_prompt=extra_prompt,
+        )
+        _update_analysis_job_progress(
+            job_id,
+            90,
+            "saving_results",
+            billing_state=billing_state,
+        )
 
         # 4. Save results -----------------------------------------------------
         logger.info("[%s] Saving results ...", job_id)
@@ -171,10 +667,25 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         ).eq("id", video_id).execute()
         assert_response_ok(save_video_resp, f"Failed to save transcript for {video_id}")
 
-        # Insert clip suggestions (enforce duration constraints: 60-90 s)
-        MIN_CLIP_SECONDS = 60
-        MAX_CLIP_SECONDS = 90
-        inserted_count = 0
+        # Insert clip suggestions.
+        MIN_CLIP_SECONDS = min_clip_seconds
+        MAX_CLIP_SECONDS = max_clip_seconds
+        boundary_start_candidates = sorted(
+            {
+                float(segment["start"])
+                for segment in analysis_segments
+                if _as_float(segment.get("start")) is not None
+            }
+        )
+        boundary_end_candidates = sorted(
+            {
+                float(segment["end"])
+                for segment in analysis_segments
+                if _as_float(segment.get("end")) is not None
+            }
+        )
+
+        clip_validation_stats["returned_by_ai"] = len(clips)
         existing_resp = (
             supabase.table("clips")
             .select("start_time,end_time,title")
@@ -192,35 +703,39 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         }
 
         for clip in clips:
-            start = float(clip["start"])
-            end = float(clip["end"])
+            start = _as_float(clip.get("start"))
+            end = _as_float(clip.get("end"))
+            if start is None or end is None or end <= start:
+                clip_validation_stats["skipped_invalid_payload"] += 1
+                continue
 
-            # Clamp within video bounds
-            end = min(end, duration_seconds)
-            start = max(0.0, min(start, end))
+            if (
+                start < processing_start_seconds - _BOUNDARY_ALIGNMENT_TOLERANCE_SECONDS
+                or end > processing_end_seconds + _BOUNDARY_ALIGNMENT_TOLERANCE_SECONDS
+                or end > float(duration_seconds) + _BOUNDARY_ALIGNMENT_TOLERANCE_SECONDS
+            ):
+                clip_validation_stats["skipped_outside_window"] += 1
+                continue
+
+            snapped_start = _nearest_boundary(
+                value=float(start),
+                candidates=boundary_start_candidates,
+                tolerance=_BOUNDARY_ALIGNMENT_TOLERANCE_SECONDS,
+            )
+            snapped_end = _nearest_boundary(
+                value=float(end),
+                candidates=boundary_end_candidates,
+                tolerance=_BOUNDARY_ALIGNMENT_TOLERANCE_SECONDS,
+            )
+            if snapped_start is None or snapped_end is None or snapped_end <= snapped_start:
+                clip_validation_stats["skipped_not_boundary_aligned"] += 1
+                continue
+
+            start = float(snapped_start)
+            end = float(snapped_end)
             duration = end - start
-
-            # Trim if too long
-            if duration > MAX_CLIP_SECONDS:
-                end = start + MAX_CLIP_SECONDS
-                duration = end - start
-
-            # Expand if too short
-            if duration < MIN_CLIP_SECONDS:
-                desired_end = min(duration_seconds, start + MIN_CLIP_SECONDS)
-                if desired_end - start < MIN_CLIP_SECONDS and start > 0:
-                    start = max(0.0, desired_end - MIN_CLIP_SECONDS)
-                end = desired_end
-                duration = end - start
-
             if duration < MIN_CLIP_SECONDS or duration > MAX_CLIP_SECONDS:
-                logger.warning(
-                    "[%s] Skipping clip outside duration bounds (%.2fs): %.2f-%.2f",
-                    job_id,
-                    duration,
-                    start,
-                    end,
-                )
+                clip_validation_stats["skipped_duration_out_of_range"] += 1
                 continue
 
             # ai_score is DECIMAL(3,2); clamp to 0-1 to avoid numeric overflow
@@ -232,6 +747,34 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                     score = None
             else:
                 score = None
+
+            if score is not None and score < _LOW_AI_SCORE_THRESHOLD:
+                clip_validation_stats["skipped_low_score"] += 1
+                continue
+
+            clip_transcript_text = _collect_clip_transcript_text(
+                segments=analysis_segments,
+                start=start,
+                end=end,
+            )
+            clip_text = " ".join(
+                part
+                for part in [
+                    clip_transcript_text,
+                    str(clip.get("title") or "").strip(),
+                    str(clip.get("hook") or "").strip(),
+                    str(clip.get("text") or "").strip(),
+                ]
+                if part
+            )
+            if _looks_low_viral_potential(
+                text=clip_text,
+                start=start,
+                end=end,
+                video_duration_seconds=float(duration_seconds),
+            ):
+                clip_validation_stats["skipped_non_viral_content"] += 1
+                continue
 
             clip_key = (
                 round(start, 2),
@@ -246,6 +789,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                     end,
                     clip.get("title", ""),
                 )
+                clip_validation_stats["skipped_duplicate"] += 1
                 continue
 
             clip_insert_resp = supabase.table("clips").insert(
@@ -258,7 +802,11 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                     "end_time": end,
                     "title": clip["title"],
                     "ai_score": round(score, 2) if score is not None else None,
-                    "transcript_excerpt": clip["text"][:500],
+                    "transcript_excerpt": (
+                        clip_transcript_text
+                        if clip_transcript_text
+                        else str(clip.get("text") or "").strip()
+                    )[:500],
                     "status": "pending",
                 }
             ).execute()
@@ -268,36 +816,96 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             )
             existing_keys.add(clip_key)
             inserted_count += 1
+            clip_validation_stats["accepted"] += 1
 
         # Charge credits atomically at finalization time.
-        _update_analysis_job_progress(job_id, 95, "charging_credits")
-        charge_video_analysis_credits(
-            user_id=user_id,
-            amount=credits_required,
-            description=(
-                f"Video analysis ({duration_seconds / 60:.1f}min): "
-                f'{video_data["title"][:50]}'
-            ),
-            video_id=video_id,
-            charge_source=charge_source,
-            team_id=workspace_team_id,
-            billing_owner_user_id=billing_owner_user_id,
-            actor_user_id=user_id,
-            job_id=job_id,
-            usage_metadata={
-                "analyses_count": 1,
-                "video_duration_seconds": duration_seconds,
-                "requested_clip_count": num_clips,
-                "suggested_clip_count": inserted_count,
-                "platform": video_data.get("platform"),
-            },
+        _update_analysis_job_progress(
+            job_id,
+            95,
+            "charging_credits",
+            billing_state=billing_state,
         )
+
+        charge_description = (
+            f"Video analysis ({processing_window_seconds / 60:.1f}min window): "
+            f'{(video_data.get("title") or "")[:50]}'
+        )
+        usage_metadata = {
+            "analyses_count": 1,
+            "video_duration_seconds": duration_seconds,
+            "processing_window_seconds": processing_window_seconds,
+            "requested_clip_count": num_clips,
+            "requested_clip_length_seconds": selected_clip_length_seconds,
+            "min_clip_seconds": min_clip_seconds,
+            "max_clip_seconds": max_clip_seconds,
+            "processing_start_seconds": processing_start_seconds,
+            "processing_end_seconds": processing_end_seconds,
+            "extra_prompt_provided": bool(extra_prompt),
+            "suggested_clip_count": inserted_count,
+            "transcript_window_stats": transcript_window_stats,
+            "clip_validation_stats": clip_validation_stats,
+            "platform": video_data.get("platform"),
+        }
+
+        if charge_source == "owner_wallet":
+            if credits_required <= 0:
+                billing_state["status"] = "not_required"
+            else:
+                if not reservation_id:
+                    raise RuntimeError("Missing credit reservation before capture")
+                capture_ok = capture_credit_reservation(
+                    reservation_id=reservation_id,
+                    tx_type="video_analysis",
+                    description=charge_description,
+                )
+                if not capture_ok:
+                    raise RuntimeError("Failed to capture video-analysis credit reservation")
+                reservation_captured = True
+                billing_state["status"] = "captured"
+                emit_video_analysis_usage_event(
+                    user_id=user_id,
+                    amount=credits_required,
+                    video_id=video_id,
+                    charge_source=charge_source,
+                    team_id=workspace_team_id,
+                    billing_owner_user_id=billing_owner_user_id,
+                    actor_user_id=user_id,
+                    job_id=job_id,
+                    usage_metadata=usage_metadata,
+                )
+        else:
+            if charge_source == "team_wallet" and workspace_team_id and credits_required > 0:
+                team_wallet_already_charged = has_team_wallet_charge_for_job(
+                    team_id=workspace_team_id,
+                    job_id=job_id,
+                    owner_user_id=billing_owner_user_id,
+                )
+
+            if team_wallet_already_charged:
+                billing_state["status"] = "already_charged"
+                logger.info(
+                    "[%s] Skipping duplicate team-wallet charge for already-charged job",
+                    job_id,
+                )
+            else:
+                charge_video_analysis_credits(
+                    user_id=user_id,
+                    amount=credits_required,
+                    description=charge_description,
+                    video_id=video_id,
+                    charge_source=charge_source,
+                    team_id=workspace_team_id,
+                    billing_owner_user_id=billing_owner_user_id,
+                    actor_user_id=user_id,
+                    job_id=job_id,
+                    usage_metadata=usage_metadata,
+                )
+                billing_state["status"] = "charged"
 
         finalize_video_resp = supabase.table("videos").update(
             {
                 "status": "completed",
                 "credits_charged": credits_required,
-                "clip_count": inserted_count,
             }
         ).eq("id", video_id).execute()
         assert_response_ok(
@@ -305,13 +913,35 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             f"Failed to finalize video metadata for {video_id}",
         )
 
-        _update_analysis_job_progress(job_id, 99, "finalizing")
-        update_job_status(job_id, "completed", 100, result_data={
-            "stage": "completed",
-            "clip_count": inserted_count,
-            "duration_seconds": duration_seconds,
-            "credits_charged": credits_required,
-        })
+        final_clip_count = _count_video_clips(video_id)
+
+        _update_analysis_job_progress(
+            job_id,
+            99,
+            "finalizing",
+            billing_state=billing_state,
+        )
+        update_job_status(
+            job_id,
+            "completed",
+            100,
+            result_data={
+                "stage": "completed",
+                "clip_count": final_clip_count,
+                "new_clip_count": inserted_count,
+                "duration_seconds": duration_seconds,
+                "credits_charged": credits_required,
+                "requested_clip_length_seconds": selected_clip_length_seconds,
+                "min_clip_seconds": min_clip_seconds,
+                "max_clip_seconds": max_clip_seconds,
+                "processing_start_seconds": processing_start_seconds,
+                "processing_end_seconds": processing_end_seconds,
+                "extra_prompt_provided": bool(extra_prompt),
+                "transcript_window_stats": transcript_window_stats,
+                "clip_validation_stats": clip_validation_stats,
+                "billing": dict(billing_state),
+            },
+        )
         logger.info(
             "[%s] Video analysis completed - %d clips saved", job_id, inserted_count
         )
@@ -320,6 +950,24 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         error_msg = str(e)
         logger.error("[%s] Error analysing video: %s", job_id, error_msg)
         logger.debug(traceback.format_exc())
+
+        if charge_source == "owner_wallet" and reservation_id and not reservation_captured:
+            try:
+                release_credit_reservation(reservation_id=reservation_id)
+                billing_state["status"] = "released"
+                _update_analysis_job_progress(
+                    job_id,
+                    96,
+                    "releasing_credit_reservation",
+                    billing_state=billing_state,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Failed to release analysis credit reservation %s: %s",
+                    job_id,
+                    reservation_id,
+                    exc,
+                )
 
         _best_effort_mark_failed(job_id=job_id, video_id=video_id, error_msg=error_msg)
         raise

@@ -40,10 +40,9 @@ def _validate_clip_range(start_time: float, end_time: float):
         raise ValueError("endTime must be greater than startTime")
 
     duration = end_time - start_time
-    if duration < 40 or duration > 90:
+    if duration < 10:
         raise ValueError(
-            f"Invalid clip duration {duration:.2f}s. Must be between 40s and 90s "
-            "(clips.duration_seconds check constraint)."
+            f"Invalid clip duration {duration:.2f}s. Must be at least 10 seconds."
         )
 
 

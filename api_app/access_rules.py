@@ -12,11 +12,17 @@ from utils.supabase_client import assert_response_ok, supabase
 
 FREE_MAX_CONCURRENT_JOBS = 1
 _ACTIVE_JOB_STATUSES = ("queued", "processing", "retrying")
-_DEFAULT_MAX_CLIP_DURATION_SECONDS = 90
+_MAX_CLIP_DURATION_SECONDS_BY_TIER: dict[str, int] = {
+    "free": 60,
+    "basic": 120,
+    "pro": 300,
+    "enterprise": 300,
+}
+_DEFAULT_MAX_CLIP_DURATION_SECONDS = _MAX_CLIP_DURATION_SECONDS_BY_TIER["pro"]
 _DEFAULT_PLAN_LIMITS_BY_TIER: dict[str, dict[str, int | bool | None]] = {
     "free": {
         "max_videos_per_month": 10,
-        "max_clip_duration_seconds": _DEFAULT_MAX_CLIP_DURATION_SECONDS,
+        "max_clip_duration_seconds": _MAX_CLIP_DURATION_SECONDS_BY_TIER["free"],
         "max_analysis_duration_seconds": 20 * 60,
         "priority_processing": False,
         "allow_custom_clips": False,
@@ -30,7 +36,7 @@ _DEFAULT_PLAN_LIMITS_BY_TIER: dict[str, dict[str, int | bool | None]] = {
     },
     "basic": {
         "max_videos_per_month": 60,
-        "max_clip_duration_seconds": _DEFAULT_MAX_CLIP_DURATION_SECONDS,
+        "max_clip_duration_seconds": _MAX_CLIP_DURATION_SECONDS_BY_TIER["basic"],
         "max_analysis_duration_seconds": 45 * 60,
         "priority_processing": False,
         "allow_custom_clips": True,
@@ -44,7 +50,7 @@ _DEFAULT_PLAN_LIMITS_BY_TIER: dict[str, dict[str, int | bool | None]] = {
     },
     "pro": {
         "max_videos_per_month": 220,
-        "max_clip_duration_seconds": _DEFAULT_MAX_CLIP_DURATION_SECONDS,
+        "max_clip_duration_seconds": _MAX_CLIP_DURATION_SECONDS_BY_TIER["pro"],
         "max_analysis_duration_seconds": 2 * 60 * 60,
         "priority_processing": True,
         "allow_custom_clips": True,
@@ -58,7 +64,7 @@ _DEFAULT_PLAN_LIMITS_BY_TIER: dict[str, dict[str, int | bool | None]] = {
     },
     "enterprise": {
         "max_videos_per_month": 600,
-        "max_clip_duration_seconds": _DEFAULT_MAX_CLIP_DURATION_SECONDS,
+        "max_clip_duration_seconds": _MAX_CLIP_DURATION_SECONDS_BY_TIER["enterprise"],
         "max_analysis_duration_seconds": None,
         "priority_processing": True,
         "allow_custom_clips": True,
@@ -72,6 +78,11 @@ _DEFAULT_PLAN_LIMITS_BY_TIER: dict[str, dict[str, int | bool | None]] = {
     },
 }
 logger = logging.getLogger(__name__)
+
+
+def _default_max_clip_duration_for_tier(tier: str) -> int:
+    normalized = str(tier or "").strip().lower()
+    return int(_MAX_CLIP_DURATION_SECONDS_BY_TIER.get(normalized, _DEFAULT_MAX_CLIP_DURATION_SECONDS))
 
 
 @dataclass(frozen=True)
@@ -209,7 +220,10 @@ def _read_plan_limits(
         ),
         "max_clip_duration_seconds": _as_int(
             row.get("max_clip_duration_seconds"),
-            _as_int(fallback.get("max_clip_duration_seconds"), _DEFAULT_MAX_CLIP_DURATION_SECONDS),
+            _as_int(
+                fallback.get("max_clip_duration_seconds"),
+                _default_max_clip_duration_for_tier(tier),
+            ),
         ),
         "max_analysis_duration_seconds": _as_int(
             row.get("max_analysis_duration_seconds"),
@@ -458,10 +472,10 @@ def get_user_access_context(user_id: str, supabase_client=supabase) -> UserAcces
 
     max_clip_duration_seconds = _as_int(
         plan_limits.get("max_clip_duration_seconds"),
-        _DEFAULT_MAX_CLIP_DURATION_SECONDS,
+        _default_max_clip_duration_for_tier(tier),
     )
     if max_clip_duration_seconds is None:
-        max_clip_duration_seconds = _DEFAULT_MAX_CLIP_DURATION_SECONDS
+        max_clip_duration_seconds = _default_max_clip_duration_for_tier(tier)
 
     return UserAccessContext(
         tier=tier,

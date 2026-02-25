@@ -289,12 +289,12 @@ def test_custom_clip_duration_validation_returns_400(client):
         json={
             "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
             "startTime": 0,
-            "endTime": 20,
+            "endTime": 8,
             "title": "Too short",
         },
     )
     assert response.status_code == 400
-    assert "40 and 90 seconds" in response.json()["detail"]
+    assert "at least 10 seconds" in response.json()["detail"]
 
 
 def test_custom_clip_rejects_free_tier_access(client, monkeypatch):
@@ -633,7 +633,7 @@ def test_analyze_video_rejects_duration_over_plan_cap(client, monkeypatch):
     assert "20 minutes" in response.json()["detail"].lower()
 
 
-def test_analyze_video_rejects_clip_count_above_three_minute_ratio(client, monkeypatch):
+def test_analyze_video_rejects_clip_count_above_density_ratio(client, monkeypatch):
     from api_app.app import app
 
     app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
@@ -680,6 +680,421 @@ def test_analyze_video_rejects_clip_count_above_three_minute_ratio(client, monke
 
     assert response.status_code == 400
     assert "1 clip every 3 minutes" in response.json()["detail"]
+
+
+def test_analyze_video_queues_range_based_analysis_credits(client, monkeypatch):
+    from api_app.app import app
+
+    class _FakeAnalyzeQuery:
+        def __init__(self, store: "_FakeAnalyzeSupabase", table_name: str):
+            self.store = store
+            self.table_name = table_name
+            self._mode = "select"
+            self._payload = None
+
+        def select(self, *_args, **_kwargs):
+            self._mode = "select"
+            return self
+
+        def upsert(self, payload, **_kwargs):
+            self._mode = "upsert"
+            self._payload = payload
+            return self
+
+        def eq(self, *_args, **_kwargs):
+            return self
+
+        def is_(self, *_args, **_kwargs):
+            return self
+
+        def limit(self, *_args, **_kwargs):
+            return self
+
+        def execute(self):
+            if self._mode == "select":
+                return _FakeResponse(data=[])
+            if self.table_name == "videos":
+                self.store.video_upserts.append(self._payload)
+            elif self.table_name == "jobs":
+                self.store.job_upserts.append(self._payload)
+            return _FakeResponse(data=[self._payload] if self._payload else [])
+
+    class _FakeAnalyzeSupabase:
+        def __init__(self):
+            self.video_upserts: list[dict] = []
+            self.job_upserts: list[dict] = []
+
+        def table(self, name: str):
+            if name in {"videos", "jobs"}:
+                return _FakeAnalyzeQuery(self, name)
+            raise AssertionError(f"Unexpected table access: {name}")
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+
+    checked_amounts: list[int] = []
+
+    def _fake_has_sufficient_credits(*, user_id, amount, **_kwargs):
+        assert user_id == "user-id"
+        checked_amounts.append(int(amount))
+        return True
+
+    enqueued_payload: dict | None = None
+
+    def _fake_enqueue_or_fail(*, job_data, **_kwargs):
+        nonlocal enqueued_payload
+        enqueued_payload = dict(job_data)
+
+    monkeypatch.setattr(videos_router, "supabase", _FakeAnalyzeSupabase())
+    monkeypatch.setattr(videos_router, "raise_on_error", lambda *_a, **_k: None)
+    monkeypatch.setattr(videos_router, "enforce_monthly_video_limit", lambda *_a, **_k: None)
+    monkeypatch.setattr(videos_router, "enqueue_or_fail", _fake_enqueue_or_fail)
+    monkeypatch.setattr(videos_router, "has_sufficient_credits", _fake_has_sufficient_credits)
+    monkeypatch.setattr(videos_router, "get_credit_balance", lambda _user_id: 999)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_args, **_kwargs: access_rules.UserAccessContext(
+            tier="basic",
+            status="active",
+            interval="month",
+            max_videos_per_month=60,
+            max_clip_duration_seconds=120,
+            max_analysis_duration_seconds=60 * 60,
+            allow_custom_clips=True,
+            max_active_jobs=2,
+        ),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_probe_credit_cost_for_url",
+        lambda _url: {
+            "valid_url": True,
+            "analysis_credits": 10,
+            "duration_seconds": 10 * 60,
+        },
+    )
+
+    response = client.post(
+        "/videos/analyze",
+        json={
+            "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
+            "numClips": 1,
+            "processingStartSeconds": 60,
+            "processingEndSeconds": 180,
+        },
+    )
+
+    assert response.status_code == 200
+    assert enqueued_payload is not None
+    assert enqueued_payload["analysisCredits"] == 2
+    assert checked_amounts == [1, 2]
+    assert enqueued_payload["clipLengthMinSeconds"] == 10
+    assert enqueued_payload["clipLengthMaxSeconds"] == 60
+
+
+def test_analyze_video_accepts_explicit_clip_length_range(client, monkeypatch):
+    from api_app.app import app
+
+    class _FakeAnalyzeQuery:
+        def __init__(self, store: "_FakeAnalyzeSupabase", table_name: str):
+            self.store = store
+            self.table_name = table_name
+            self._mode = "select"
+            self._payload = None
+
+        def select(self, *_args, **_kwargs):
+            self._mode = "select"
+            return self
+
+        def upsert(self, payload, **_kwargs):
+            self._mode = "upsert"
+            self._payload = payload
+            return self
+
+        def eq(self, *_args, **_kwargs):
+            return self
+
+        def is_(self, *_args, **_kwargs):
+            return self
+
+        def limit(self, *_args, **_kwargs):
+            return self
+
+        def execute(self):
+            if self._mode == "select":
+                return _FakeResponse(data=[])
+            if self.table_name == "videos":
+                self.store.video_upserts.append(self._payload)
+            elif self.table_name == "jobs":
+                self.store.job_upserts.append(self._payload)
+            return _FakeResponse(data=[self._payload] if self._payload else [])
+
+    class _FakeAnalyzeSupabase:
+        def __init__(self):
+            self.video_upserts: list[dict] = []
+            self.job_upserts: list[dict] = []
+
+        def table(self, name: str):
+            if name in {"videos", "jobs"}:
+                return _FakeAnalyzeQuery(self, name)
+            raise AssertionError(f"Unexpected table access: {name}")
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+
+    enqueued_payload: dict | None = None
+
+    def _fake_enqueue_or_fail(*, job_data, **_kwargs):
+        nonlocal enqueued_payload
+        enqueued_payload = dict(job_data)
+
+    monkeypatch.setattr(videos_router, "supabase", _FakeAnalyzeSupabase())
+    monkeypatch.setattr(videos_router, "raise_on_error", lambda *_a, **_k: None)
+    monkeypatch.setattr(videos_router, "enforce_monthly_video_limit", lambda *_a, **_k: None)
+    monkeypatch.setattr(videos_router, "enqueue_or_fail", _fake_enqueue_or_fail)
+    monkeypatch.setattr(videos_router, "has_sufficient_credits", lambda **_k: True)
+    monkeypatch.setattr(videos_router, "get_credit_balance", lambda _user_id: 999)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_args, **_kwargs: access_rules.UserAccessContext(
+            tier="basic",
+            status="active",
+            interval="month",
+            max_videos_per_month=60,
+            max_clip_duration_seconds=120,
+            max_analysis_duration_seconds=60 * 60,
+            allow_custom_clips=True,
+            max_active_jobs=2,
+        ),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_probe_credit_cost_for_url",
+        lambda _url: {
+            "valid_url": True,
+            "analysis_credits": 10,
+            "duration_seconds": 10 * 60,
+        },
+    )
+
+    response = client.post(
+        "/videos/analyze",
+        json={
+            "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
+            "numClips": 1,
+            "clipLengthMinSeconds": 60,
+            "clipLengthMaxSeconds": 120,
+            "processingStartSeconds": 0,
+            "processingEndSeconds": 70,
+        },
+    )
+
+    assert response.status_code == 200
+    assert enqueued_payload is not None
+    assert enqueued_payload["clipLengthMinSeconds"] == 60
+    assert enqueued_payload["clipLengthMaxSeconds"] == 120
+    assert enqueued_payload["clipLengthSeconds"] == 120
+
+
+def test_analyze_video_rejects_unpaired_clip_range_values(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    monkeypatch.setattr(videos_router, "has_sufficient_credits", lambda **_k: True)
+    monkeypatch.setattr(videos_router, "get_credit_balance", lambda _user_id: 999)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_args, **_kwargs: access_rules.UserAccessContext(
+            tier="basic",
+            status="active",
+            interval="month",
+            max_videos_per_month=60,
+            max_clip_duration_seconds=120,
+            max_analysis_duration_seconds=60 * 60,
+            allow_custom_clips=True,
+            max_active_jobs=2,
+        ),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_probe_credit_cost_for_url",
+        lambda _url: {
+            "valid_url": True,
+            "analysis_credits": 10,
+            "duration_seconds": 10 * 60,
+        },
+    )
+
+    response = client.post(
+        "/videos/analyze",
+        json={
+            "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
+            "numClips": 1,
+            "clipLengthMinSeconds": 60,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "provided together" in response.json()["detail"]
+
+
+def test_analyze_video_rejects_invalid_clip_range_order(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    monkeypatch.setattr(videos_router, "has_sufficient_credits", lambda **_k: True)
+    monkeypatch.setattr(videos_router, "get_credit_balance", lambda _user_id: 999)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_args, **_kwargs: access_rules.UserAccessContext(
+            tier="basic",
+            status="active",
+            interval="month",
+            max_videos_per_month=60,
+            max_clip_duration_seconds=120,
+            max_analysis_duration_seconds=60 * 60,
+            allow_custom_clips=True,
+            max_active_jobs=2,
+        ),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_probe_credit_cost_for_url",
+        lambda _url: {
+            "valid_url": True,
+            "analysis_credits": 10,
+            "duration_seconds": 10 * 60,
+        },
+    )
+
+    response = client.post(
+        "/videos/analyze",
+        json={
+            "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
+            "numClips": 1,
+            "clipLengthMinSeconds": 90,
+            "clipLengthMaxSeconds": 60,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "cannot be greater" in response.json()["detail"]
+
+
+def test_analyze_video_rejects_clip_range_above_plan_limit(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    monkeypatch.setattr(videos_router, "has_sufficient_credits", lambda **_k: True)
+    monkeypatch.setattr(videos_router, "get_credit_balance", lambda _user_id: 999)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_args, **_kwargs: access_rules.UserAccessContext(
+            tier="basic",
+            status="active",
+            interval="month",
+            max_videos_per_month=60,
+            max_clip_duration_seconds=120,
+            max_analysis_duration_seconds=60 * 60,
+            allow_custom_clips=True,
+            max_active_jobs=2,
+        ),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_probe_credit_cost_for_url",
+        lambda _url: {
+            "valid_url": True,
+            "analysis_credits": 10,
+            "duration_seconds": 10 * 60,
+        },
+    )
+
+    response = client.post(
+        "/videos/analyze",
+        json={
+            "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
+            "numClips": 1,
+            "clipLengthMinSeconds": 60,
+            "clipLengthMaxSeconds": 180,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "outside your plan limits" in response.json()["detail"]
+
+
+def test_analyze_video_rejects_window_shorter_than_selected_range_min(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    monkeypatch.setattr(videos_router, "has_sufficient_credits", lambda **_k: True)
+    monkeypatch.setattr(videos_router, "get_credit_balance", lambda _user_id: 999)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_args, **_kwargs: access_rules.UserAccessContext(
+            tier="basic",
+            status="active",
+            interval="month",
+            max_videos_per_month=60,
+            max_clip_duration_seconds=120,
+            max_analysis_duration_seconds=60 * 60,
+            allow_custom_clips=True,
+            max_active_jobs=2,
+        ),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_probe_credit_cost_for_url",
+        lambda _url: {
+            "valid_url": True,
+            "analysis_credits": 10,
+            "duration_seconds": 10 * 60,
+        },
+    )
+
+    response = client.post(
+        "/videos/analyze",
+        json={
+            "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
+            "numClips": 1,
+            "clipLengthMinSeconds": 60,
+            "clipLengthMaxSeconds": 120,
+            "processingStartSeconds": 0,
+            "processingEndSeconds": 50,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "minimum clip length" in response.json()["detail"]
 
 
 def test_generate_clip_fails_early_when_no_credits(client, monkeypatch):

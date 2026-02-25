@@ -8,6 +8,46 @@ from pydantic import BaseModel, Field, HttpUrl
 class AnalyzeVideoRequest(BaseModel):
     url: HttpUrl
     numClips: int = Field(default=5, ge=1, le=20)
+    clipLengthSeconds: Optional[int] = Field(
+        default=None,
+        ge=10,
+        le=300,
+        description=(
+            "Legacy clip length selector (seconds). "
+            "Used as fallback when clipLengthMinSeconds/clipLengthMaxSeconds are not provided."
+        ),
+    )
+    clipLengthMinSeconds: Optional[int] = Field(
+        default=None,
+        ge=10,
+        le=300,
+        description=(
+            "Selected minimum clip length in seconds. Must be paired with clipLengthMaxSeconds."
+        ),
+    )
+    clipLengthMaxSeconds: Optional[int] = Field(
+        default=None,
+        ge=10,
+        le=300,
+        description=(
+            "Selected maximum clip length in seconds. Must be paired with clipLengthMinSeconds."
+        ),
+    )
+    processingStartSeconds: float = Field(
+        default=0,
+        ge=0,
+        description="Optional analysis window start in seconds.",
+    )
+    processingEndSeconds: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Optional analysis window end in seconds.",
+    )
+    extraPrompt: Optional[str] = Field(
+        default=None,
+        max_length=1000,
+        description="Optional additional guidance for the AI analyzer.",
+    )
     videoId: Optional[str] = Field(
         default=None,
         description="Optional existing video id to reuse",
@@ -54,7 +94,7 @@ class CustomClipRequest(BaseModel):
         ...,
         min_length=1,
         max_length=200,
-        description="Clip title (duration must be 40-90 seconds)",
+        description="Clip title",
     )
     layoutId: Optional[str] = Field(
         default=None,
@@ -114,6 +154,10 @@ class CreditsCostByUrlResponse(BaseModel):
     currentBalance: Optional[int] = None
     hasEnoughCredits: Optional[bool] = None
     hasEnoughCreditsForEstimatedTotal: Optional[bool] = None
+    videoTitle: Optional[str] = None
+    thumbnailUrl: Optional[str] = None
+    platform: Optional[str] = None
+    detectedLanguage: Optional[str] = None
 
 
 class CaptionModesResponse(BaseModel):

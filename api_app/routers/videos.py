@@ -1,5 +1,6 @@
 """Video analysis and credit-cost endpoints."""
 
+from math import ceil
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -40,10 +41,50 @@ from utils.supabase_client import (
 router = APIRouter()
 _STANDARD_VIDEO_QUEUE = "video-processing"
 _PRIORITY_VIDEO_QUEUE = "video-processing-priority"
+_ANALYZE_CLIP_MIN_SECONDS = 10
 
 
 def _video_queue_for_context(context: UserAccessContext) -> str:
     return _PRIORITY_VIDEO_QUEUE if context.priority_processing else _STANDARD_VIDEO_QUEUE
+
+
+def _resolve_legacy_clip_range(*, clip_length_seconds: int, plan_max_seconds: int) -> tuple[int, int]:
+    """
+    Map legacy single-value clip selector to the historical analyze range buckets.
+    """
+    selected_max = max(
+        _ANALYZE_CLIP_MIN_SECONDS,
+        min(int(clip_length_seconds), int(plan_max_seconds)),
+    )
+    if selected_max <= 60:
+        selected_min = _ANALYZE_CLIP_MIN_SECONDS
+    elif selected_max <= 90:
+        selected_min = 60
+    elif selected_max <= 120:
+        selected_min = 90
+    else:
+        selected_min = 120
+
+    selected_min = min(selected_min, selected_max)
+    selected_min = max(_ANALYZE_CLIP_MIN_SECONDS, selected_min)
+    return selected_min, selected_max
+
+
+def _normalize_processing_window(
+    *,
+    start_seconds: float,
+    end_seconds: float | None,
+    duration_seconds: int,
+) -> tuple[float, float]:
+    start = max(0.0, float(start_seconds))
+    duration = max(0.0, float(duration_seconds))
+    end = duration if end_seconds is None else min(duration, float(end_seconds))
+    if end <= start:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Processing end must be greater than processing start.",
+        )
+    return start, end
 
 
 def _probe_credit_cost_for_url(url_str: str) -> dict:
@@ -57,6 +98,10 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
             "valid_url": False,
             "analysis_credits": 0,
             "duration_seconds": 0,
+            "video_title": None,
+            "thumbnail_url": None,
+            "platform": None,
+            "detected_language": None,
         }
 
     duration_seconds = int(probe.get("duration_seconds") or 0)
@@ -72,6 +117,10 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
             "valid_url": False,
             "analysis_credits": 0,
             "duration_seconds": duration_seconds,
+            "video_title": probe.get("title"),
+            "thumbnail_url": probe.get("thumbnail"),
+            "platform": probe.get("platform"),
+            "detected_language": probe.get("detected_language"),
         }
 
     analysis_credits = calculate_video_analysis_cost(duration_seconds)
@@ -79,6 +128,10 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
         "valid_url": True,
         "analysis_credits": analysis_credits,
         "duration_seconds": duration_seconds,
+        "video_title": probe.get("title"),
+        "thumbnail_url": probe.get("thumbnail"),
+        "platform": probe.get("platform"),
+        "detected_language": probe.get("detected_language"),
     }
 
 
@@ -171,12 +224,87 @@ def analyze_video(
         context=access_context,
         duration_seconds=analysis_duration_seconds,
     )
-    max_clip_count = _max_clip_count_for_duration(analysis_duration_seconds)
+    clip_length_plan_max = int(access_context.max_clip_duration_seconds)
+    selected_clip_min: int
+    selected_clip_max: int
+    clip_length_legacy_value = payload.clipLengthSeconds
+    clip_length_min_payload = payload.clipLengthMinSeconds
+    clip_length_max_payload = payload.clipLengthMaxSeconds
+    if (clip_length_min_payload is None) != (clip_length_max_payload is None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "clipLengthMinSeconds and clipLengthMaxSeconds must be provided together."
+            ),
+        )
+
+    if clip_length_min_payload is not None and clip_length_max_payload is not None:
+        selected_clip_min = int(clip_length_min_payload)
+        selected_clip_max = int(clip_length_max_payload)
+        if selected_clip_min > selected_clip_max:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="clipLengthMinSeconds cannot be greater than clipLengthMaxSeconds.",
+            )
+    else:
+        resolved_legacy_length = (
+            int(clip_length_legacy_value)
+            if clip_length_legacy_value is not None
+            else min(60, clip_length_plan_max)
+        )
+        if (
+            clip_length_legacy_value is not None
+            and (
+                resolved_legacy_length < _ANALYZE_CLIP_MIN_SECONDS
+                or resolved_legacy_length > clip_length_plan_max
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Selected clip length is outside your plan limits. "
+                    f"Allowed range: {_ANALYZE_CLIP_MIN_SECONDS}-{clip_length_plan_max} seconds."
+                ),
+            )
+        selected_clip_min, selected_clip_max = _resolve_legacy_clip_range(
+            clip_length_seconds=resolved_legacy_length,
+            plan_max_seconds=clip_length_plan_max,
+        )
+
+    if (
+        selected_clip_min < _ANALYZE_CLIP_MIN_SECONDS
+        or selected_clip_max > clip_length_plan_max
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Selected clip length range is outside your plan limits. "
+                f"Allowed range: {_ANALYZE_CLIP_MIN_SECONDS}-{clip_length_plan_max} seconds."
+            ),
+        )
+
+    processing_start_seconds, processing_end_seconds = _normalize_processing_window(
+        start_seconds=float(payload.processingStartSeconds),
+        end_seconds=payload.processingEndSeconds,
+        duration_seconds=analysis_duration_seconds,
+    )
+    processing_window_duration = max(0.0, processing_end_seconds - processing_start_seconds)
+    if processing_window_duration < float(selected_clip_min):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Selected processing timeframe is shorter than the requested minimum clip length. "
+                "Increase the timeframe or choose a shorter clip range."
+            ),
+        )
+    billed_analysis_credits = calculate_video_analysis_cost(int(ceil(processing_window_duration)))
+
+    max_clip_count = _max_clip_count_for_duration(int(processing_window_duration))
     if payload.numClips > max_clip_count:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"Too many clips requested for this video length. Maximum: {max_clip_count} "
+                f"Too many clips requested for this processing window. Maximum: {max_clip_count} "
                 "(1 clip every 3 minutes)."
             ),
         )
@@ -184,7 +312,7 @@ def analyze_video(
     _raise_if_insufficient_credits(
         context=access_context,
         actor_user_id=user_id,
-        required_credits=int(url_probe["analysis_credits"]),
+        required_credits=billed_analysis_credits,
     )
 
     existing_query = supabase.table("videos").select("id").eq("url", url_str)
@@ -205,16 +333,22 @@ def analyze_video(
         video_id = str(uuid4())
 
     logger.info(
-        "Analyze request - user=%s  video=%s  url=%s  numClips=%d",
+        "Analyze request - user=%s  video=%s  url=%s  numClips=%d  clipRange=%d-%ds  "
+        "window=%.2f-%.2f",
         user_id,
         video_id,
         url_str,
         payload.numClips,
+        selected_clip_min,
+        selected_clip_max,
+        processing_start_seconds,
+        processing_end_seconds,
     )
     logger.info(
-        "Analyze request accepted - user=%s  url=%s  analysisCredits=%s",
+        "Analyze request accepted - user=%s  url=%s  requiredCredits=%s  fullDurationCredits=%s",
         user_id,
         url_str,
+        billed_analysis_credits,
         url_probe["analysis_credits"],
     )
 
@@ -241,7 +375,13 @@ def analyze_video(
         "userId": user_id,
         "url": url_str,
         "numClips": payload.numClips,
-        "analysisCredits": int(url_probe["analysis_credits"]),
+        "clipLengthSeconds": selected_clip_max,
+        "clipLengthMinSeconds": selected_clip_min,
+        "clipLengthMaxSeconds": selected_clip_max,
+        "processingStartSeconds": processing_start_seconds,
+        "processingEndSeconds": processing_end_seconds,
+        "extraPrompt": (payload.extraPrompt.strip() if payload.extraPrompt else None),
+        "analysisCredits": billed_analysis_credits,
         "analysisDurationSeconds": analysis_duration_seconds,
         "workspaceTeamId": access_context.workspace_team_id,
         "billingOwnerUserId": access_context.billing_owner_user_id or user_id,
@@ -326,6 +466,10 @@ def get_credit_cost_from_url(
             currentBalance=current_balance,
             hasEnoughCredits=False,
             hasEnoughCreditsForEstimatedTotal=False,
+            videoTitle=probe.get("video_title"),
+            thumbnailUrl=probe.get("thumbnail_url"),
+            platform=probe.get("platform"),
+            detectedLanguage=probe.get("detected_language"),
         )
 
     analysis_credits = int(probe["analysis_credits"])
@@ -350,4 +494,8 @@ def get_credit_cost_from_url(
         currentBalance=current_balance,
         hasEnoughCredits=has_enough_credits,
         hasEnoughCreditsForEstimatedTotal=has_enough_credits_for_estimated_total,
+        videoTitle=probe.get("video_title"),
+        thumbnailUrl=probe.get("thumbnail_url"),
+        platform=probe.get("platform"),
+        detectedLanguage=probe.get("detected_language"),
     )

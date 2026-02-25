@@ -377,10 +377,10 @@ def custom_clip(
             detail="endTime must be greater than startTime",
         )
     duration = payload.endTime - payload.startTime
-    if duration < 40 or duration > 90:
+    if duration < 10:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Clip duration must be between 40 and 90 seconds",
+            detail="Clip duration must be at least 10 seconds",
         )
 
     clip_id = str(uuid4())

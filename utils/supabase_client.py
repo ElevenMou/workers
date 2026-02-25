@@ -392,6 +392,101 @@ def has_sufficient_credits(
     return bool(response.data)
 
 
+def reserve_credits(
+    *,
+    user_id: str,
+    amount: int,
+    reason: str,
+    reservation_key: str | None = None,
+    video_id: str | None = None,
+    clip_id: str | None = None,
+) -> str | None:
+    """Reserve owner-wallet credits using an idempotency key."""
+    parsed_amount = int(amount)
+    if parsed_amount <= 0:
+        return None
+
+    _refresh_free_monthly_credits_if_needed(user_id)
+    response = supabase.rpc(
+        "reserve_credits",
+        {
+            "p_user_id": user_id,
+            "p_amount": parsed_amount,
+            "p_reason": reason,
+            "p_reservation_key": reservation_key,
+            "p_video_id": video_id,
+            "p_clip_id": clip_id,
+        },
+    ).execute()
+    assert_response_ok(response, f"Failed to reserve credits for {user_id}")
+    reservation_id = response.data
+    if reservation_id is None:
+        return None
+    return str(reservation_id)
+
+
+def capture_credit_reservation(
+    *,
+    reservation_id: str,
+    tx_type: str,
+    description: str | None = None,
+) -> bool:
+    """Capture a previously reserved owner-wallet charge."""
+    response = supabase.rpc(
+        "capture_credit_reservation",
+        {
+            "p_reservation_id": reservation_id,
+            "p_type": tx_type,
+            "p_description": description,
+        },
+    ).execute()
+    assert_response_ok(
+        response,
+        f"Failed to capture credit reservation {reservation_id}",
+    )
+    return bool(response.data)
+
+
+def release_credit_reservation(*, reservation_id: str) -> bool:
+    """Release a previously reserved owner-wallet charge."""
+    response = supabase.rpc(
+        "release_credit_reservation",
+        {"p_reservation_id": reservation_id},
+    ).execute()
+    assert_response_ok(
+        response,
+        f"Failed to release credit reservation {reservation_id}",
+    )
+    return bool(response.data)
+
+
+def has_team_wallet_charge_for_job(
+    *,
+    team_id: str,
+    job_id: str,
+    owner_user_id: str | None = None,
+) -> bool:
+    """Return whether a team-wallet processing charge already exists for a job."""
+    query = (
+        supabase.table("team_wallet_transactions")
+        .select("id")
+        .eq("team_id", team_id)
+        .eq("job_id", job_id)
+        .eq("type", "processing_charge")
+        .lt("amount", 0)
+        .limit(1)
+    )
+    if owner_user_id:
+        query = query.eq("owner_user_id", owner_user_id)
+
+    response = query.execute()
+    assert_response_ok(
+        response,
+        f"Failed to check existing team-wallet charge for job {job_id}",
+    )
+    return bool(response.data)
+
+
 def _build_usage_external_id(
     *,
     category: str,
@@ -609,6 +704,40 @@ def charge_video_analysis_credits(
         owner_user_id=owner_user_id,
         actor_user_id=actor_id,
         amount=amount,
+        charge_source=charge_source,
+        team_id=team_id,
+        job_id=job_id,
+        video_id=video_id,
+        clip_id=None,
+        usage_metadata=usage_metadata,
+    )
+
+
+def emit_video_analysis_usage_event(
+    *,
+    user_id: str,
+    amount: int,
+    video_id: str,
+    charge_source: str = "owner_wallet",
+    team_id: str | None = None,
+    billing_owner_user_id: str | None = None,
+    actor_user_id: str | None = None,
+    job_id: str | None = None,
+    usage_metadata: dict[str, Any] | None = None,
+) -> None:
+    """Emit video-analysis usage telemetry without charging credits."""
+    parsed_amount = int(amount)
+    if parsed_amount <= 0:
+        return
+
+    owner_user_id = billing_owner_user_id or user_id
+    actor_id = actor_user_id or user_id
+    _emit_usage_event_after_charge(
+        event_name=POLAR_USAGE_EVENT_ANALYSIS_NAME,
+        category="video_analysis",
+        owner_user_id=owner_user_id,
+        actor_user_id=actor_id,
+        amount=parsed_amount,
         charge_source=charge_source,
         team_id=team_id,
         job_id=job_id,

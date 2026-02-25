@@ -9,6 +9,12 @@ class AnalyzeVideoJob(TypedDict):
     userId: str
     url: str
     numClips: NotRequired[int]
+    clipLengthSeconds: NotRequired[int]
+    clipLengthMinSeconds: NotRequired[int]
+    clipLengthMaxSeconds: NotRequired[int]
+    processingStartSeconds: NotRequired[float]
+    processingEndSeconds: NotRequired[float | None]
+    extraPrompt: NotRequired[str | None]
     analysisCredits: NotRequired[int]
     analysisDurationSeconds: NotRequired[int]
     workspaceTeamId: NotRequired[str | None]

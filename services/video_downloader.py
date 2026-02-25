@@ -224,6 +224,11 @@ class VideoDownloader:
         formats = info.get("formats") or []
         can_download = bool(formats) or bool(info.get("url"))
         has_audio = any((f.get("acodec") not in (None, "none")) for f in formats)
+        detected_language = str(info.get("language") or "").strip() or None
+        if not detected_language:
+            language_candidates = list(subtitles.keys()) + list(automatic_captions.keys())
+            if language_candidates:
+                detected_language = str(language_candidates[0]).strip() or None
 
         return {
             "can_download": can_download,
@@ -233,6 +238,8 @@ class VideoDownloader:
             "platform": info.get("extractor_key", "unknown").lower(),
             "external_id": info.get("id"),
             "title": info.get("title"),
+            "thumbnail": info.get("thumbnail"),
+            "detected_language": detected_language,
         }
 
     def get_youtube_transcript(self, video_id: str) -> dict | None:

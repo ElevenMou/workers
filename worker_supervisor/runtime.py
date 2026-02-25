@@ -30,8 +30,46 @@ def worker_cls():
     return _WindowsWorker if os.name == "nt" else Worker
 
 
+def _worker_key(worker_name: str) -> str:
+    return f"{Worker.redis_worker_namespace_prefix}{worker_name}"
+
+
+def _decode(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def _force_remove_worker_registration(conn, worker_name: str):
+    """Delete worker hash + membership sets by name, even if Worker.all misses it."""
+    key = _worker_key(worker_name)
+    queue_keys = []
+    try:
+        queue_keys = list(conn.smembers("rq:queues") or [])
+    except Exception as exc:
+        logger.warning("Could not enumerate queues while cleaning %s: %s", worker_name, exc)
+
+    try:
+        pipe = conn.pipeline()
+        pipe.delete(key)
+        pipe.srem("rq:workers", key)
+        for queue_key in queue_keys:
+            queue_value = _decode(queue_key)
+            if not queue_value.startswith("rq:queue:"):
+                continue
+            queue_name = queue_value[len("rq:queue:") :]
+            if queue_name:
+                pipe.srem(f"rq:workers:{queue_name}", key)
+        pipe.execute()
+    except Exception as exc:
+        logger.warning("Failed direct worker cleanup for %s: %s", worker_name, exc)
+
+
 def cleanup_named_workers(conn, worker_names: set[str]):
     """Remove Redis worker registrations for exact provided names."""
+    for name in worker_names:
+        _force_remove_worker_registration(conn, name)
+
     try:
         existing = Worker.all(connection=conn)
     except Exception as exc:
@@ -63,8 +101,19 @@ def run_worker(queue_names: list[str], worker_name: str):
     cls = worker_cls()
 
     logger.info("Worker %s starting - queues: %s", worker_name, queue_names)
-    worker = cls(queues, connection=conn, name=worker_name)
-    worker.work(with_scheduler=False)
+    for attempt in range(2):
+        worker = cls(queues, connection=conn, name=worker_name)
+        try:
+            worker.work(with_scheduler=False)
+            return
+        except ValueError as exc:
+            if "There exists an active worker named" not in str(exc) or attempt > 0:
+                raise
+            logger.warning(
+                "Detected worker-name collision for %s; forcing Redis cleanup and retrying once.",
+                worker_name,
+            )
+            _force_remove_worker_registration(conn, worker_name)
 
 
 def spawn_worker(queue_names: list[str], worker_name: str) -> multiprocessing.Process:
