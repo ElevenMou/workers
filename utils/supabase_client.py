@@ -463,6 +463,21 @@ def charge_clip_generation_credits(
     job_id: str | None = None,
     usage_metadata: dict[str, Any] | None = None,
 ):
+    amount = int(amount)
+    if amount < 0:
+        raise RuntimeError(
+            f"Failed to charge clip-generation credits: amount must be >= 0 (got {amount})"
+        )
+    if amount == 0:
+        logger.info(
+            "Skipping clip-generation charge because resolved amount is 0 "
+            "(user=%s clip=%s source=%s)",
+            billing_owner_user_id or user_id,
+            clip_id,
+            charge_source,
+        )
+        return
+
     owner_user_id = billing_owner_user_id or user_id
     actor_id = actor_user_id or user_id
     if charge_source == "team_wallet":
@@ -532,6 +547,21 @@ def charge_video_analysis_credits(
     job_id: str | None = None,
     usage_metadata: dict[str, Any] | None = None,
 ):
+    amount = int(amount)
+    if amount < 0:
+        raise RuntimeError(
+            f"Failed to charge video-analysis credits: amount must be >= 0 (got {amount})"
+        )
+    if amount == 0:
+        logger.info(
+            "Skipping video-analysis charge because resolved amount is 0 "
+            "(user=%s video=%s source=%s)",
+            billing_owner_user_id or user_id,
+            video_id,
+            charge_source,
+        )
+        return
+
     owner_user_id = billing_owner_user_id or user_id
     actor_id = actor_user_id or user_id
     if charge_source == "team_wallet":

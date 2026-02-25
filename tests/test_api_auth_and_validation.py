@@ -1102,6 +1102,80 @@ def test_restart_generation_requires_credits(client, monkeypatch):
     assert enqueued_job_data["generationCredits"] == 3
 
 
+def test_restart_failed_ai_suggested_generation_is_still_free(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+
+    fake_supabase = _FakeGenerateSupabase(
+        owner_user_id="user-id",
+        prior_jobs=[
+            {
+                "id": "job-failed-1",
+                "clip_id": "clip-1",
+                "type": "generate_clip",
+                "status": "failed",
+                "user_id": "user-id",
+                "team_id": None,
+            }
+        ],
+        clip_row={
+            "id": "clip-1",
+            "video_id": "video-1",
+            "user_id": "user-id",
+            "team_id": None,
+            "billing_owner_user_id": "user-id",
+            "start_time": 0,
+            "end_time": 60,
+            "status": "failed",
+            "storage_path": None,
+            "thumbnail_path": None,
+            "ai_score": 0.92,
+            "transcript_excerpt": "AI suggested excerpt",
+        },
+    )
+    monkeypatch.setattr(clips_router, "supabase", fake_supabase)
+    monkeypatch.setattr(
+        clips_router,
+        "enforce_processing_access_rules",
+        lambda *_args, **_kwargs: access_rules.UserAccessContext(
+            tier="pro",
+            status="active",
+            interval="month",
+            max_videos_per_month=220,
+            max_clip_duration_seconds=90,
+            priority_processing=True,
+        ),
+    )
+
+    checked_amounts: list[int] = []
+
+    def _fake_has_sufficient_credits(*, user_id, amount, **_kwargs):
+        assert user_id == "user-id"
+        checked_amounts.append(amount)
+        return True
+
+    enqueued_job_data: dict | None = None
+
+    def _fake_enqueue_or_fail(*, job_data, **_kwargs):
+        nonlocal enqueued_job_data
+        enqueued_job_data = job_data
+
+    monkeypatch.setattr(clips_router, "has_sufficient_credits", _fake_has_sufficient_credits)
+    monkeypatch.setattr(clips_router, "enqueue_or_fail", _fake_enqueue_or_fail)
+
+    response = client.post("/clips/generate", json={"clipId": "clip-1"})
+
+    assert response.status_code == 200
+    assert checked_amounts == []
+    assert enqueued_job_data is not None
+    assert enqueued_job_data["generationCredits"] == 0
+
+
 def test_generate_clip_sets_three_credits_for_pro_smart_cleanup(client, monkeypatch):
     from api_app.app import app
 

@@ -38,7 +38,7 @@ from utils.supabase_client import (
 
 router = APIRouter()
 _ACTIVE_GENERATE_JOB_STATUSES = ("queued", "processing", "retrying")
-_TERMINAL_GENERATE_JOB_STATUSES = ("completed", "failed")
+_SUCCESSFUL_GENERATE_JOB_STATUSES = ("completed",)
 _SMART_CLEANUP_ALLOWED_TIERS = {"basic", "pro", "enterprise"}
 _STANDARD_CLIP_QUEUE = "clip-generation"
 _PRIORITY_CLIP_QUEUE = "clip-generation-priority"
@@ -104,7 +104,9 @@ def _clip_has_prior_generation(
     actor_user_id: str,
 ) -> bool:
     clip_status = str(clip.get("status") or "").strip().lower()
-    if clip_status in _TERMINAL_GENERATE_JOB_STATUSES:
+    # A failed attempt should not consume the "first AI-suggested generation is free"
+    # entitlement. Only successful generations count.
+    if clip_status in _SUCCESSFUL_GENERATE_JOB_STATUSES:
         return True
 
     if clip.get("storage_path") or clip.get("thumbnail_path"):
@@ -115,7 +117,7 @@ def _clip_has_prior_generation(
         .select("id")
         .eq("clip_id", clip_id)
         .eq("type", "generate_clip")
-        .in_("status", list(_TERMINAL_GENERATE_JOB_STATUSES))
+        .in_("status", list(_SUCCESSFUL_GENERATE_JOB_STATUSES))
         .order("created_at", desc=True)
         .limit(1)
     )
