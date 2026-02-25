@@ -9,6 +9,7 @@ from services.clips.constants import (
     CHAR_WIDTH_RATIO,
     TITLE_BAR_V_PAD,
     TITLE_GAP,
+    TITLE_LINE_HEIGHT_RATIO,
     canvas_size_for_aspect_ratio,
     normalize_video_scale_mode,
 )
@@ -149,7 +150,8 @@ def compute_layout(
     )
 
     single_line_h = title_font_size + 2 * TITLE_BAR_V_PAD
-    title_bar_h = single_line_h + (title_line_count - 1) * int(title_font_size * 1.3)
+    title_line_height = int(title_font_size * TITLE_LINE_HEIGHT_RATIO)
+    title_bar_h = single_line_h + (title_line_count - 1) * title_line_height
 
     title_position_key = str(title_position_y or "above_video").strip().lower()
     if title_position_key == "custom":

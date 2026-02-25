@@ -24,7 +24,7 @@ def test_compute_video_position_uses_custom_x_y_width():
     assert vid_y == 340
 
 
-def test_caption_overrides_build_custom_position_box():
+def test_caption_overrides_build_custom_position_y():
     overrides = _overrides_from_layout(
         {
             "position": "custom",
@@ -36,7 +36,6 @@ def test_caption_overrides_build_custom_position_box():
     )
 
     assert overrides["position"] == "auto"
-    assert overrides["alignment"] == 7
-    assert overrides["margin_l"] == 290
-    assert overrides["margin_r"] == 290
+    assert overrides["alignment"] == 8
     assert overrides["margin_v"] == 250
+    assert overrides["safe_margin_y"] == 250

@@ -37,6 +37,7 @@ VIDEO_SCALE_MODE_ALIASES = {
 
 TITLE_BAR_V_PAD = 16
 TITLE_GAP = 12
+TITLE_LINE_HEIGHT_RATIO = 1.1
 
 QUALITY_PRESETS: dict[str, QualityPreset] = {
     "low": {"crf": 28, "preset": "veryfast"},

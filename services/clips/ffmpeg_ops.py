@@ -7,7 +7,7 @@ from pathlib import Path
 
 import ffmpeg
 
-from services.clips.constants import normalize_video_scale_mode
+from services.clips.constants import TITLE_LINE_HEIGHT_RATIO, normalize_video_scale_mode
 from services.clips.models import QualityPreset
 
 logger = logging.getLogger(__name__)
@@ -123,7 +123,7 @@ def _build_title_ass(
     font_name = title_font_family or "Montserrat-Bold"
     primary = _hex_to_ass_color(title_font_color, "&H00FFFFFF")
     outline = _hex_to_ass_color(title_stroke_color, "&H00000000")
-    line_height = int(title_font_size * 1.3)
+    line_height = int(title_font_size * TITLE_LINE_HEIGHT_RATIO)
     align_tag = r"\an8" if title_align == "center" else r"\an7"
     area_x = max(0, int(title_area_x))
     area_w = max(2, min(canvas_w - area_x, int(title_area_w)))

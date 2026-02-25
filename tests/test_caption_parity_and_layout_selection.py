@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import tempfile
 from types import SimpleNamespace
 
 from services.captions.ass_generator import generate_ass_content
-from tasks.clips.helpers.captions import _overrides_from_layout
+from tasks.clips.helpers.captions import _overrides_from_layout, build_caption_ass
 from tasks.clips.helpers.layout import EffectiveLayoutSelection, resolve_effective_layout_id
 
 
@@ -51,6 +53,13 @@ def _parse_ass_time(timestamp: str) -> float:
     )
 
 
+def _style_row(ass_text: str) -> list[str]:
+    for line in ass_text.splitlines():
+        if line.startswith("Style: Default,"):
+            return line.split(",")
+    raise AssertionError("ASS style row not found")
+
+
 def test_caption_override_precedence_for_chars_lines_and_delay():
     overrides = _overrides_from_layout(
         {
@@ -68,8 +77,24 @@ def test_caption_override_precedence_for_chars_lines_and_delay():
     )
 
     assert overrides["max_chars_per_line"] == 33
-    assert overrides["max_lines"] == 3
+    assert overrides["max_lines"] == 1
     assert overrides["line_delay"] == 0.12
+
+
+def test_caption_override_maps_italic_and_underline():
+    overrides = _overrides_from_layout(
+        {
+            "style": "grouped",
+            "italic": True,
+            "underline": True,
+        },
+        canvas_w=1080,
+        canvas_h=1920,
+        preset_name="clean",
+    )
+
+    assert overrides["italic"] is True
+    assert overrides["underline"] is True
 
 
 def test_caption_override_fallbacks_for_legacy_and_words_mapping():
@@ -218,6 +243,91 @@ def test_word_by_word_line_delay_is_applied_per_event():
     assert start_1 > 0.8
 
 
+def test_top_position_anchor_uses_video_bounds_margin():
+    transcript = {
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 2.4,
+                "text": "One two three",
+                "words": [
+                    {"word": "One", "start": 0.0, "end": 0.8},
+                    {"word": "two", "start": 0.8, "end": 1.6},
+                    {"word": "three", "start": 1.6, "end": 2.4},
+                ],
+            }
+        ]
+    }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        ass_path = build_caption_ass(
+            job_id="job-top-anchor",
+            clip_id="clip-top-anchor",
+            transcript=transcript,
+            cap_cfg={
+                "show": True,
+                "presetName": "clean",
+                "style": "grouped",
+                "position": "top",
+                "fontFamily": "Montserrat",
+                "fontWeight": "bold",
+                "maxCharsPerCaption": 36,
+                "maxLines": 2,
+            },
+            start_time=0.0,
+            end_time=2.4,
+            canvas_w=1080,
+            canvas_h=1920,
+            vid_y=420,
+            vid_h=1080,
+            video_aspect_ratio="9:16",
+            work_dir=tmp_dir,
+            logger=LOGGER,
+        )
+        assert ass_path is not None
+        with open(ass_path, "r", encoding="utf-8") as handle:
+            style = _style_row(handle.read())
+
+    # For top position: margin should be anchored to video top + inset = 420 + 80.
+    assert style[21] == "500"
+
+
+def test_italic_and_underline_propagate_to_ass_style():
+    transcript = _sample_transcript()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        ass_path = build_caption_ass(
+            job_id="job-italic-underline",
+            clip_id="clip-italic-underline",
+            transcript=transcript,
+            cap_cfg={
+                "show": True,
+                "presetName": "clean",
+                "style": "grouped",
+                "italic": True,
+                "underline": True,
+                "fontFamily": "Montserrat",
+                "fontWeight": "bold",
+                "maxCharsPerCaption": 36,
+                "maxLines": 2,
+            },
+            start_time=0.0,
+            end_time=2.4,
+            canvas_w=1080,
+            canvas_h=1920,
+            vid_y=420,
+            vid_h=1080,
+            video_aspect_ratio="9:16",
+            work_dir=tmp_dir,
+            logger=LOGGER,
+        )
+        assert ass_path is not None
+        with open(ass_path, "r", encoding="utf-8") as handle:
+            style = _style_row(handle.read())
+
+    assert style[8] == "-1"
+    assert style[9] == "-1"
+
+
 class _DefaultLayoutQuery:
     def __init__(self, rows: list[dict]):
         self._rows = rows
@@ -226,6 +336,9 @@ class _DefaultLayoutQuery:
         return self
 
     def eq(self, _key: str, _value):
+        return self
+
+    def is_(self, _key: str, _value):
         return self
 
     def limit(self, _value: int):

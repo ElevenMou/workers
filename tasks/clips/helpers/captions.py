@@ -196,7 +196,7 @@ def _overrides_from_layout(
         max_chars = float(_to_int(preset_defaults.get("max_chars_per_line"), 30))
     overrides["max_chars_per_line"] = max(8, int(max_chars))
 
-    max_lines = _pick_numeric(cap_cfg, "linesPerPage", "maxLines")
+    max_lines = _pick_numeric(cap_cfg, "maxLines", "linesPerPage")
     if max_lines is None:
         max_lines = float(_to_int(preset_defaults.get("max_lines"), 2))
     overrides["max_lines"] = max(1, int(max_lines))
@@ -213,6 +213,12 @@ def _overrides_from_layout(
     font_size = cap_cfg.get("fontSize")
     if isinstance(font_size, (int, float)):
         overrides["font_size"] = int(font_size)
+
+    if "italic" in cap_cfg:
+        overrides["italic"] = bool(cap_cfg.get("italic"))
+
+    if "underline" in cap_cfg:
+        overrides["underline"] = bool(cap_cfg.get("underline"))
 
     font_family = cap_cfg.get("fontFamily")
     if isinstance(font_family, str) and font_family.strip():
@@ -260,18 +266,11 @@ def _overrides_from_layout(
         else ""
     )
     if normalized_position == "custom":
-        box_width = _clamp(
-            _to_int(cap_cfg.get("customWidth"), canvas_w),
-            2,
-            max(2, canvas_w),
-        )
-        box_x = max(0, (canvas_w - box_width) // 2)
-        box_y = _clamp(_to_int(cap_cfg.get("customY"), 0), 0, max(0, canvas_h - 1))
+        custom_y = _clamp(_to_int(cap_cfg.get("customY"), 0), 0, max(0, canvas_h - 1))
         overrides["position"] = "auto"
-        overrides["alignment"] = 7
-        overrides["margin_l"] = box_x
-        overrides["margin_r"] = max(0, canvas_w - (box_x + box_width))
-        overrides["margin_v"] = box_y
+        overrides["alignment"] = 8
+        overrides["margin_v"] = custom_y
+        overrides["safe_margin_y"] = custom_y
     elif normalized_position:
         overrides["position"] = normalized_position
 
@@ -349,6 +348,8 @@ def build_caption_ass(
         )
         if anchored_margin is not None:
             overrides["margin_v"] = anchored_margin
+            if requested_position == "top":
+                overrides["safe_margin_y"] = anchored_margin
             logger.info(
                 "[%s] Caption position '%s' anchored to video bounds (margin_v=%d)",
                 job_id,
