@@ -23,6 +23,10 @@ from tasks.clips.helpers.layout import (
 )
 from tasks.clips.helpers.media import probe_video_size
 from tasks.clips.helpers.smart_cleanup import apply_balanced_smart_cleanup
+from tasks.clips.helpers.source_video import (
+    build_raw_video_metadata_update,
+    resolve_source_video,
+)
 from tasks.models.jobs import CustomClipJob
 from tasks.models.layout import merge_layout_configs
 from tasks.videos.transcript import (
@@ -191,6 +195,36 @@ def _best_effort_mark_failed(
         logger.warning("[%s] Failed to mark video %s failed: %s", job_id, video_id, exc)
 
 
+def _load_video_context_row(video_id: str) -> dict:
+    response = (
+        supabase.table("videos")
+        .select(
+            "transcript,raw_video_path,url,title,duration_seconds,thumbnail_url,platform,external_id"
+        )
+        .eq("id", video_id)
+        .limit(1)
+        .execute()
+    )
+    assert_response_ok(response, f"Failed to load source metadata for video {video_id}")
+    data = response.data
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        return data[0] if data else {}
+    return {}
+
+
+def _persist_video_raw_path(video_id: str, raw_video_path: str):
+    payload = build_raw_video_metadata_update(raw_video_path)
+    response = (
+        supabase.table("videos")
+        .update(payload)
+        .eq("id", video_id)
+        .execute()
+    )
+    assert_response_ok(response, f"Failed to persist raw video path for {video_id}")
+
+
 def custom_clip_task(job_data: CustomClipJob):
     """Download a video, get its transcript, and generate a clip.
 
@@ -237,6 +271,9 @@ def custom_clip_task(job_data: CustomClipJob):
     downloader = VideoDownloader(work_dir=work_dir)
     audio_path: str | None = None
     uploaded_storage_path: str | None = None
+    source_video_strategy = "reused_existing"
+    source_video_wait_seconds = 0.0
+    source_video_download_seconds = 0.0
 
     try:
         _update_clip_job_progress(job_id, 0, "starting")
@@ -263,24 +300,83 @@ def custom_clip_task(job_data: CustomClipJob):
         ).execute()
         assert_response_ok(clip_status_resp, f"Failed to mark clip {clip_id} generating")
 
-        # 1. Download video ----------------------------------------------------
-        _update_clip_job_progress(job_id, 12, "downloading_video")
-        logger.info("[%s] Downloading video: %s", job_id, url)
-        video_data = downloader.download(url, video_id)
-        video_path = video_data["path"]
-        _update_clip_job_progress(job_id, 20, "downloading_video")
+        existing_video = _load_video_context_row(video_id)
 
-        duration_seconds = int(video_data["duration"])
+        # 1. Resolve source video ---------------------------------------------
+        waiting_stage_emitted = False
+
+        def _emit_waiting_for_source(_elapsed_seconds: float):
+            nonlocal waiting_stage_emitted
+            if waiting_stage_emitted:
+                return
+            waiting_stage_emitted = True
+            _update_clip_job_progress(job_id, 12, "waiting_for_source_video_download")
+
+        def _emit_downloading_source():
+            _update_clip_job_progress(job_id, 12, "downloading_video")
+
+        source_resolution = resolve_source_video(
+            video_id=video_id,
+            source_url=url or existing_video.get("url"),
+            initial_raw_video_path=existing_video.get("raw_video_path"),
+            downloader=downloader,
+            load_video_row=_load_video_context_row,
+            persist_raw_video_path=_persist_video_raw_path,
+            logger=logger,
+            job_id=job_id,
+            on_wait_for_download=_emit_waiting_for_source,
+            on_download_start=_emit_downloading_source,
+        )
+        video_path = source_resolution.video_path
+        source_video_strategy = str(source_resolution.strategy)
+        source_video_wait_seconds = float(source_resolution.wait_seconds)
+        source_video_download_seconds = float(source_resolution.download_seconds)
+        _update_clip_job_progress(job_id, 20, "downloading_video")
+        logger.info(
+            "[%s] Source video resolved for %s via %s (wait=%.2fs, download=%.2fs)",
+            job_id,
+            video_id,
+            source_video_strategy,
+            source_video_wait_seconds,
+            source_video_download_seconds,
+        )
+
+        download_metadata = source_resolution.download_metadata or {}
+        duration_seconds = int(
+            download_metadata.get("duration")
+            or existing_video.get("duration_seconds")
+            or max(1.0, end_time + 10.0, end_time - start_time)
+        )
+        source_title = str(
+            download_metadata.get("title")
+            or existing_video.get("title")
+            or title
+        )
+        source_thumbnail = download_metadata.get("thumbnail") or existing_video.get(
+            "thumbnail_url"
+        )
+        source_platform = str(
+            download_metadata.get("platform")
+            or existing_video.get("platform")
+            or "unknown"
+        ).lower()
+        source_external_id = (
+            download_metadata.get("external_id")
+            or existing_video.get("external_id")
+        )
+        raw_video_metadata = build_raw_video_metadata_update(video_path)
 
         # Update video row with metadata
         update_video_status(
             video_id,
             "analyzing",
-            title=video_data["title"],
+            title=source_title,
             duration_seconds=duration_seconds,
-            thumbnail_url=video_data["thumbnail"],
-            platform=video_data["platform"],
-            external_id=video_data.get("external_id"),
+            thumbnail_url=source_thumbnail,
+            platform=source_platform,
+            external_id=source_external_id,
+            raw_video_path=raw_video_metadata["raw_video_path"],
+            raw_video_expires_at=raw_video_metadata["raw_video_expires_at"],
         )
 
         # 2. Get transcript ----------------------------------------------------
@@ -288,29 +384,15 @@ def custom_clip_task(job_data: CustomClipJob):
         partial_transcript = False
 
         # Reuse stored transcript if the video already has one.
-        existing_video_resp = (
-            supabase.table("videos")
-            .select("transcript")
-            .eq("id", video_id)
-            .single()
-            .execute()
-        )
-        assert_response_ok(
-            existing_video_resp,
-            f"Failed to load existing transcript for {video_id}",
-        )
-        existing_video = existing_video_resp.data or {}
         existing_transcript = existing_video.get("transcript")
         if isinstance(existing_transcript, dict) and existing_transcript.get("segments"):
             transcript = existing_transcript
             logger.info("[%s] Reusing transcript already stored on video", job_id)
 
-        if not transcript and video_data["platform"] == "youtube" and video_data.get(
-            "external_id"
-        ):
+        if not transcript and source_platform == "youtube" and source_external_id:
             _update_clip_job_progress(job_id, 30, "fetching_source_captions")
             logger.info("[%s] Attempting to get YouTube transcript ...", job_id)
-            transcript = downloader.get_youtube_transcript(video_data["external_id"])
+            transcript = downloader.get_youtube_transcript(str(source_external_id))
             if transcript:
                 logger.info("[%s] Got transcript from YouTube", job_id)
 
@@ -596,6 +678,11 @@ def custom_clip_task(job_data: CustomClipJob):
                 "stage": "completed",
                 "storage_path": storage_path,
                 "file_size": result["file_size"],
+                "source_video_strategy": source_video_strategy,
+                "source_video_wait_seconds": round(source_video_wait_seconds, 3),
+                "source_video_download_seconds": round(
+                    source_video_download_seconds, 3
+                ),
                 "smart_cleanup": smart_cleanup_summary,
             },
         )

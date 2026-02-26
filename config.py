@@ -15,6 +15,22 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    value = os.getenv(name)
+    if value is None:
+        parsed = int(default)
+    else:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            logger.warning("Invalid %s=%r; using default %d", name, value, default)
+            parsed = int(default)
+
+    if minimum is not None:
+        return max(int(minimum), parsed)
+    return parsed
+
+
 # ---------------------------------------------------------------------------
 # Supabase
 # ---------------------------------------------------------------------------
@@ -46,6 +62,21 @@ RAW_VIDEO_CLEANUP_INTERVAL_SECONDS = int(
 )
 CLIP_ASSET_CLEANUP_INTERVAL_SECONDS = int(
     os.getenv("CLIP_ASSET_CLEANUP_INTERVAL_SECONDS", 300)
+)
+PROCESSING_JOB_STALE_SECONDS = _env_int(
+    "PROCESSING_JOB_STALE_SECONDS",
+    max(VIDEO_JOB_TIMEOUT, CLIP_JOB_TIMEOUT) + 300,
+    minimum=60,
+)
+SOURCE_VIDEO_LOCK_WAIT_SECONDS = _env_int(
+    "SOURCE_VIDEO_LOCK_WAIT_SECONDS",
+    180,
+    minimum=1,
+)
+SOURCE_VIDEO_LOCK_TTL_SECONDS = _env_int(
+    "SOURCE_VIDEO_LOCK_TTL_SECONDS",
+    600,
+    minimum=5,
 )
 
 # ---------------------------------------------------------------------------
@@ -153,7 +184,18 @@ POLAR_USAGE_EVENT_GENERATION_NAME = os.getenv(
 # Processing
 # ---------------------------------------------------------------------------
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+# Clip-window retranscription can use a smaller model for better latency.
+# Set to WHISPER_MODEL to keep a single-model behavior.
+WHISPER_CLIP_MODEL = os.getenv("WHISPER_CLIP_MODEL", "tiny")
 MAX_RETRIES = 3
+YTDLP_SOCKET_TIMEOUT_SECONDS = _env_int(
+    "YTDLP_SOCKET_TIMEOUT_SECONDS",
+    20,
+    minimum=1,
+)
+YTDLP_DOWNLOAD_RETRIES = _env_int("YTDLP_DOWNLOAD_RETRIES", 3, minimum=1)
+YTDLP_FRAGMENT_RETRIES = _env_int("YTDLP_FRAGMENT_RETRIES", 3, minimum=1)
+YTDLP_EXTRACTOR_RETRIES = _env_int("YTDLP_EXTRACTOR_RETRIES", 3, minimum=1)
 
 
 # ---------------------------------------------------------------------------

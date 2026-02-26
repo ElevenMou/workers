@@ -8,6 +8,7 @@ from typing import Any
 
 import ffmpeg as ffmpeg_lib
 
+from config import WHISPER_CLIP_MODEL
 from services.transcriber import Transcriber
 
 
@@ -49,6 +50,48 @@ def transcript_has_word_timing(transcript: dict[str, Any] | None) -> bool:
     return False
 
 
+def transcript_has_word_timing_in_window(
+    transcript: dict[str, Any] | None,
+    *,
+    start_time: float,
+    end_time: float,
+    minimum_words: int = 1,
+) -> bool:
+    """Return whether transcript has usable word timing overlapping a window."""
+    if not isinstance(transcript, dict):
+        return False
+
+    window_start = float(start_time)
+    window_end = float(end_time)
+    if window_end <= window_start:
+        return False
+
+    words_found = 0
+    for seg in transcript.get("segments", []):
+        words = seg.get("words")
+        if not isinstance(words, list) or not words:
+            continue
+
+        for word in words:
+            token = str(word.get("word", word.get("text", "")) or "").strip()
+            if not token:
+                continue
+            try:
+                word_start = float(word.get("start"))
+                word_end = float(word.get("end"))
+            except (TypeError, ValueError):
+                continue
+            if word_end <= word_start:
+                continue
+            if word_end <= window_start or word_start >= window_end:
+                continue
+            words_found += 1
+            if words_found >= max(1, int(minimum_words)):
+                return True
+
+    return False
+
+
 _WORD_LEVEL_STYLES = {"word_by_word", "karaoke"}
 
 
@@ -81,6 +124,7 @@ def transcribe_clip_window_with_whisper(
     start_time: float,
     end_time: float,
     video_duration_seconds: float,
+    model_name: str | None = None,
 ) -> dict[str, Any]:
     """Transcribe only the clip window (+context) and return absolute timestamps."""
     context_pad = max(
@@ -98,9 +142,9 @@ def transcribe_clip_window_with_whisper(
         ar=16000,
     ).overwrite_output().run(quiet=True)
 
-    transcriber = Transcriber()
+    selected_model = str(model_name or WHISPER_CLIP_MODEL).strip() or WHISPER_CLIP_MODEL
+    transcriber = Transcriber(model_name=selected_model)
     transcript = transcriber.transcribe(clip_audio_path)
     transcript = shift_transcript_timestamps(transcript, window_start)
     transcript["source"] = "whisper"
     return transcript
-

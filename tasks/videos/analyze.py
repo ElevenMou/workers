@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 _MIN_CLIP_SECONDS = 10
 _BOUNDARY_ALIGNMENT_TOLERANCE_SECONDS = 0.35
+_DEFAULT_LEGACY_CLIP_LENGTH_SECONDS = 90
 try:
     _LOW_AI_SCORE_THRESHOLD = max(
         0.0,
@@ -70,7 +71,10 @@ _NON_VIRAL_PATTERNS = (
 
 
 def _resolve_legacy_clip_range(clip_length_seconds: int | None) -> tuple[int, int]:
-    selected_max = max(_MIN_CLIP_SECONDS, int(clip_length_seconds or 60))
+    selected_max = max(
+        _MIN_CLIP_SECONDS,
+        int(clip_length_seconds or _DEFAULT_LEGACY_CLIP_LENGTH_SECONDS),
+    )
     if selected_max <= 60:
         selected_min = _MIN_CLIP_SECONDS
     elif selected_max <= 90:

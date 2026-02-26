@@ -1,7 +1,7 @@
 """Startup recovery and cleanup helpers for supervisor."""
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from worker_supervisor.state import logger
 
@@ -216,3 +216,140 @@ def recover_processing_rows_on_start():
                 logger.warning("Failed to recover video %s: %s", video_id, exc)
 
     logger.warning("Startup DB processing-row recovery marked %d jobs as failed", len(rows))
+
+
+def collect_started_job_ids(conn, queue_names: list[str]) -> set[str]:
+    """Collect in-flight RQ started-job ids across configured queues."""
+    try:
+        from rq.registry import StartedJobRegistry
+        from utils.redis_client import get_queue  # noqa: E402
+    except Exception as exc:
+        logger.warning("Could not import started-job registry helpers: %s", exc)
+        return set()
+
+    started_job_ids: set[str] = set()
+    for queue_name in queue_names:
+        try:
+            queue = get_queue(queue_name, conn)
+            registry = StartedJobRegistry(queue=queue)
+            started_job_ids.update(str(job_id) for job_id in registry.get_job_ids())
+        except Exception as exc:
+            logger.warning(
+                "Failed reading Started registry for '%s' during stale sweep: %s",
+                queue_name,
+                exc,
+            )
+    return started_job_ids
+
+
+def recover_stale_processing_rows(
+    *,
+    conn,
+    queue_names: list[str],
+    stale_seconds: int,
+) -> int:
+    """
+    Mark stale processing DB rows as failed when they are not in active Started registries.
+
+    Returns the number of jobs transitioned to failed.
+    """
+    stale_seconds = int(stale_seconds)
+    if stale_seconds <= 0:
+        return 0
+
+    try:
+        from utils.supabase_client import assert_response_ok, supabase  # noqa: E402
+    except Exception as exc:
+        logger.warning("Could not import Supabase client for stale sweep: %s", exc)
+        return 0
+
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)).isoformat()
+
+    started_rows_resp = (
+        supabase.table("jobs")
+        .select("id,type,clip_id,video_id,started_at,created_at")
+        .eq("status", "processing")
+        .lt("started_at", cutoff_iso)
+        .limit(500)
+        .execute()
+    )
+    assert_response_ok(
+        started_rows_resp,
+        "Failed to query stale processing jobs by started_at",
+    )
+    rows = list(started_rows_resp.data or [])
+
+    created_rows_resp = (
+        supabase.table("jobs")
+        .select("id,type,clip_id,video_id,started_at,created_at")
+        .eq("status", "processing")
+        .is_("started_at", "null")
+        .lt("created_at", cutoff_iso)
+        .limit(500)
+        .execute()
+    )
+    assert_response_ok(
+        created_rows_resp,
+        "Failed to query stale processing jobs by created_at fallback",
+    )
+    for row in created_rows_resp.data or []:
+        row_id = row.get("id")
+        if row_id and not any(existing.get("id") == row_id for existing in rows):
+            rows.append(row)
+
+    if not rows:
+        return 0
+
+    active_started_job_ids = collect_started_job_ids(conn, queue_names)
+    stale_rows = [row for row in rows if str(row.get("id") or "") not in active_started_job_ids]
+    if not stale_rows:
+        return 0
+
+    reason = (
+        "Marked failed: stale processing heartbeat exceeded "
+        f"{stale_seconds}s and job was not active in worker started registries"
+    )
+    stale_job_ids = [str(row["id"]) for row in stale_rows if row.get("id")]
+    mark_jobs_failed(stale_job_ids, reason)
+
+    clip_failures = 0
+    video_failures = 0
+    for row in stale_rows:
+        clip_id = row.get("clip_id")
+        video_id = row.get("video_id")
+        job_type = str(row.get("type") or "")
+
+        if clip_id:
+            try:
+                clip_resp = (
+                    supabase.table("clips")
+                    .update({"status": "failed", "error_message": reason})
+                    .eq("id", clip_id)
+                    .execute()
+                )
+                assert_response_ok(clip_resp, f"Failed to mark clip {clip_id} failed")
+                clip_failures += 1
+            except Exception as exc:
+                logger.warning("Failed stale-recovery update for clip %s: %s", clip_id, exc)
+
+        if video_id and job_type in {"analyze_video", "custom_clip"}:
+            try:
+                video_resp = (
+                    supabase.table("videos")
+                    .update({"status": "failed", "error_message": reason})
+                    .eq("id", video_id)
+                    .execute()
+                )
+                assert_response_ok(video_resp, f"Failed to mark video {video_id} failed")
+                video_failures += 1
+            except Exception as exc:
+                logger.warning("Failed stale-recovery update for video %s: %s", video_id, exc)
+
+    logger.warning(
+        "Runtime stale-processing recovery marked %d jobs failed (clips=%d videos=%d cutoff=%ss)",
+        len(stale_rows),
+        clip_failures,
+        video_failures,
+        stale_seconds,
+    )
+    return len(stale_rows)

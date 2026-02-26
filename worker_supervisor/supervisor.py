@@ -15,6 +15,7 @@ from worker_supervisor.startup import (
     env_bool,
     purge_startup_backlog,
     recover_processing_rows_on_start,
+    recover_stale_processing_rows,
 )
 from worker_supervisor.state import logger
 
@@ -34,6 +35,7 @@ def run_supervisor() -> int:
         CLIP_ASSET_CLEANUP_INTERVAL_SECONDS,
         NUM_CLIP_WORKERS,
         NUM_VIDEO_WORKERS,
+        PROCESSING_JOB_STALE_SECONDS,
         RAW_VIDEO_CLEANUP_INTERVAL_SECONDS,
         validate_env,
     )
@@ -111,6 +113,11 @@ def run_supervisor() -> int:
     )
     last_raw_video_cleanup_run = 0.0
     last_clip_asset_cleanup_run = 0.0
+    processing_recovery_interval_seconds = max(
+        30,
+        min(300, int(PROCESSING_JOB_STALE_SECONDS // 4) if PROCESSING_JOB_STALE_SECONDS else 60),
+    )
+    last_processing_recovery_run = 0.0
 
     try:
         while True:
@@ -136,6 +143,22 @@ def run_supervisor() -> int:
                     logger.warning("Expired clip-asset cleanup tick failed: %s", exc)
                 finally:
                     last_clip_asset_cleanup_run = now
+
+            if (
+                PROCESSING_JOB_STALE_SECONDS > 0
+                and now - last_processing_recovery_run
+                >= processing_recovery_interval_seconds
+            ):
+                try:
+                    recover_stale_processing_rows(
+                        conn=startup_conn,
+                        queue_names=queue_names,
+                        stale_seconds=PROCESSING_JOB_STALE_SECONDS,
+                    )
+                except Exception as exc:
+                    logger.warning("Runtime stale-processing recovery tick failed: %s", exc)
+                finally:
+                    last_processing_recovery_run = now
 
             try:
                 target_video_workers, target_clip_workers = get_worker_scale_target(

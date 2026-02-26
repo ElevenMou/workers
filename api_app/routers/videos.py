@@ -42,6 +42,7 @@ router = APIRouter()
 _STANDARD_VIDEO_QUEUE = "video-processing"
 _PRIORITY_VIDEO_QUEUE = "video-processing-priority"
 _ANALYZE_CLIP_MIN_SECONDS = 10
+_DEFAULT_ANALYZE_LEGACY_CLIP_SECONDS = 90
 
 
 def _video_queue_for_context(context: UserAccessContext) -> str:
@@ -250,7 +251,7 @@ def analyze_video(
         resolved_legacy_length = (
             int(clip_length_legacy_value)
             if clip_length_legacy_value is not None
-            else min(60, clip_length_plan_max)
+            else min(_DEFAULT_ANALYZE_LEGACY_CLIP_SECONDS, clip_length_plan_max)
         )
         if (
             clip_length_legacy_value is not None

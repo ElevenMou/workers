@@ -10,9 +10,14 @@ from services.clips.constants import canvas_size_for_aspect_ratio
 from services.video_downloader import VideoDownloader
 from tasks.clips.helpers.captions import build_caption_ass, resolve_caption_style_mode
 from tasks.clips.helpers.smart_cleanup import apply_balanced_smart_cleanup
+from tasks.clips.helpers.source_video import (
+    build_raw_video_metadata_update,
+    resolve_source_video,
+)
 from tasks.videos.transcript import (
     needs_whisper_retranscription,
     transcript_has_word_timing,
+    transcript_has_word_timing_in_window,
     transcribe_clip_window_with_whisper,
 )
 from tasks.clips.helpers.layout import (
@@ -20,7 +25,6 @@ from tasks.clips.helpers.layout import (
     maybe_download_layout_background_image,
     resolve_effective_layout_id,
 )
-from tasks.clips.helpers.media import probe_video_size
 from tasks.models.jobs import GenerateClipJob
 from tasks.models.layout import merge_layout_configs
 from utils.workdirs import create_work_dir
@@ -211,6 +215,34 @@ def _best_effort_mark_failed(*, job_id: str, clip_id: str, error_msg: str):
         logger.warning("[%s] Failed to mark clip %s failed: %s", job_id, clip_id, exc)
 
 
+def _load_video_source_row(video_id: str) -> dict:
+    response = (
+        supabase.table("videos")
+        .select("raw_video_path,url")
+        .eq("id", video_id)
+        .limit(1)
+        .execute()
+    )
+    assert_response_ok(response, f"Failed to load source metadata for video {video_id}")
+    data = response.data
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        return data[0] if data else {}
+    return {}
+
+
+def _persist_video_raw_path(video_id: str, raw_video_path: str):
+    payload = build_raw_video_metadata_update(raw_video_path)
+    response = (
+        supabase.table("videos")
+        .update(payload)
+        .eq("id", video_id)
+        .execute()
+    )
+    assert_response_ok(response, f"Failed to persist raw video path for {video_id}")
+
+
 def generate_clip_task(job_data: GenerateClipJob):
     """Generate final clip with overlay.
 
@@ -251,9 +283,13 @@ def generate_clip_task(job_data: GenerateClipJob):
     work_dir = create_work_dir(f"clip_{clip_id}")
 
     generator = ClipGenerator(work_dir=work_dir)
+    source_downloader = VideoDownloader(work_dir=work_dir)
 
     storage_path: str | None = None
     uploaded_storage_path: str | None = None
+    source_video_strategy = "reused_existing"
+    source_video_wait_seconds = 0.0
+    source_video_download_seconds = 0.0
 
     try:
         _update_clip_job_progress(job_id, 0, "starting")
@@ -352,37 +388,46 @@ def generate_clip_task(job_data: GenerateClipJob):
 
         # -- Resolve source video path and dimensions -----------------------
         _update_clip_job_progress(job_id, 20, "preparing_source_video")
-        video_file = clip["videos"].get("raw_video_path")
-        src_w: int | None = None
-        src_h: int | None = None
+        waiting_stage_emitted = False
 
-        if video_file and os.path.isfile(video_file):
-            try:
-                src_w, src_h = probe_video_size(video_file)
-            except Exception as exc:
-                logger.warning(
-                    "[%s] Existing raw video is not probeable (%s): %s",
-                    job_id,
-                    video_file,
-                    exc,
-                )
-                video_file = None
-        else:
-            video_file = None
+        def _emit_waiting_for_source(_elapsed_seconds: float):
+            nonlocal waiting_stage_emitted
+            if waiting_stage_emitted:
+                return
+            waiting_stage_emitted = True
+            _update_clip_job_progress(job_id, 30, "waiting_for_source_video_download")
 
-        if not video_file:
-            source_url = clip["videos"].get("url")
-            if not source_url:
-                raise RuntimeError("Missing source URL and raw_video_path for clip generation")
-
+        def _emit_downloading_source():
             _update_clip_job_progress(job_id, 30, "downloading_source_video")
-            logger.info("[%s] Re-downloading source video for clip %s", job_id, clip_id)
-            downloader = VideoDownloader(work_dir=work_dir)
-            downloaded = downloader.download(source_url, clip["video_id"])
-            video_file = downloaded["path"]
-            src_w, src_h = probe_video_size(video_file)
 
-        assert src_w is not None and src_h is not None
+        source_resolution = resolve_source_video(
+            video_id=clip["video_id"],
+            source_url=clip["videos"].get("url"),
+            initial_raw_video_path=clip["videos"].get("raw_video_path"),
+            downloader=source_downloader,
+            load_video_row=_load_video_source_row,
+            persist_raw_video_path=_persist_video_raw_path,
+            logger=logger,
+            job_id=job_id,
+            on_wait_for_download=_emit_waiting_for_source,
+            on_download_start=_emit_downloading_source,
+        )
+        video_file = source_resolution.video_path
+        src_w = int(source_resolution.width)
+        src_h = int(source_resolution.height)
+        source_video_strategy = str(source_resolution.strategy)
+        source_video_wait_seconds = float(source_resolution.wait_seconds)
+        source_video_download_seconds = float(source_resolution.download_seconds)
+
+        logger.info(
+            "[%s] Source video resolved for %s via %s (wait=%.2fs, download=%.2fs)",
+            job_id,
+            clip["video_id"],
+            source_video_strategy,
+            source_video_wait_seconds,
+            source_video_download_seconds,
+        )
+
         _, vid_h, _, vid_y = compute_video_position(
             src_w,
             src_h,
@@ -406,11 +451,26 @@ def generate_clip_task(job_data: GenerateClipJob):
         should_retranscribe_for_captions = needs_whisper_retranscription(
             transcript, caption_style
         )
-        should_retranscribe_for_smart_cleanup = smart_cleanup_enabled
+        has_word_timing_for_window = transcript_has_word_timing_in_window(
+            transcript,
+            start_time=start_time,
+            end_time=end_time,
+            minimum_words=1,
+        )
+        should_retranscribe_for_smart_cleanup = (
+            smart_cleanup_enabled and not has_word_timing_for_window
+        )
+        if smart_cleanup_enabled and has_word_timing_for_window:
+            logger.info(
+                "[%s] Smart Cleanup reusing existing transcript word timings for %.2f-%.2fs",
+                job_id,
+                start_time,
+                end_time,
+            )
 
         if should_retranscribe_for_captions or should_retranscribe_for_smart_cleanup:
             retranscribe_reason = (
-                "Smart Cleanup requires fresh Whisper word timing"
+                "Smart Cleanup needs word timing in selected window"
                 if should_retranscribe_for_smart_cleanup
                 else f"caption style '{caption_style}' requires word timing"
             )
@@ -628,6 +688,11 @@ def generate_clip_task(job_data: GenerateClipJob):
                 "stage": "completed",
                 "storage_path": storage_path,
                 "file_size": result["file_size"],
+                "source_video_strategy": source_video_strategy,
+                "source_video_wait_seconds": round(source_video_wait_seconds, 3),
+                "source_video_download_seconds": round(
+                    source_video_download_seconds, 3
+                ),
                 "smart_cleanup": smart_cleanup_summary,
             },
         )

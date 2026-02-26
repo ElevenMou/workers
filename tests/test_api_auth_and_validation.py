@@ -792,8 +792,8 @@ def test_analyze_video_queues_range_based_analysis_credits(client, monkeypatch):
     assert enqueued_payload is not None
     assert enqueued_payload["analysisCredits"] == 2
     assert checked_amounts == [1, 2]
-    assert enqueued_payload["clipLengthMinSeconds"] == 10
-    assert enqueued_payload["clipLengthMaxSeconds"] == 60
+    assert enqueued_payload["clipLengthMinSeconds"] == 60
+    assert enqueued_payload["clipLengthMaxSeconds"] == 90
 
 
 def test_analyze_video_accepts_explicit_clip_length_range(client, monkeypatch):

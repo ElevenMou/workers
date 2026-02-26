@@ -532,6 +532,9 @@ def test_analysis_transcript_is_strictly_clipped_to_processing_window(monkeypatc
         _job_data(
             processingStartSeconds=25,
             processingEndSeconds=70,
+            clipLengthMinSeconds=10,
+            clipLengthMaxSeconds=60,
+            clipLengthSeconds=60,
         )
     )
 

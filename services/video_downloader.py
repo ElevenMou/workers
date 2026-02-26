@@ -2,6 +2,7 @@ import ipaddress
 import logging
 import os
 import socket
+import time
 from glob import glob
 from urllib.parse import urlparse
 
@@ -9,7 +10,14 @@ import ffmpeg as ffmpeg_lib
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 
-from config import TEMP_DIR, MAX_VIDEO_SIZE_MB
+from config import (
+    MAX_VIDEO_SIZE_MB,
+    TEMP_DIR,
+    YTDLP_DOWNLOAD_RETRIES,
+    YTDLP_EXTRACTOR_RETRIES,
+    YTDLP_FRAGMENT_RETRIES,
+    YTDLP_SOCKET_TIMEOUT_SECONDS,
+)
 
 _yt_transcript_api = YouTubeTranscriptApi()
 
@@ -102,6 +110,7 @@ class VideoDownloader:
             "format": "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
             "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
             "merge_output_format": "mp4",
+            "noplaylist": True,
             # Try multiple YouTube client profiles to avoid signature/403 issues
             "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
             # Set a desktop UA to reduce throttling/403
@@ -112,8 +121,10 @@ class VideoDownloader:
                     "Chrome/122.0.0.0 Safari/537.36"
                 )
             },
-            "retries": 3,
-            "fragment_retries": 3,
+            "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
+            "retries": YTDLP_DOWNLOAD_RETRIES,
+            "fragment_retries": YTDLP_FRAGMENT_RETRIES,
+            "extractor_retries": YTDLP_EXTRACTOR_RETRIES,
         }
 
     @staticmethod
@@ -136,7 +147,14 @@ class VideoDownloader:
             return expected_path
         return max(candidates, key=os.path.getmtime)
 
-    def _download_with_opts(self, url: str, output_path: str, *, format_selector: str) -> dict:
+    def _download_with_opts(
+        self,
+        url: str,
+        output_path: str,
+        *,
+        format_selector: str,
+        attempt_label: str,
+    ) -> dict:
         ydl_opts = self._base_ydl_opts()
         ydl_opts.update(
             {
@@ -146,8 +164,28 @@ class VideoDownloader:
                 "no_warnings": False,
             }
         )
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=True)
+        started_at = time.monotonic()
+        video_hint = os.path.splitext(os.path.basename(output_path))[0]
+        logger.info(
+            "yt-dlp download start (%s): video=%s timeout=%ss retries=%s/%s/%s",
+            attempt_label,
+            video_hint,
+            ydl_opts.get("socket_timeout"),
+            ydl_opts.get("retries"),
+            ydl_opts.get("fragment_retries"),
+            ydl_opts.get("extractor_retries"),
+        )
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=True)
+        finally:
+            elapsed = time.monotonic() - started_at
+            logger.info(
+                "yt-dlp download finished (%s): video=%s elapsed=%.2fs",
+                attempt_label,
+                video_hint,
+                elapsed,
+            )
 
     def download(self, url: str, video_id: str) -> dict:
         """Download video and return metadata."""
@@ -158,6 +196,7 @@ class VideoDownloader:
             url,
             output_path,
             format_selector="bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
+            attempt_label="primary_av_merge",
         )
         downloaded_path = self._resolve_output_path(output_path)
 
@@ -179,6 +218,7 @@ class VideoDownloader:
                     "b[height<=720][vcodec!=none][acodec!=none]/"
                     "b[vcodec!=none][acodec!=none]"
                 ),
+                attempt_label="fallback_muxed_av",
             )
             downloaded_path = self._resolve_output_path(output_path)
 

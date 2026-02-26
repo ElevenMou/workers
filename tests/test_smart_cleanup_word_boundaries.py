@@ -16,6 +16,7 @@ if "whisper" not in sys.modules:
 from tasks.clips import custom as custom_task_module
 from tasks.clips import generate as generate_task_module
 from tasks.clips.helpers import smart_cleanup as smart_cleanup
+from tasks.clips.helpers import source_video as source_video_helper
 
 
 def _transcript_from_words(words: list[tuple[str, float, float]]) -> dict:
@@ -195,7 +196,7 @@ class _FakeSupabase:
         return _FakeSupabaseQuery(table_name, self.clip_payload, self.video_payload)
 
 
-def test_generate_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_path: Path):
+def test_generate_flow_reuses_existing_word_timing_for_smart_cleanup(monkeypatch, tmp_path: Path):
     transcript_calls = {"count": 0}
 
     clip_payload = {
@@ -205,7 +206,7 @@ def test_generate_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_p
         "start_time": 10.2,
         "end_time": 11.8,
         "title": "Clip title",
-        # Existing word-timed transcript should still be ignored when Smart Cleanup is on.
+        # Existing word-timed transcript should be reused for Smart Cleanup.
         "transcript": _transcript_from_words([("old", 10.2, 10.7), ("words", 10.8, 11.4)]),
         "videos": {
             "raw_video_path": "C:/tmp/video.mp4",
@@ -229,7 +230,7 @@ def test_generate_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_p
     monkeypatch.setattr(generate_task_module, "needs_whisper_retranscription", lambda *_a, **_k: False)
     monkeypatch.setattr(generate_task_module, "get_credit_balance", lambda *_a, **_k: 999)
     monkeypatch.setattr(generate_task_module, "get_team_wallet_balance", lambda *_a, **_k: 999)
-    monkeypatch.setattr(generate_task_module, "probe_video_size", lambda *_a, **_k: (1080, 1920))
+    monkeypatch.setattr(source_video_helper, "probe_video_size", lambda *_a, **_k: (1080, 1920))
     monkeypatch.setattr(
         generate_task_module,
         "compute_video_position",
@@ -313,7 +314,7 @@ def test_generate_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_p
             }
         )
 
-    assert transcript_calls["count"] == 1
+    assert transcript_calls["count"] == 0
 
 
 def test_custom_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_path: Path):
@@ -386,6 +387,8 @@ def test_custom_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_pat
         "create_work_dir",
         lambda name: str((tmp_path / name).mkdir(parents=True, exist_ok=True) or (tmp_path / name)),
     )
+    monkeypatch.setattr(source_video_helper.os.path, "isfile", lambda *_a, **_k: True)
+    monkeypatch.setattr(source_video_helper, "probe_video_size", lambda *_a, **_k: (1080, 1920))
 
     class _FakeDownloader:
         def __init__(self, work_dir: str):
