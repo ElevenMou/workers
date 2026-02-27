@@ -234,7 +234,8 @@ def load_layout_overrides(
     overrides.bg_color = layout.get("background_color") or "#000000"
     overrides.bg_image_storage_path = layout.get("background_image_path")
     overrides.blur_strength = layout.get("background_blur_strength") or 20
-    overrides.output_quality = layout.get("output_quality") or "medium"
+    raw_output_quality = str(layout.get("output_quality") or "medium").strip().lower()
+    overrides.output_quality = raw_output_quality if raw_output_quality else "medium"
     overrides.layout_video = layout.get("video") or {}
     overrides.layout_title = layout.get("title") or {}
 

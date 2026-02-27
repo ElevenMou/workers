@@ -18,6 +18,7 @@ _PLAY_RES_BY_ASPECT: dict[str, tuple[int, int]] = {
     "1:1": (1080, 1080),
     "4:5": (1080, 1350),
 }
+_MIN_ESTIMATED_LINE_WIDTH_PX = 120
 _WS_RE = re.compile(r"\s+")
 _SPACE_BEFORE_PUNCT_RE = re.compile(r"\s+([,.;:!?])")
 
@@ -64,6 +65,69 @@ def _clean_text(text: str, cleanup_punctuation: bool) -> str:
     if cleanup_punctuation:
         cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
     return cleaned
+
+
+def _is_bold_weight(weight: Any) -> bool:
+    token = str(weight or "").strip().lower()
+    return token in {"900", "800", "700", "bold", "black"}
+
+
+def _resolve_font_size_for_play_res(
+    preset: CaptionPreset,
+    *,
+    play_res: tuple[int, int],
+) -> int:
+    font_size = _to_int(preset.get("font_size"), 64)
+    if play_res[0] >= 1920 and play_res[1] <= 1080:
+        font_size = max(36, int(math.floor(font_size * 0.72)))
+    return max(8, font_size)
+
+
+def _configured_max_chars_per_line(preset: CaptionPreset) -> int:
+    return max(8, _to_int(preset.get("max_chars_per_line"), 30))
+
+
+def _estimate_average_glyph_width_px(
+    preset: CaptionPreset,
+    *,
+    resolved_font_size: int,
+) -> float:
+    uppercase = bool(preset.get("uppercase", False))
+    width_factor = 0.66 if uppercase else 0.56
+
+    font_name = str(preset.get("font_name", "")).strip().lower()
+    if "space mono" in font_name or "spacemono" in font_name:
+        width_factor += 0.08
+    elif "bangers" in font_name or "oswald" in font_name:
+        width_factor += 0.05
+    elif "playfair" in font_name:
+        width_factor += 0.04
+
+    if bool(preset.get("bold", False)) or _is_bold_weight(preset.get("font_weight")):
+        width_factor += 0.03
+
+    outline = max(0.0, _to_float(preset.get("outline"), 3.0))
+    return max(1.0, (resolved_font_size * width_factor) + (outline * 0.55))
+
+
+def _estimate_max_chars_per_line_by_width(
+    preset: CaptionPreset,
+    *,
+    play_res: tuple[int, int],
+) -> int:
+    margin_l = _to_int(preset.get("margin_l"), _to_int(preset.get("safe_margin_x"), 56))
+    margin_r = _to_int(preset.get("margin_r"), _to_int(preset.get("safe_margin_x"), 56))
+    resolved_font_size = _resolve_font_size_for_play_res(preset, play_res=play_res)
+    background_padding = int(round(resolved_font_size * 0.9)) if bool(preset.get("background_box", False)) else 0
+    usable_width = max(
+        _MIN_ESTIMATED_LINE_WIDTH_PX,
+        play_res[0] - margin_l - margin_r - background_padding,
+    )
+    avg_glyph_width = _estimate_average_glyph_width_px(
+        preset,
+        resolved_font_size=resolved_font_size,
+    )
+    return max(8, int(math.floor(usable_width / avg_glyph_width)))
 
 
 def _escape_ass_text(text: str) -> str:
@@ -422,7 +486,9 @@ def _build_events(
     *,
     play_res: tuple[int, int],
 ) -> list[DialogueEvent]:
-    max_chars = _to_int(preset.get("max_chars_per_line"), 30)
+    configured_max_chars = _configured_max_chars_per_line(preset)
+    estimated_max_chars = _estimate_max_chars_per_line_by_width(preset, play_res=play_res)
+    max_chars = max(8, min(configured_max_chars, estimated_max_chars))
     max_lines = _to_int(preset.get("max_lines"), 2)
     uppercase = bool(preset.get("uppercase", False))
     cleanup_punctuation = bool(preset.get("punctuation_cleanup", True))
@@ -509,9 +575,7 @@ def _style_line(
     italic_flag = -1 if bool(preset.get("italic", False)) else 0
     underline_flag = -1 if bool(preset.get("underline", False)) else 0
 
-    font_size = _to_int(preset.get("font_size"), 64)
-    if play_res[0] >= 1920 and play_res[1] <= 1080:
-        font_size = max(36, int(math.floor(font_size * 0.72)))
+    font_size = _resolve_font_size_for_play_res(preset, play_res=play_res)
 
     return (
         "Style: Default,"

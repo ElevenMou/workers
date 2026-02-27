@@ -7,7 +7,11 @@ from pathlib import Path
 
 import ffmpeg
 
-from services.clips.constants import TITLE_LINE_HEIGHT_RATIO, normalize_video_scale_mode
+from services.clips.constants import (
+    TITLE_LINE_HEIGHT_RATIO,
+    intermediate_quality_preset,
+    normalize_video_scale_mode,
+)
 from services.clips.models import QualityPreset
 
 logger = logging.getLogger(__name__)
@@ -173,21 +177,86 @@ def extract_segment(
     qp: QualityPreset,
 ) -> None:
     """Extract a source segment to a temporary clip."""
-    duration = end - start
-    logger.info("Extracting segment %.2f-%.2f (%.2fs)", start, end, duration)
-
-    (
-        ffmpeg.input(input_path, ss=start, t=duration)
-        .output(
-            output_path,
-            vcodec="libx264",
-            acodec="aac",
-            crf=qp["crf"],
-            preset=qp["preset"],
+    start_f = float(start)
+    end_f = float(end)
+    if end_f <= start_f:
+        raise RuntimeError(
+            f"Invalid clip time range: start={start_f:.3f}, end={end_f:.3f}"
         )
-        .overwrite_output()
-        .run(quiet=True)
+
+    safe_start = max(0.0, start_f)
+    safe_end = max(safe_start + 0.05, end_f)
+
+    # Clamp to source duration when metadata is available.
+    try:
+        probe = ffmpeg.probe(input_path)
+        source_duration = float(probe.get("format", {}).get("duration", 0.0))
+    except Exception:
+        source_duration = 0.0
+
+    if source_duration > 0.0:
+        if safe_start >= source_duration:
+            fallback_start = max(0.0, source_duration - 0.5)
+            logger.warning(
+                "Clip start %.3fs is outside source duration %.3fs; clamping to %.3fs",
+                safe_start,
+                source_duration,
+                fallback_start,
+            )
+            safe_start = fallback_start
+        if safe_end > source_duration:
+            logger.warning(
+                "Clip end %.3fs exceeds source duration %.3fs; clamping end",
+                safe_end,
+                source_duration,
+            )
+            safe_end = source_duration
+        if safe_end <= safe_start:
+            safe_end = min(source_duration, safe_start + 0.5)
+        if safe_end <= safe_start:
+            raise RuntimeError(
+                "Cannot extract clip segment after clamping to source duration "
+                f"(start={safe_start:.3f}, end={safe_end:.3f}, source={source_duration:.3f})"
+            )
+
+    duration = safe_end - safe_start
+    logger.info(
+        "Extracting segment %.2f-%.2f (%.2fs, quality=%s/%s)",
+        safe_start,
+        safe_end,
+        duration,
+        qp.get("preset"),
+        qp.get("crf"),
     )
+
+    try:
+        (
+            ffmpeg.input(input_path, ss=safe_start, t=duration)
+            .output(
+                output_path,
+                vcodec="libx264",
+                acodec="aac",
+                crf=qp["crf"],
+                preset=qp["preset"],
+                pix_fmt="yuv420p",
+                movflags="+faststart",
+            )
+            .overwrite_output()
+            .run(capture_stderr=True)
+        )
+    except ffmpeg.Error as e:
+        stderr_output = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+        logger.error(
+            "FFmpeg extract failed for %s (start=%.3f end=%.3f duration=%.3f crf=%s preset=%s):\n%s",
+            input_path,
+            safe_start,
+            safe_end,
+            duration,
+            qp.get("crf"),
+            qp.get("preset"),
+            stderr_output,
+        )
+        raise
 
 
 def create_portrait_background(
@@ -575,11 +644,13 @@ def concat_intro_outro(
     intermediates: list[str] = []
     segments: list[str] = []
 
+    segment_qp = intermediate_quality_preset(qp)
+
     # Prepare intro segment.
     if intro_file_path and intro_cfg and intro_cfg.get("enabled"):
         intro_norm = main_clip_path + ".intro_norm.mp4"
         result = _prepare_intro_outro_segment(
-            intro_file_path, intro_cfg, canvas_w, canvas_h, intro_norm, qp,
+            intro_file_path, intro_cfg, canvas_w, canvas_h, intro_norm, segment_qp,
         )
         if result:
             segments.append(result)
@@ -591,7 +662,7 @@ def concat_intro_outro(
     if outro_file_path and outro_cfg and outro_cfg.get("enabled"):
         outro_norm = main_clip_path + ".outro_norm.mp4"
         result = _prepare_intro_outro_segment(
-            outro_file_path, outro_cfg, canvas_w, canvas_h, outro_norm, qp,
+            outro_file_path, outro_cfg, canvas_w, canvas_h, outro_norm, segment_qp,
         )
         if result:
             segments.append(result)

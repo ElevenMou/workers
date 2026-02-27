@@ -9,6 +9,7 @@ from services.clips.constants import (
     DEFAULT_VIDEO_SCALE_MODE,
     QUALITY_PRESETS,
     canvas_size_for_aspect_ratio,
+    intermediate_quality_preset,
 )
 from services.clips.ffmpeg_ops import (
     add_overlays,
@@ -74,7 +75,19 @@ class ClipGenerator:
         """Generate final clip with title and optional captions."""
         intermediates: list[str] = []
         qp = QUALITY_PRESETS.get(output_quality, QUALITY_PRESETS["medium"])
+        intermediate_qp = intermediate_quality_preset(qp)
         canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
+
+        has_intro = (
+            intro_file_path
+            and intro_cfg
+            and intro_cfg.get("enabled")
+        )
+        has_outro = (
+            outro_file_path
+            and outro_cfg
+            and outro_cfg.get("enabled")
+        )
 
         if str(title_position_y).strip().lower() == "custom":
             try:
@@ -91,7 +104,7 @@ class ClipGenerator:
         title_lines = wrap_title(title, title_font_size, max_text_w)
 
         raw_clip_path = os.path.join(self.temp_dir, f"{clip_id}_raw.mp4")
-        extract_segment(video_path, start_time, end_time, raw_clip_path, qp)
+        extract_segment(video_path, start_time, end_time, raw_clip_path, intermediate_qp)
         intermediates.append(raw_clip_path)
 
         layout = compute_layout(
@@ -125,12 +138,14 @@ class ClipGenerator:
             layout["vid_y"],
             blur_strength,
             video_scale_mode,
-            qp,
+            intermediate_qp,
             background_color=background_color,
             background_image_path=background_image_path,
         )
         intermediates.append(bg_clip_path)
 
+        # If intro/outro concat runs afterward, keep this pass high-fidelity.
+        overlay_qp = qp if not (has_intro or has_outro) else intermediate_qp
         composited_path = os.path.join(self.temp_dir, f"{clip_id}_composited.mp4")
         add_overlays(
             bg_clip_path,
@@ -153,24 +168,13 @@ class ClipGenerator:
             title_text_y=layout["title_text_y"],
             title_bar_h=layout["title_bar_h"],
             caption_ass_path=caption_ass_path,
-            qp=qp,
+            qp=overlay_qp,
             overlay_file_path=overlay_file_path,
             overlay_cfg=overlay_cfg,
         )
         intermediates.append(composited_path)
 
         # Concatenate intro/outro if configured.
-        has_intro = (
-            intro_file_path
-            and intro_cfg
-            and intro_cfg.get("enabled")
-        )
-        has_outro = (
-            outro_file_path
-            and outro_cfg
-            and outro_cfg.get("enabled")
-        )
-
         if has_intro or has_outro:
             final_clip_path = os.path.join(self.temp_dir, f"{clip_id}_final.mp4")
             concat_intermediates = concat_intro_outro(

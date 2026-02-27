@@ -45,6 +45,19 @@ QUALITY_PRESETS: dict[str, QualityPreset] = {
     "high": {"crf": 18, "preset": "slow"},
 }
 
+
+def intermediate_quality_preset(base: QualityPreset) -> QualityPreset:
+    """Return a higher-fidelity preset for intermediate transcodes.
+
+    The generation pipeline can encode multiple times before the final output.
+    Using a lower CRF for intermediates preserves detail and avoids cumulative
+    quality loss, while the final pass still honors the selected output quality.
+    """
+    base_crf = int(base.get("crf", 23))
+    # Keep intermediates visibly cleaner than the final CRF target.
+    intermediate_crf = max(10, min(28, base_crf - 8))
+    return {"crf": intermediate_crf, "preset": str(base.get("preset", "medium"))}
+
 CHAR_WIDTH_RATIO = 0.52
 
 
