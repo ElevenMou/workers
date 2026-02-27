@@ -122,14 +122,63 @@ DEFAULT_CAPTION_LAYOUT: CaptionLayout = {
 }
 
 
+class IntroOutroLayout(TypedDict, total=False):
+    enabled: bool
+    type: str  # "video" or "image"
+    storagePath: str
+    durationSeconds: float  # used when type == "image"
+
+
+class OverlayLayout(TypedDict, total=False):
+    enabled: bool
+    storagePath: str
+    widthPx: int
+    x: int
+    y: int
+
+
+DEFAULT_INTRO_LAYOUT: IntroOutroLayout = {
+    "enabled": False,
+    "type": "image",
+    "storagePath": "",
+    "durationSeconds": 3.0,
+}
+DEFAULT_OUTRO_LAYOUT: IntroOutroLayout = {
+    "enabled": False,
+    "type": "image",
+    "storagePath": "",
+    "durationSeconds": 3.0,
+}
+DEFAULT_OVERLAY_LAYOUT: OverlayLayout = {
+    "enabled": False,
+    "storagePath": "",
+    "widthPx": 200,
+    "x": 0,
+    "y": 0,
+}
+
+
 def merge_layout_configs(
     video_cfg: dict[str, Any] | None,
     title_cfg: dict[str, Any] | None,
     caption_cfg: dict[str, Any] | None,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    intro_cfg: dict[str, Any] | None = None,
+    outro_cfg: dict[str, Any] | None = None,
+    overlay_cfg: dict[str, Any] | None = None,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
     """Merge user layout overrides with task defaults."""
     return (
         {**DEFAULT_VIDEO_LAYOUT, **(video_cfg or {})},
         {**DEFAULT_TITLE_LAYOUT, **(title_cfg or {})},
         {**DEFAULT_CAPTION_LAYOUT, **(caption_cfg or {})},
+        {**DEFAULT_INTRO_LAYOUT, **(intro_cfg or {})},
+        {**DEFAULT_OUTRO_LAYOUT, **(outro_cfg or {})},
+        {**DEFAULT_OVERLAY_LAYOUT, **(overlay_cfg or {})},
     )

@@ -364,6 +364,8 @@ def add_overlays(
     title_bar_h: int,
     caption_ass_path: str | None,
     qp: QualityPreset,
+    overlay_file_path: str | None = None,
+    overlay_cfg: dict | None = None,
 ) -> None:
     """Draw title/text/captions in a single encode pass."""
     logger.info(
@@ -445,6 +447,18 @@ def add_overlays(
         else:
             stream = stream.filter("ass", filename=normalized_ass_path)
 
+    if (
+        overlay_file_path
+        and os.path.isfile(overlay_file_path)
+        and overlay_cfg
+        and overlay_cfg.get("enabled")
+    ):
+        overlay_x = max(0, int(overlay_cfg.get("x", 0)))
+        overlay_y = max(0, int(overlay_cfg.get("y", 0)))
+        overlay_w = max(1, min(1920, int(overlay_cfg.get("widthPx", 200))))
+        overlay_input = ffmpeg.input(overlay_file_path).filter("scale", overlay_w, -1)
+        stream = ffmpeg.filter([stream, overlay_input], "overlay", overlay_x, overlay_y)
+
     try:
         (
             ffmpeg.output(
@@ -468,6 +482,156 @@ def add_overlays(
     finally:
         for temp_file in temp_files:
             safe_remove(temp_file)
+
+
+def _prepare_intro_outro_segment(
+    file_path: str,
+    cfg: dict,
+    canvas_w: int,
+    canvas_h: int,
+    output_path: str,
+    qp: QualityPreset,
+) -> str | None:
+    """Convert an intro/outro source (image or video) to a normalised clip segment.
+
+    Returns the path to the normalised segment on success, ``None`` on failure.
+    """
+    media_type = cfg.get("type", "image")
+    try:
+        if media_type == "image":
+            duration = max(0.5, min(60.0, float(cfg.get("durationSeconds", 3.0))))
+            img = (
+                ffmpeg.input(file_path, loop=1, t=duration, framerate=30)
+                .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="decrease")
+                .filter("pad", canvas_w, canvas_h, "(ow-iw)/2", "(oh-ih)/2", color="black")
+            )
+            silent = ffmpeg.input(
+                f"anullsrc=r=44100:cl=stereo",
+                f="lavfi",
+                t=duration,
+            )
+            (
+                ffmpeg.output(
+                    img,
+                    silent,
+                    output_path,
+                    vcodec="libx264",
+                    acodec="aac",
+                    crf=qp["crf"],
+                    preset=qp["preset"],
+                    pix_fmt="yuv420p",
+                    shortest=None,
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
+        else:
+            # Video type — scale/pad to canvas size.
+            video = (
+                ffmpeg.input(file_path)
+                .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="decrease")
+                .filter("pad", canvas_w, canvas_h, "(ow-iw)/2", "(oh-ih)/2", color="black")
+            )
+            audio = ffmpeg.input(file_path).audio
+            (
+                ffmpeg.output(
+                    video,
+                    audio,
+                    output_path,
+                    vcodec="libx264",
+                    acodec="aac",
+                    crf=qp["crf"],
+                    preset=qp["preset"],
+                    pix_fmt="yuv420p",
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
+        return output_path
+    except Exception:
+        logger.exception("Failed to prepare intro/outro segment from %s", file_path)
+        safe_remove(output_path)
+        return None
+
+
+def concat_intro_outro(
+    main_clip_path: str,
+    output_path: str,
+    qp: QualityPreset,
+    *,
+    intro_file_path: str | None = None,
+    intro_cfg: dict | None = None,
+    outro_file_path: str | None = None,
+    outro_cfg: dict | None = None,
+    canvas_w: int,
+    canvas_h: int,
+) -> list[str]:
+    """Prepend intro and/or append outro to main clip using FFmpeg concat demuxer.
+
+    Returns a list of temporary intermediate files created (caller should clean up).
+    """
+    import tempfile
+
+    intermediates: list[str] = []
+    segments: list[str] = []
+
+    # Prepare intro segment.
+    if intro_file_path and intro_cfg and intro_cfg.get("enabled"):
+        intro_norm = main_clip_path + ".intro_norm.mp4"
+        result = _prepare_intro_outro_segment(
+            intro_file_path, intro_cfg, canvas_w, canvas_h, intro_norm, qp,
+        )
+        if result:
+            segments.append(result)
+            intermediates.append(intro_norm)
+
+    segments.append(main_clip_path)
+
+    # Prepare outro segment.
+    if outro_file_path and outro_cfg and outro_cfg.get("enabled"):
+        outro_norm = main_clip_path + ".outro_norm.mp4"
+        result = _prepare_intro_outro_segment(
+            outro_file_path, outro_cfg, canvas_w, canvas_h, outro_norm, qp,
+        )
+        if result:
+            segments.append(result)
+            intermediates.append(outro_norm)
+
+    if len(segments) <= 1:
+        # Nothing to concat — main clip is the only segment.
+        return intermediates
+
+    logger.info("Concatenating %d segments (intro=%s, outro=%s)", len(segments),
+                bool(intro_file_path), bool(outro_file_path))
+
+    # Write a concat list file.
+    concat_list_path = main_clip_path + ".concat.txt"
+    intermediates.append(concat_list_path)
+    with open(concat_list_path, "w", encoding="utf-8") as f:
+        for seg in segments:
+            safe_path = seg.replace("\\", "/").replace("'", "'\\''")
+            f.write(f"file '{safe_path}'\n")
+
+    try:
+        (
+            ffmpeg.input(concat_list_path, f="concat", safe=0)
+            .output(
+                output_path,
+                vcodec="libx264",
+                acodec="aac",
+                crf=qp["crf"],
+                preset=qp["preset"],
+                movflags="+faststart",
+            )
+            .overwrite_output()
+            .run(capture_stderr=True)
+        )
+    except ffmpeg.Error as e:
+        stderr_output = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+        logger.error("FFmpeg concat failed:\n%s", stderr_output)
+        raise
+
+    return intermediates
 
 
 def generate_thumbnail(video_path: str, output_path: str) -> None:

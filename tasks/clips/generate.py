@@ -23,6 +23,7 @@ from tasks.videos.transcript import (
 from tasks.clips.helpers.layout import (
     load_layout_overrides,
     maybe_download_layout_background_image,
+    maybe_download_media_files,
     resolve_effective_layout_id,
 )
 from tasks.models.jobs import GenerateClipJob
@@ -366,10 +367,13 @@ def generate_clip_task(job_data: GenerateClipJob):
         output_quality = layout_overrides.output_quality
 
         # Unpack nested style dicts (layout values override task defaults)
-        vid_cfg, title_cfg, cap_cfg = merge_layout_configs(
+        vid_cfg, title_cfg, cap_cfg, intro_cfg, outro_cfg, overlay_cfg = merge_layout_configs(
             layout_overrides.layout_video,
             layout_overrides.layout_title,
             layout_overrides.layout_captions,
+            layout_overrides.layout_intro,
+            layout_overrides.layout_outro,
+            layout_overrides.layout_overlay,
         )
         canvas_aspect_ratio = str(vid_cfg.get("canvasAspectRatio") or "9:16")
         video_scale_mode = str(vid_cfg.get("videoScaleMode") or "fit")
@@ -378,6 +382,15 @@ def generate_clip_task(job_data: GenerateClipJob):
         bg_style, bg_image_path = maybe_download_layout_background_image(
             bg_style=bg_style,
             bg_image_storage_path=layout_overrides.bg_image_storage_path,
+            work_dir=work_dir,
+            job_id=job_id,
+            logger=logger,
+        )
+
+        intro_file_path, outro_file_path, overlay_file_path = maybe_download_media_files(
+            intro_cfg=intro_cfg,
+            outro_cfg=outro_cfg,
+            overlay_cfg=overlay_cfg,
             work_dir=work_dir,
             job_id=job_id,
             logger=logger,
@@ -605,6 +618,13 @@ def generate_clip_task(job_data: GenerateClipJob):
             title_custom_width=title_cfg.get("customWidth"),
             # captions
             caption_ass_path=caption_ass_path,
+            # intro / outro / overlay
+            intro_cfg=intro_cfg,
+            outro_cfg=outro_cfg,
+            overlay_cfg=overlay_cfg,
+            intro_file_path=intro_file_path,
+            outro_file_path=outro_file_path,
+            overlay_file_path=overlay_file_path,
             # misc
             blur_strength=blur_strength,
             output_quality=output_quality,

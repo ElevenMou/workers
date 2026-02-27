@@ -1,6 +1,7 @@
 """High-level clip generation orchestration."""
 
 import os
+from typing import Any
 
 from config import TEMP_DIR
 from services.clips.constants import (
@@ -11,6 +12,7 @@ from services.clips.constants import (
 )
 from services.clips.ffmpeg_ops import (
     add_overlays,
+    concat_intro_outro,
     create_portrait_background,
     extract_segment,
 )
@@ -58,6 +60,13 @@ class ClipGenerator:
         title_custom_width: int | None = None,
         # -- captions --
         caption_ass_path: str | None = None,
+        # -- intro / outro / overlay --
+        intro_cfg: dict[str, Any] | None = None,
+        outro_cfg: dict[str, Any] | None = None,
+        overlay_cfg: dict[str, Any] | None = None,
+        intro_file_path: str | None = None,
+        outro_file_path: str | None = None,
+        overlay_file_path: str | None = None,
         # -- misc --
         blur_strength: int = 20,
         output_quality: str = "medium",
@@ -65,7 +74,7 @@ class ClipGenerator:
         """Generate final clip with title and optional captions."""
         intermediates: list[str] = []
         qp = QUALITY_PRESETS.get(output_quality, QUALITY_PRESETS["medium"])
-        canvas_w, _ = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
+        canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
 
         if str(title_position_y).strip().lower() == "custom":
             try:
@@ -122,11 +131,11 @@ class ClipGenerator:
         )
         intermediates.append(bg_clip_path)
 
-        final_clip_path = os.path.join(self.temp_dir, f"{clip_id}_final.mp4")
+        composited_path = os.path.join(self.temp_dir, f"{clip_id}_composited.mp4")
         add_overlays(
             bg_clip_path,
             raw_clip_path,
-            final_clip_path,
+            composited_path,
             title_lines=title_lines,
             title_show=title_show,
             title_font_size=title_font_size,
@@ -145,7 +154,41 @@ class ClipGenerator:
             title_bar_h=layout["title_bar_h"],
             caption_ass_path=caption_ass_path,
             qp=qp,
+            overlay_file_path=overlay_file_path,
+            overlay_cfg=overlay_cfg,
         )
+        intermediates.append(composited_path)
+
+        # Concatenate intro/outro if configured.
+        has_intro = (
+            intro_file_path
+            and intro_cfg
+            and intro_cfg.get("enabled")
+        )
+        has_outro = (
+            outro_file_path
+            and outro_cfg
+            and outro_cfg.get("enabled")
+        )
+
+        if has_intro or has_outro:
+            final_clip_path = os.path.join(self.temp_dir, f"{clip_id}_final.mp4")
+            concat_intermediates = concat_intro_outro(
+                composited_path,
+                final_clip_path,
+                qp,
+                intro_file_path=intro_file_path,
+                intro_cfg=intro_cfg,
+                outro_file_path=outro_file_path,
+                outro_cfg=outro_cfg,
+                canvas_w=canvas_w,
+                canvas_h=canvas_h,
+            )
+            intermediates.extend(concat_intermediates)
+        else:
+            final_clip_path = composited_path
+            # Remove composited_path from intermediates since it IS the final.
+            intermediates = [p for p in intermediates if p != composited_path]
 
         file_size = os.path.getsize(final_clip_path)
         return {

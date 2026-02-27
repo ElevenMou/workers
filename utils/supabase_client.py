@@ -242,7 +242,7 @@ def _refresh_free_monthly_credits_if_needed(user_id: str):
         if _FREE_RESET_RPC_AVAILABLE is not False:
             logger.warning(
                 "Missing DB function reset_free_monthly_credits. "
-                "Apply SQL/free_plan_monthly_credits.sql to enable free-plan monthly resets."
+                "Apply SQL/billing_reliability.sql to enable free-plan monthly resets."
             )
         _FREE_RESET_RPC_AVAILABLE = False
         return

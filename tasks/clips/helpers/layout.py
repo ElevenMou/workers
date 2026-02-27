@@ -20,6 +20,9 @@ class LayoutOverrides:
     layout_video: dict[str, Any] = field(default_factory=dict)
     layout_title: dict[str, Any] = field(default_factory=dict)
     layout_captions: dict[str, Any] = field(default_factory=dict)
+    layout_intro: dict[str, Any] = field(default_factory=dict)
+    layout_outro: dict[str, Any] = field(default_factory=dict)
+    layout_overlay: dict[str, Any] = field(default_factory=dict)
 
 
 LayoutSelectionSource = Literal["requested", "clip", "default", "first_created", "none"]
@@ -243,7 +246,61 @@ def load_layout_overrides(
     overrides.layout_captions = {
         k: v for k, v in raw_layout_captions.items() if k != "preset"
     }
+
+    raw_intro = layout.get("intro")
+    overrides.layout_intro = raw_intro if isinstance(raw_intro, dict) else {}
+    raw_outro = layout.get("outro")
+    overrides.layout_outro = raw_outro if isinstance(raw_outro, dict) else {}
+    raw_overlay = layout.get("overlay")
+    overrides.layout_overlay = raw_overlay if isinstance(raw_overlay, dict) else {}
+
     return overrides
+
+
+def maybe_download_media_files(
+    *,
+    intro_cfg: dict[str, Any],
+    outro_cfg: dict[str, Any],
+    overlay_cfg: dict[str, Any],
+    work_dir: str,
+    job_id: str,
+    logger: logging.Logger,
+) -> tuple[str | None, str | None, str | None]:
+    """Download intro, outro, and overlay files from storage.
+
+    Returns ``(intro_path, outro_path, overlay_path)``.  Each is ``None``
+    when the corresponding feature is disabled or the download fails.
+    """
+
+    def _download(cfg: dict[str, Any], label: str, local_name: str) -> str | None:
+        if not cfg.get("enabled"):
+            return None
+        storage_path = cfg.get("storagePath")
+        if not storage_path or not isinstance(storage_path, str) or not storage_path.strip():
+            return None
+        dest = os.path.join(work_dir, local_name)
+        try:
+            file_bytes = supabase.storage.from_("layouts").download(storage_path.strip())
+            with open(dest, "wb") as f:
+                f.write(file_bytes)
+            logger.info("[%s] Downloaded %s from storage: %s", job_id, label, storage_path)
+            return dest
+        except Exception as exc:
+            logger.warning("[%s] Could not download %s: %s", job_id, label, exc)
+            return None
+
+    intro_path = _download(intro_cfg, "intro", "intro_media" + _ext(intro_cfg))
+    outro_path = _download(outro_cfg, "outro", "outro_media" + _ext(outro_cfg))
+    overlay_path = _download(overlay_cfg, "overlay", "overlay_image.png")
+    return intro_path, outro_path, overlay_path
+
+
+def _ext(cfg: dict[str, Any]) -> str:
+    """Guess a file extension from the intro/outro config."""
+    storage_path = cfg.get("storagePath", "")
+    if isinstance(storage_path, str) and "." in storage_path:
+        return "." + storage_path.rsplit(".", 1)[-1].lower()
+    return ".mp4" if cfg.get("type") == "video" else ".png"
 
 
 def maybe_download_layout_background_image(
