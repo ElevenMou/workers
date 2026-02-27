@@ -117,6 +117,9 @@ class _FakeSupabaseTable:
     def limit(self, _count: int):
         return self
 
+    def range(self, _start: int, _end: int):
+        return self
+
     def execute(self):
         if self.table_name == "jobs" and self.mode == "select":
             return _FakeSupabaseResponse(self.owner.jobs_rows)

@@ -89,6 +89,11 @@ def test_resolve_source_video_deduplicates_download_for_concurrent_same_video(
     monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
     monkeypatch.setattr(source_video, "SOURCE_VIDEO_LOCK_WAIT_SECONDS", 5)
     monkeypatch.setattr(source_video, "_WAIT_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        source_video,
+        "upload_raw_video_to_storage",
+        lambda **_kwargs: ("raw/video-1.mp4", "etag-1"),
+    )
 
     results: dict[str, source_video.SourceVideoResolution] = {}
     errors: list[Exception] = []
@@ -101,6 +106,7 @@ def test_resolve_source_video_deduplicates_download_for_concurrent_same_video(
                 video_id="video-1",
                 source_url=shared_row["url"],
                 initial_raw_video_path=None,
+                initial_raw_video_storage_path=None,
                 downloader=_FakeDownloader(),
                 load_video_row=_load_video_row,
                 persist_raw_video_path=_persist_raw_video_path,
@@ -148,6 +154,7 @@ def test_resolve_source_video_reuses_existing_raw_path_without_download(
         video_id="video-2",
         source_url="https://example.com/watch?v=xyz",
         initial_raw_video_path=str(existing_path),
+        initial_raw_video_storage_path=None,
         downloader=_FakeDownloader(),
         load_video_row=lambda _video_id: {
             "raw_video_path": str(existing_path),
@@ -181,11 +188,17 @@ def test_resolve_source_video_prefers_fresh_download_when_requested(
 
     monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
     monkeypatch.setattr(source_video, "get_redis_connection", lambda: None)
+    monkeypatch.setattr(
+        source_video,
+        "upload_raw_video_to_storage",
+        lambda **_kwargs: ("raw/video-fresh.mp4", "etag-fresh"),
+    )
 
     result = source_video.resolve_source_video(
         video_id="video-fresh",
         source_url="https://example.com/watch?v=fresh",
         initial_raw_video_path=str(existing_path),
+        initial_raw_video_storage_path=None,
         downloader=_FakeDownloader(),
         load_video_row=lambda _video_id: {
             "raw_video_path": str(existing_path),
@@ -227,11 +240,17 @@ def test_resolve_source_video_can_request_unbounded_source_height(
 
     monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
     monkeypatch.setattr(source_video, "get_redis_connection", lambda: None)
+    monkeypatch.setattr(
+        source_video,
+        "upload_raw_video_to_storage",
+        lambda **_kwargs: ("raw/video-best-source.mp4", "etag-best"),
+    )
 
     result = source_video.resolve_source_video(
         video_id="video-best-source",
         source_url="https://example.com/watch?v=best",
         initial_raw_video_path=None,
+        initial_raw_video_storage_path=None,
         downloader=_FakeDownloader(),
         load_video_row=lambda _video_id: {"raw_video_path": None, "url": None},
         persist_raw_video_path=lambda *_args, **_kwargs: None,
@@ -243,6 +262,46 @@ def test_resolve_source_video_can_request_unbounded_source_height(
 
     assert captured_max_height["value"] is None
     assert result.video_path == str(fresh_path)
+
+
+def test_resolve_source_video_downloads_from_canonical_storage_before_url(
+    monkeypatch,
+    tmp_path: Path,
+):
+    class _FailIfDownloaded:
+        def download(self, *_args, **_kwargs):
+            raise AssertionError("URL download should not be used when canonical storage is available")
+
+    class _FakeStorageBucket:
+        def download(self, _path: str):
+            return b"stored-video"
+
+    class _FakeStorageClient:
+        def from_(self, _bucket: str):
+            return _FakeStorageBucket()
+
+    monkeypatch.setattr(source_video, "RAW_VIDEO_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1280, 720))
+    monkeypatch.setattr(source_video, "supabase", type("S", (), {"storage": _FakeStorageClient()})())
+
+    result = source_video.resolve_source_video(
+        video_id="video-storage-first",
+        source_url="https://example.com/watch?v=storage",
+        initial_raw_video_path=None,
+        initial_raw_video_storage_path="raw/video-storage-first.mp4",
+        downloader=_FailIfDownloaded(),
+        load_video_row=lambda _video_id: {
+            "raw_video_path": None,
+            "raw_video_storage_path": "raw/video-storage-first.mp4",
+            "url": "https://example.com/watch?v=storage",
+        },
+        persist_raw_video_path=lambda *_args, **_kwargs: None,
+        logger=type("Logger", (), {"warning": lambda *args, **kwargs: None})(),
+        job_id="job-storage-first",
+    )
+
+    assert result.strategy == "downloaded_from_storage"
+    assert Path(result.video_path).is_file()
 
 
 def test_resolve_source_video_prefers_fresh_but_reuses_waited_download(
@@ -282,6 +341,11 @@ def test_resolve_source_video_prefers_fresh_but_reuses_waited_download(
     monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
     monkeypatch.setattr(source_video, "SOURCE_VIDEO_LOCK_WAIT_SECONDS", 5)
     monkeypatch.setattr(source_video, "_WAIT_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        source_video,
+        "upload_raw_video_to_storage",
+        lambda **_kwargs: ("raw/video-fresh-wait.mp4", "etag-fresh-wait"),
+    )
 
     results: dict[str, source_video.SourceVideoResolution] = {}
     errors: list[Exception] = []
@@ -294,6 +358,7 @@ def test_resolve_source_video_prefers_fresh_but_reuses_waited_download(
                 video_id="video-fresh-wait",
                 source_url=shared_row["url"],
                 initial_raw_video_path=str(stale_path),
+                initial_raw_video_storage_path=None,
                 downloader=_FakeDownloader(),
                 load_video_row=_load_video_row,
                 persist_raw_video_path=_persist_raw_video_path,
@@ -341,6 +406,7 @@ def test_resolve_source_video_times_out_when_lock_is_never_released(monkeypatch)
             video_id="video-timeout",
             source_url="https://example.com/video",
             initial_raw_video_path=None,
+            initial_raw_video_storage_path=None,
             downloader=_FakeDownloader(),
             load_video_row=lambda _video_id: {"raw_video_path": None, "url": None},
             persist_raw_video_path=lambda *_args, **_kwargs: None,

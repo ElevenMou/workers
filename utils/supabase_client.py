@@ -258,9 +258,33 @@ def _charge_credits_or_raise(
     description: str,
     video_id: str | None = None,
     clip_id: str | None = None,
+    processing_ref: str | None = None,
     context: str,
 ):
     """Atomically charge credits in DB and fail when balance is insufficient."""
+    if processing_ref:
+        existing_resp = (
+            supabase.table("credit_transactions")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("type", tx_type)
+            .eq("processing_ref", processing_ref)
+            .lt("amount", 0)
+            .limit(1)
+            .execute()
+        )
+        assert_response_ok(existing_resp, f"{context}: dedupe precheck failed")
+        if existing_resp.data:
+            try:
+                from utils.redis_client import get_redis_connection
+
+                conn = get_redis_connection()
+                conn.incr("clipry:metrics:billing_dedupe:total")
+                conn.incr("clipry:metrics:billing_dedupe:owner_wallet")
+            except Exception:
+                pass
+            return
+
     _refresh_free_monthly_credits_if_needed(user_id)
 
     resp = supabase.rpc(
@@ -272,6 +296,7 @@ def _charge_credits_or_raise(
             "p_description": description,
             "p_video_id": video_id,
             "p_clip_id": clip_id,
+            "p_processing_ref": processing_ref,
         },
     ).execute()
     assert_response_ok(resp, context)
@@ -290,9 +315,33 @@ def _charge_team_credits_or_raise(
     video_id: str | None = None,
     clip_id: str | None = None,
     job_id: str | None = None,
+    processing_ref: str | None = None,
     context: str,
 ):
     """Atomically charge a team wallet and write owner/team audit transactions."""
+    if processing_ref:
+        existing_resp = (
+            supabase.table("team_wallet_transactions")
+            .select("id")
+            .eq("team_id", team_id)
+            .eq("type", "processing_charge")
+            .eq("processing_ref", processing_ref)
+            .lt("amount", 0)
+            .limit(1)
+            .execute()
+        )
+        assert_response_ok(existing_resp, f"{context}: dedupe precheck failed")
+        if existing_resp.data:
+            try:
+                from utils.redis_client import get_redis_connection
+
+                conn = get_redis_connection()
+                conn.incr("clipry:metrics:billing_dedupe:total")
+                conn.incr("clipry:metrics:billing_dedupe:team_wallet")
+            except Exception:
+                pass
+            return
+
     resp = supabase.rpc(
         "charge_team_credits",
         {
@@ -305,6 +354,7 @@ def _charge_team_credits_or_raise(
             "p_video_id": video_id,
             "p_clip_id": clip_id,
             "p_job_id": job_id,
+            "p_processing_ref": processing_ref,
         },
     ).execute()
     assert_response_ok(resp, context)
@@ -430,6 +480,7 @@ def capture_credit_reservation(
     reservation_id: str,
     tx_type: str,
     description: str | None = None,
+    processing_ref: str | None = None,
 ) -> bool:
     """Capture a previously reserved owner-wallet charge."""
     response = supabase.rpc(
@@ -438,6 +489,7 @@ def capture_credit_reservation(
             "p_reservation_id": reservation_id,
             "p_type": tx_type,
             "p_description": description,
+            "p_processing_ref": processing_ref,
         },
     ).execute()
     assert_response_ok(
@@ -556,6 +608,7 @@ def charge_clip_generation_credits(
     billing_owner_user_id: str | None = None,
     actor_user_id: str | None = None,
     job_id: str | None = None,
+    processing_ref: str | None = None,
     usage_metadata: dict[str, Any] | None = None,
 ):
     amount = int(amount)
@@ -588,6 +641,7 @@ def charge_clip_generation_credits(
             video_id=video_id,
             clip_id=clip_id,
             job_id=job_id,
+            processing_ref=processing_ref,
             context="Failed to charge clip-generation credits",
         )
         _emit_usage_event_after_charge(
@@ -612,6 +666,7 @@ def charge_clip_generation_credits(
         description=description,
         video_id=video_id,
         clip_id=clip_id,
+        processing_ref=processing_ref,
         context="Failed to charge clip-generation credits",
     )
     _emit_usage_event_after_charge(
@@ -640,6 +695,7 @@ def charge_video_analysis_credits(
     billing_owner_user_id: str | None = None,
     actor_user_id: str | None = None,
     job_id: str | None = None,
+    processing_ref: str | None = None,
     usage_metadata: dict[str, Any] | None = None,
 ):
     amount = int(amount)
@@ -672,6 +728,7 @@ def charge_video_analysis_credits(
             video_id=video_id,
             clip_id=None,
             job_id=job_id,
+            processing_ref=processing_ref,
             context="Failed to charge video-analysis credits",
         )
         _emit_usage_event_after_charge(
@@ -696,6 +753,7 @@ def charge_video_analysis_credits(
         description=description,
         video_id=video_id,
         clip_id=None,
+        processing_ref=processing_ref,
         context="Failed to charge video-analysis credits",
     )
     _emit_usage_event_after_charge(
@@ -771,6 +829,14 @@ def update_job_status(
 
     resp = supabase.table("jobs").update(data).eq("id", job_id).execute()
     assert_response_ok(resp, f"Failed to update job status for {job_id}")
+
+    if status in {"completed", "failed"}:
+        try:
+            from utils.redis_client import release_job_admission
+
+            release_job_admission(job_id)
+        except Exception as exc:
+            logger.warning("Failed to release admission token for %s: %s", job_id, exc)
 
 
 def update_video_status(video_id: str, status: str, **kwargs):

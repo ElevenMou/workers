@@ -15,6 +15,7 @@ if "whisper" not in sys.modules:
 
 from tasks.clips import custom as custom_task_module
 from tasks.clips import generate as generate_task_module
+from tasks.clips.helpers import lifecycle as lifecycle_helper
 from tasks.clips.helpers import smart_cleanup as smart_cleanup
 from tasks.clips.helpers import source_video as source_video_helper
 
@@ -273,6 +274,7 @@ def test_generate_flow_reuses_existing_word_timing_for_smart_cleanup(monkeypatch
     )
     monkeypatch.setattr(generate_task_module, "_best_effort_mark_failed", lambda **_k: None)
     monkeypatch.setattr(generate_task_module, "update_job_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(lifecycle_helper, "update_job_status", lambda *_a, **_k: None)
     monkeypatch.setattr(generate_task_module, "has_sufficient_credits", lambda **_k: True)
     monkeypatch.setattr(generate_task_module, "needs_whisper_retranscription", lambda *_a, **_k: False)
     monkeypatch.setattr(generate_task_module, "get_credit_balance", lambda *_a, **_k: 999)
@@ -390,6 +392,7 @@ def test_custom_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(custom_task_module, "_best_effort_mark_failed", lambda **_k: None)
     monkeypatch.setattr(custom_task_module, "update_job_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(lifecycle_helper, "update_job_status", lambda *_a, **_k: None)
     monkeypatch.setattr(custom_task_module, "update_video_status", lambda *_a, **_k: None)
     monkeypatch.setattr(custom_task_module, "has_sufficient_credits", lambda **_k: True)
     monkeypatch.setattr(custom_task_module, "get_credit_balance", lambda *_a, **_k: 999)

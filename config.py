@@ -84,6 +84,7 @@ MAX_CLIP_QUEUE_DEPTH = _env_int("MAX_CLIP_QUEUE_DEPTH", 1000, minimum=10)
 # Storage
 # ---------------------------------------------------------------------------
 TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/video_clipper")
+RAW_VIDEO_CACHE_DIR = os.getenv("RAW_VIDEO_CACHE_DIR", f"{TEMP_DIR.rstrip('/')}/cache/raw")
 MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", 500))
 
 # ---------------------------------------------------------------------------
@@ -103,6 +104,18 @@ PROCESSING_JOB_STALE_SECONDS = _env_int(
     "PROCESSING_JOB_STALE_SECONDS",
     max(VIDEO_JOB_TIMEOUT, CLIP_JOB_TIMEOUT) + 300,
     minimum=60,
+)
+SUPERVISOR_ROLE = str(os.getenv("SUPERVISOR_ROLE", "worker")).strip().lower() or "worker"
+WORKER_INSTANCE_ID = (os.getenv("WORKER_INSTANCE_ID") or "").strip()
+MAINTENANCE_LEADER_LOCK_TTL_SECONDS = _env_int(
+    "MAINTENANCE_LEADER_LOCK_TTL_SECONDS",
+    15,
+    minimum=5,
+)
+MAINTENANCE_LEADER_RENEW_SECONDS = _env_int(
+    "MAINTENANCE_LEADER_RENEW_SECONDS",
+    5,
+    minimum=1,
 )
 SOURCE_VIDEO_LOCK_WAIT_SECONDS = _env_int(
     "SOURCE_VIDEO_LOCK_WAIT_SECONDS",
@@ -232,6 +245,7 @@ YTDLP_SOCKET_TIMEOUT_SECONDS = _env_int(
 YTDLP_DOWNLOAD_RETRIES = _env_int("YTDLP_DOWNLOAD_RETRIES", 3, minimum=1)
 YTDLP_FRAGMENT_RETRIES = _env_int("YTDLP_FRAGMENT_RETRIES", 3, minimum=1)
 YTDLP_EXTRACTOR_RETRIES = _env_int("YTDLP_EXTRACTOR_RETRIES", 3, minimum=1)
+FFMPEG_THREADS = _env_int("FFMPEG_THREADS", 2, minimum=1)
 
 
 # ---------------------------------------------------------------------------

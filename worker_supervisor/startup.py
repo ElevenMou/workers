@@ -55,6 +55,17 @@ def mark_jobs_failed(job_ids: list[str], reason: str):
             updated += 1
         except Exception as exc:
             logger.warning("Failed to update dropped job %s: %s", job_id, exc)
+        finally:
+            try:
+                from utils.redis_client import release_job_admission
+
+                release_job_admission(job_id)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to release admission token while failing job %s: %s",
+                    job_id,
+                    exc,
+                )
 
     logger.info("Marked %d/%d dropped jobs as failed", updated, len(job_ids))
 
@@ -363,4 +374,10 @@ def recover_stale_processing_rows(
         video_failures,
         stale_seconds,
     )
+    try:
+        conn.incrby("clipry:metrics:stale_recoveries:total", len(stale_rows))
+        conn.incrby("clipry:metrics:stale_recoveries:clips", int(clip_failures))
+        conn.incrby("clipry:metrics:stale_recoveries:videos", int(video_failures))
+    except Exception as exc:
+        logger.warning("Failed to increment stale-recovery metrics: %s", exc)
     return len(stale_rows)

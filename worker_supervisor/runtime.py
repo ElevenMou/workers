@@ -100,6 +100,20 @@ def run_worker(queue_names: list[str], worker_name: str):
     queues = get_queues(queue_names, conn)
     cls = worker_cls()
 
+    should_preload_whisper = (
+        os.getenv("PRELOAD_WHISPER_ON_WORKER_START", "true").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    has_video_work = any(str(name).startswith("video-processing") for name in queue_names)
+    if should_preload_whisper and has_video_work:
+        try:
+            from services.transcriber import Transcriber  # noqa: E402
+
+            Transcriber()
+            logger.info("Worker %s preloaded Whisper model", worker_name)
+        except Exception as exc:
+            logger.warning("Worker %s failed to preload Whisper model: %s", worker_name, exc)
+
     logger.info("Worker %s starting - queues: %s", worker_name, queue_names)
     for attempt in range(2):
         worker = cls(queues, connection=conn, name=worker_name)

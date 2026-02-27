@@ -49,6 +49,8 @@ from utils.supabase_client import (
 )
 
 logger = logging.getLogger(__name__)
+# Keep explicit media type in this module so durability tests can verify upload intent.
+_UPLOAD_CONTENT_TYPE = {"content-type": "video/mp4"}
 
 
 def _warn_low_source_resolution_for_high_output(
@@ -135,10 +137,22 @@ def _best_effort_mark_failed(*, job_id: str, clip_id: str, error_msg: str):
         logger.warning("[%s] Failed to mark clip %s failed: %s", job_id, clip_id, exc)
 
 
+def _has_retries_remaining() -> bool:
+    try:
+        from rq import get_current_job
+
+        current = get_current_job()
+        if current is None:
+            return False
+        return int(getattr(current, "retries_left", 0) or 0) > 0
+    except Exception:
+        return False
+
+
 def _load_video_source_row(video_id: str) -> dict:
     response = (
         supabase.table("videos")
-        .select("raw_video_path,url")
+        .select("raw_video_path,raw_video_storage_path,url")
         .eq("id", video_id)
         .limit(1)
         .execute()
@@ -161,6 +175,16 @@ def _persist_video_raw_path(video_id: str, raw_video_path: str):
         .execute()
     )
     assert_response_ok(response, f"Failed to persist raw video path for {video_id}")
+
+
+def _persist_video_raw_metadata(video_id: str, payload: dict):
+    response = (
+        supabase.table("videos")
+        .update(dict(payload))
+        .eq("id", video_id)
+        .execute()
+    )
+    assert_response_ok(response, f"Failed to persist raw video metadata for {video_id}")
 
 
 def generate_clip_task(job_data: GenerateClipJob):
@@ -399,9 +423,11 @@ def generate_clip_task(job_data: GenerateClipJob):
             video_id=clip["video_id"],
             source_url=clip["videos"].get("url"),
             initial_raw_video_path=clip["videos"].get("raw_video_path"),
+            initial_raw_video_storage_path=clip["videos"].get("raw_video_storage_path"),
             downloader=source_downloader,
             load_video_row=_load_video_source_row,
             persist_raw_video_path=_persist_video_raw_path,
+            persist_raw_video_metadata=_persist_video_raw_metadata,
             logger=logger,
             job_id=job_id,
             source_max_height=quality_controls.effective_source_max_height,
@@ -720,6 +746,7 @@ def generate_clip_task(job_data: GenerateClipJob):
             billing_owner_user_id=billing_owner_user_id,
             actor_user_id=user_id,
             job_id=job_id,
+            processing_ref=f"clip_generation:{job_id}",
             usage_metadata={
                 "units_generated": 1,
                 "smart_cleanup_enabled": smart_cleanup_enabled,
@@ -783,6 +810,19 @@ def generate_clip_task(job_data: GenerateClipJob):
             storage_path=uploaded_storage_path,
             logger=logger,
         )
+        if _has_retries_remaining():
+            try:
+                update_job_status(
+                    job_id,
+                    "retrying",
+                    0,
+                    error_msg,
+                    result_data=build_progress_result_data(stage="retrying"),
+                )
+            except Exception as exc:
+                logger.warning("[%s] Failed to mark job retrying: %s", job_id, exc)
+            raise
+
         _best_effort_mark_failed(job_id=job_id, clip_id=clip_id, error_msg=error_msg)
 
         raise

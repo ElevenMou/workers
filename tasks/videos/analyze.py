@@ -10,6 +10,10 @@ from config import calculate_video_analysis_cost
 from services.ai_analyzer import AIAnalyzer
 from services.transcriber import Transcriber
 from services.video_downloader import VideoDownloader
+from tasks.clips.helpers.source_video import (
+    build_raw_video_metadata_update,
+    upload_raw_video_to_storage,
+)
 from tasks.models.jobs import AnalyzeVideoJob
 from utils.workdirs import create_work_dir
 from utils.supabase_client import (
@@ -336,6 +340,18 @@ def _best_effort_mark_failed(*, job_id: str, video_id: str, error_msg: str):
         logger.warning("[%s] Failed to mark video %s failed: %s", job_id, video_id, exc)
 
 
+def _has_retries_remaining() -> bool:
+    try:
+        from rq import get_current_job
+
+        current = get_current_job()
+        if current is None:
+            return False
+        return int(getattr(current, "retries_left", 0) or 0) > 0
+    except Exception:
+        return False
+
+
 def _count_video_clips(video_id: str) -> int:
     response = (
         supabase.table("clips")
@@ -561,7 +577,25 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 billing_state=billing_state,
             )
 
-        # Update video metadata (keep raw_video_path for later clip generation)
+        raw_video_metadata = build_raw_video_metadata_update(video_path)
+        try:
+            raw_storage_path, raw_storage_etag = upload_raw_video_to_storage(
+                video_id=video_id,
+                local_video_path=video_path,
+                logger=logger,
+                job_id=job_id,
+            )
+            raw_video_metadata["raw_video_storage_path"] = raw_storage_path
+            raw_video_metadata["raw_video_storage_etag"] = raw_storage_etag
+        except Exception as exc:
+            logger.warning(
+                "[%s] Canonical raw-source upload failed for %s: %s",
+                job_id,
+                video_id,
+                exc,
+            )
+
+        # Update video metadata (keep local raw path for backward compatibility)
         update_video_status(
             video_id,
             "analyzing",
@@ -570,10 +604,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             thumbnail_url=video_data["thumbnail"],
             platform=video_data["platform"],
             external_id=video_data.get("external_id"),
-            raw_video_path=video_path,
-            raw_video_expires_at=(
-                datetime.now(timezone.utc) + timedelta(hours=24)
-            ).isoformat(),
+            **raw_video_metadata,
         )
 
         # 2. Get transcript ---------------------------------------------------
@@ -861,6 +892,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                     reservation_id=reservation_id,
                     tx_type="video_analysis",
                     description=charge_description,
+                    processing_ref=f"video_analysis:{job_id}",
                 )
                 if not capture_ok:
                     raise RuntimeError("Failed to capture video-analysis credit reservation")
@@ -902,6 +934,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                     billing_owner_user_id=billing_owner_user_id,
                     actor_user_id=user_id,
                     job_id=job_id,
+                    processing_ref=f"video_analysis:{job_id}",
                     usage_metadata=usage_metadata,
                 )
                 billing_state["status"] = "charged"
@@ -954,6 +987,19 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         error_msg = str(e)
         logger.error("[%s] Error analysing video: %s", job_id, error_msg)
         logger.debug(traceback.format_exc())
+
+        if _has_retries_remaining():
+            try:
+                update_job_status(
+                    job_id,
+                    "retrying",
+                    0,
+                    error_msg,
+                    result_data={"stage": "retrying"},
+                )
+            except Exception as exc:
+                logger.warning("[%s] Failed to update retrying status: %s", job_id, exc)
+            raise
 
         if charge_source == "owner_wallet" and reservation_id and not reservation_captured:
             try:

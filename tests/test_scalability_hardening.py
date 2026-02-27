@@ -141,9 +141,34 @@ class _FakeRedis:
     def get(self, key: str):
         return self.strings.get(key)
 
-    def set(self, key: str, value: object):
+    def set(self, key: str, value: object, nx: bool = False, ex: int | None = None):
+        del ex
+        if nx and key in self.strings:
+            return False
         self.strings[key] = value
         return True
+
+    def delete(self, key: str):
+        self.strings.pop(key, None)
+        return 1
+
+    def eval(self, script: str, _numkeys: int, *params):
+        key = str(params[0])
+        if "max_depth" in script:
+            max_depth = int(params[1])
+            current = int(self.strings.get(key, 0))
+            if current >= max_depth:
+                return -1
+            current += 1
+            if current > max_depth:
+                return -1
+            self.strings[key] = current
+            return current
+        current = int(self.strings.get(key, 0))
+        if current > 0:
+            current -= 1
+            self.strings[key] = current
+        return current
 
     def hgetall(self, key: str):
         return self.hashes.get(key, {})
@@ -203,6 +228,45 @@ def test_set_group_worker_scale_target_does_not_mutate_other_group():
 
     assert int(fake_conn.get(redis_client.WORKER_SCALE_VIDEO_KEY)) == 9
     assert int(fake_conn.get(redis_client.WORKER_SCALE_CLIP_KEY)) == 7
+
+
+def test_release_job_admission_is_idempotent():
+    fake_conn = _FakeRedis()
+    fake_conn.strings[redis_client.ADMISSION_VIDEO_KEY] = 1
+    fake_conn.strings[f"{redis_client.ADMISSION_JOB_GROUP_PREFIX}job-1"] = "video"
+
+    assert redis_client.release_job_admission("job-1", connection=fake_conn) is True
+    assert int(fake_conn.get(redis_client.ADMISSION_VIDEO_KEY)) == 0
+    assert redis_client.release_job_admission("job-1", connection=fake_conn) is False
+
+
+def test_enqueue_job_sets_retry_policy_and_admission_meta(monkeypatch):
+    fake_conn = _FakeRedis()
+    captured: dict[str, object] = {}
+
+    class _FakeQueue:
+        def enqueue(self, task_path, job_data, **kwargs):
+            captured["task_path"] = task_path
+            captured["job_data"] = job_data
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(id=kwargs.get("job_id"))
+
+    monkeypatch.setattr(redis_client, "get_redis_connection", lambda: fake_conn)
+    monkeypatch.setattr(redis_client, "get_queue", lambda _name, _conn: _FakeQueue())
+
+    result = redis_client.enqueue_job(
+        "video-processing",
+        "tasks.fake.task",
+        {"x": 1},
+        job_id="job-99",
+    )
+
+    assert result.id == "job-99"
+    kwargs = captured["kwargs"]
+    assert kwargs["job_id"] == "job-99"
+    assert kwargs["meta"]["admission_group"] == "video"
+    assert kwargs["meta"]["admission_token"] == 1
+    assert kwargs["retry"].max == 3
 
 
 def test_health_metrics_requires_auth(client):

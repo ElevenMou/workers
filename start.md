@@ -67,6 +67,13 @@ PURGE_QUEUED_JOBS_ON_START=false
 FAIL_STARTED_JOBS_ON_START=true
 FAIL_PROCESSING_ROWS_ON_START=true
 RAW_VIDEO_CLEANUP_INTERVAL_SECONDS=300
+SUPERVISOR_ROLE=worker
+WORKER_INSTANCE_ID=node-a
+MAINTENANCE_LEADER_LOCK_TTL_SECONDS=15
+MAINTENANCE_LEADER_RENEW_SECONDS=5
+FFMPEG_THREADS=2
+OMP_NUM_THREADS=1
+MKL_NUM_THREADS=1
 POLAR_ACCESS_TOKEN=polar_org_token_with_events_write_scope
 POLAR_ENV=sandbox
 POLAR_USAGE_EVENTS_ENABLED=true
@@ -79,6 +86,7 @@ POLAR_USAGE_EVENT_TIMEOUT_SECONDS=5
 
 Notes:
 - `PURGE_QUEUED_JOBS_ON_START` now defaults to `false` and should stay `false` in production.
+- Run a dedicated `maintenance-supervisor` instance with `SUPERVISOR_ROLE=maintenance`.
 - Use `WORKER_SCALE_ADMIN_USER_IDS` (comma-separated) to allow `/workers/scale` admin access.
 - Mutating API routes (`/videos/analyze`, `/clips/generate`, `/clips/custom`, `/workers/scale`) now require a valid `Authorization: Bearer <supabase-jwt>` header.
 - Polar usage event ingestion is non-blocking. If Polar is unavailable, jobs still complete and credits are still charged.

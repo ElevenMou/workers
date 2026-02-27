@@ -7,6 +7,7 @@ from pathlib import Path
 
 import ffmpeg
 
+from config import FFMPEG_THREADS
 from services.clips.constants import (
     TITLE_LINE_HEIGHT_RATIO,
     intermediate_quality_preset,
@@ -15,6 +16,7 @@ from services.clips.constants import (
 from services.clips.models import QualityPreset
 
 logger = logging.getLogger(__name__)
+_FFMPEG_THREADS = max(1, int(FFMPEG_THREADS))
 
 _VALID_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -35,6 +37,10 @@ def safe_remove(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+def _ffmpeg_thread_args() -> dict[str, int]:
+    return {"threads": _FFMPEG_THREADS}
 
 
 def _probe_media_duration(path: str) -> float:
@@ -260,6 +266,7 @@ def extract_segment(
                 acodec="aac",
                 crf=qp["crf"],
                 preset=qp["preset"],
+                **_ffmpeg_thread_args(),
                 pix_fmt="yuv420p",
                 ar=48000,
                 audio_bitrate="256k",
@@ -338,7 +345,7 @@ def create_portrait_background(
             .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase", flags="lanczos")
             .filter("crop", canvas_w, canvas_h)
             .filter("boxblur", blur_strength)
-            .output(bg_temp)
+            .output(bg_temp, **_ffmpeg_thread_args())
             .overwrite_output()
             .run(quiet=True)
         )
@@ -354,6 +361,7 @@ def create_portrait_background(
                 acodec="aac",
                 crf=qp["crf"],
                 preset=qp["preset"],
+                **_ffmpeg_thread_args(),
             )
             .overwrite_output()
             .run(quiet=True)
@@ -381,6 +389,7 @@ def create_portrait_background(
                 acodec="aac",
                 crf=qp["crf"],
                 preset=qp["preset"],
+                **_ffmpeg_thread_args(),
                 shortest=None,
             )
             .overwrite_output()
@@ -414,6 +423,7 @@ def create_portrait_background(
                 acodec="aac",
                 crf=qp["crf"],
                 preset=qp["preset"],
+                **_ffmpeg_thread_args(),
                 shortest=None,
             )
             .overwrite_output()
@@ -432,6 +442,7 @@ def create_portrait_background(
             acodec="aac",
             crf=qp["crf"],
             preset=qp["preset"],
+            **_ffmpeg_thread_args(),
         )
         .overwrite_output()
         .run(quiet=True)
@@ -566,6 +577,7 @@ def add_overlays(
                 acodec="aac",
                 crf=qp["crf"],
                 preset=qp["preset"],
+                **_ffmpeg_thread_args(),
                 pix_fmt="yuv420p",
                 audio_bitrate="256k",
                 colorspace="bt709",
@@ -794,6 +806,7 @@ def compose_clip(
                 acodec="aac",
                 crf=qp["crf"],
                 preset=qp["preset"],
+                **_ffmpeg_thread_args(),
                 pix_fmt="yuv420p",
                 audio_bitrate="256k",
                 colorspace="bt709",
@@ -877,6 +890,7 @@ def _prepare_intro_outro_segment(
                 acodec="aac",
                 crf=qp["crf"],
                 preset=qp["preset"],
+                **_ffmpeg_thread_args(),
                 pix_fmt="yuv420p",
                 audio_bitrate="256k",
                 colorspace="bt709",
@@ -998,6 +1012,7 @@ def concat_intro_outro(
                 acodec="aac",
                 crf=qp["crf"],
                 preset=qp["preset"],
+                **_ffmpeg_thread_args(),
                 pix_fmt="yuv420p",
                 audio_bitrate="256k",
                 colorspace="bt709",

@@ -5,7 +5,9 @@ FROM python:3.11-slim AS base
 
 # Prevent Python from buffering stdout/stderr (important for Docker logs)
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1
 
 # System dependencies:
 #   ffmpeg  - video processing (ffmpeg-python, yt-dlp)
