@@ -58,6 +58,31 @@ from utils.supabase_client import (
 logger = logging.getLogger(__name__)
 
 
+def _warn_low_source_resolution_for_high_output(
+    *,
+    job_id: str,
+    video_id: str,
+    output_quality: str,
+    source_width: int,
+    source_height: int,
+    source_strategy: str,
+) -> bool:
+    if str(output_quality).strip().lower() != "high":
+        return False
+    if int(source_height) > 480:
+        return False
+    logger.warning(
+        "[%s] High output quality requested but source video is low resolution "
+        "(%dx%d via %s for %s); continuing with source constraints.",
+        job_id,
+        int(source_width),
+        int(source_height),
+        source_strategy,
+        video_id,
+    )
+    return True
+
+
 def _best_effort_mark_failed(
     *,
     job_id: str,
@@ -317,6 +342,8 @@ def custom_clip_task(job_data: CustomClipJob):
             on_download_start=_emit_downloading_source,
         )
         video_path = source_resolution.video_path
+        src_w = int(source_resolution.width)
+        src_h = int(source_resolution.height)
         source_video_strategy = str(source_resolution.strategy)
         source_video_wait_seconds = float(source_resolution.wait_seconds)
         source_video_download_seconds = float(source_resolution.download_seconds)
@@ -339,6 +366,14 @@ def custom_clip_task(job_data: CustomClipJob):
                 else "best"
             ),
             quality_policy_profile or "none",
+        )
+        _warn_low_source_resolution_for_high_output(
+            job_id=job_id,
+            video_id=video_id,
+            output_quality=output_quality,
+            source_width=src_w,
+            source_height=src_h,
+            source_strategy=source_video_strategy,
         )
 
         download_metadata = source_resolution.download_metadata or {}

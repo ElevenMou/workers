@@ -47,6 +47,49 @@ def _flatten_cleaned_words(cleaned_transcript: dict) -> list[str]:
     return words
 
 
+def test_generate_warns_for_low_source_resolution_when_output_is_high(monkeypatch):
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        generate_task_module.logger,
+        "warning",
+        lambda message, *args: warnings.append(message % args if args else message),
+    )
+
+    warned = generate_task_module._warn_low_source_resolution_for_high_output(
+        job_id="job-1",
+        video_id="video-1",
+        output_quality="high",
+        source_width=640,
+        source_height=360,
+        source_strategy="downloaded_now",
+    )
+
+    assert warned is True
+    assert len(warnings) == 1
+    assert "low resolution" in warnings[0]
+
+
+def test_custom_does_not_warn_for_non_high_output_quality(monkeypatch):
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        custom_task_module.logger,
+        "warning",
+        lambda message, *args: warnings.append(message % args if args else message),
+    )
+
+    warned = custom_task_module._warn_low_source_resolution_for_high_output(
+        job_id="job-2",
+        video_id="video-2",
+        output_quality="medium",
+        source_width=640,
+        source_height=360,
+        source_strategy="downloaded_now",
+    )
+
+    assert warned is False
+    assert warnings == []
+
+
 def test_plan_expands_requested_window_to_word_boundaries(monkeypatch):
     monkeypatch.setattr(
         smart_cleanup,

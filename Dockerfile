@@ -10,10 +10,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # System dependencies:
 #   ffmpeg  - video processing (ffmpeg-python, yt-dlp)
 #   git     - pip install openai-whisper from GitHub
+#   nodejs  - yt-dlp JS runtime for YouTube extraction hardening
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
+    nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

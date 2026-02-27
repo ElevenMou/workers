@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import pytest
+import yt_dlp
 
 from config import (
     YTDLP_DOWNLOAD_RETRIES,
@@ -355,9 +356,11 @@ def test_resolve_source_video_times_out_when_lock_is_never_released(monkeypatch)
 
 def test_video_downloader_base_options_include_hardening_flags():
     opts = VideoDownloader._base_ydl_opts()
-    assert opts["format"] == "bv*+ba/b"
+    assert opts["format"] == VideoDownloader._format_selector_for_max_height(1080)
     assert "height<=720" not in opts["format"]
     assert opts["noplaylist"] is True
+    assert "extractor_args" not in opts
+    assert set((opts.get("js_runtimes") or {}).keys()) == {"node", "deno"}
     assert opts["socket_timeout"] == YTDLP_SOCKET_TIMEOUT_SECONDS
     assert opts["retries"] == YTDLP_DOWNLOAD_RETRIES
     assert opts["fragment_retries"] == YTDLP_FRAGMENT_RETRIES
@@ -377,8 +380,10 @@ def test_video_downloader_fallback_selector_is_not_720_limited(
         *,
         format_selector: str,
         attempt_label: str,
+        max_height: int | None = 1080,
+        ydl_overrides: dict[str, object] | None = None,
     ):
-        del self, url, output_path
+        del self, url, output_path, max_height, ydl_overrides
         selectors.append((attempt_label, format_selector))
         return {
             "title": "Video",
@@ -398,6 +403,92 @@ def test_video_downloader_fallback_selector_is_not_720_limited(
     result = downloader.download("https://example.com/video", "video-123")
 
     assert result["path"].endswith("video-123.mp4")
-    assert selectors[0] == ("primary_av_merge", "bv*+ba/b")
+    assert selectors[0] == (
+        "primary_av_merge_default",
+        VideoDownloader._format_selector_for_max_height(1080),
+    )
     assert selectors[1][0] == "fallback_muxed_av"
     assert "height<=720" not in selectors[1][1]
+
+
+def test_video_downloader_retries_legacy_clients_for_youtube_on_primary_error(
+    monkeypatch,
+    tmp_path: Path,
+):
+    attempts: list[tuple[str, dict[str, object] | None]] = []
+
+    def _fake_download_with_opts(
+        self,
+        url: str,
+        output_path: str,
+        *,
+        format_selector: str,
+        attempt_label: str,
+        max_height: int | None = 1080,
+        ydl_overrides: dict[str, object] | None = None,
+    ):
+        del self, url, output_path, format_selector, max_height
+        attempts.append((attempt_label, ydl_overrides))
+        if attempt_label == "primary_av_merge_default":
+            raise yt_dlp.utils.DownloadError("primary failed")
+        return {
+            "title": "Video",
+            "duration": 10,
+            "thumbnail": None,
+            "extractor_key": "youtube",
+            "id": "abc123",
+        }
+
+    monkeypatch.setattr(video_downloader_module, "_validate_url", lambda _url: None)
+    monkeypatch.setattr(VideoDownloader, "_download_with_opts", _fake_download_with_opts)
+    monkeypatch.setattr(VideoDownloader, "_resolve_output_path", lambda _self, path: path)
+    monkeypatch.setattr(VideoDownloader, "_has_audio_stream", lambda _self, _path: True)
+
+    downloader = VideoDownloader(work_dir=str(tmp_path))
+    result = downloader.download("https://www.youtube.com/watch?v=abc123", "video-123")
+
+    assert result["path"].endswith("video-123.mp4")
+    assert attempts[0] == ("primary_av_merge_default", None)
+    assert attempts[1] == (
+        "primary_av_merge_legacy_clients",
+        {"extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}},
+    )
+    assert len(attempts) == 2
+
+
+def test_video_downloader_no_legacy_retry_when_primary_succeeds(
+    monkeypatch,
+    tmp_path: Path,
+):
+    attempts: list[tuple[str, dict[str, object] | None]] = []
+
+    def _fake_download_with_opts(
+        self,
+        url: str,
+        output_path: str,
+        *,
+        format_selector: str,
+        attempt_label: str,
+        max_height: int | None = 1080,
+        ydl_overrides: dict[str, object] | None = None,
+    ):
+        del self, url, output_path, format_selector, max_height
+        attempts.append((attempt_label, ydl_overrides))
+        return {
+            "title": "Video",
+            "duration": 10,
+            "thumbnail": None,
+            "extractor_key": "youtube",
+            "id": "abc123",
+        }
+
+    monkeypatch.setattr(video_downloader_module, "_validate_url", lambda _url: None)
+    monkeypatch.setattr(VideoDownloader, "_download_with_opts", _fake_download_with_opts)
+    monkeypatch.setattr(VideoDownloader, "_resolve_output_path", lambda _self, path: path)
+    monkeypatch.setattr(VideoDownloader, "_has_audio_stream", lambda _self, _path: True)
+
+    downloader = VideoDownloader(work_dir=str(tmp_path))
+    result = downloader.download("https://www.youtube.com/watch?v=abc123", "video-123")
+
+    assert result["path"].endswith("video-123.mp4")
+    assert attempts == [("primary_av_merge_default", None)]

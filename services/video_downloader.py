@@ -54,6 +54,12 @@ _ALLOWED_DOMAINS: set[str] = {
     "streamable.com",
     "www.streamable.com",
 }
+_YOUTUBE_DOMAINS: set[str] = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "youtu.be",
+}
 
 
 def _validate_url(url: str) -> None:
@@ -144,8 +150,8 @@ class VideoDownloader:
             "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
             "merge_output_format": "mp4",
             "noplaylist": True,
-            # Try multiple YouTube client profiles to avoid signature/403 issues
-            "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
+            # Enable JS runtimes for YouTube challenge solving hardening.
+            "js_runtimes": {"node": {}, "deno": {}},
             # Set a desktop UA to reduce throttling/403
             "http_headers": {
                 "User-Agent": (
@@ -221,6 +227,11 @@ class VideoDownloader:
             return expected_path
         return max(candidates, key=os.path.getmtime)
 
+    @staticmethod
+    def _is_youtube_url(url: str) -> bool:
+        hostname = (urlparse(url).hostname or "").strip().lower()
+        return hostname in _YOUTUBE_DOMAINS
+
     def _download_with_opts(
         self,
         url: str,
@@ -229,6 +240,7 @@ class VideoDownloader:
         format_selector: str,
         attempt_label: str,
         max_height: int | None = 1080,
+        ydl_overrides: dict[str, object] | None = None,
     ) -> dict:
         ydl_opts = self._base_ydl_opts(max_height=max_height)
         ydl_opts.update(
@@ -239,6 +251,8 @@ class VideoDownloader:
                 "no_warnings": False,
             }
         )
+        if ydl_overrides:
+            ydl_opts.update(ydl_overrides)
         started_at = time.monotonic()
         video_hint = os.path.splitext(os.path.basename(output_path))[0]
         logger.info(
@@ -274,14 +288,33 @@ class VideoDownloader:
         output_path = os.path.join(self.temp_dir, f"{video_id}.mp4")
         normalized_max_height = self._normalize_max_height(max_height)
         primary_selector = self._format_selector_for_max_height(normalized_max_height)
-
-        info = self._download_with_opts(
-            url,
-            output_path,
-            format_selector=primary_selector,
-            attempt_label="primary_av_merge",
-            max_height=normalized_max_height,
-        )
+        legacy_client_overrides = {
+            "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}
+        }
+        try:
+            info = self._download_with_opts(
+                url,
+                output_path,
+                format_selector=primary_selector,
+                attempt_label="primary_av_merge_default",
+                max_height=normalized_max_height,
+            )
+        except yt_dlp.utils.DownloadError as exc:
+            if not self._is_youtube_url(url):
+                raise
+            logger.warning(
+                "yt-dlp default-client download failed for %s; retrying with legacy YouTube clients: %s",
+                video_id,
+                exc,
+            )
+            info = self._download_with_opts(
+                url,
+                output_path,
+                format_selector=primary_selector,
+                attempt_label="primary_av_merge_legacy_clients",
+                max_height=normalized_max_height,
+                ydl_overrides=legacy_client_overrides,
+            )
         downloaded_path = self._resolve_output_path(output_path)
 
         if not self._has_audio_stream(downloaded_path):
