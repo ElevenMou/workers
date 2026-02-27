@@ -37,6 +37,28 @@ def safe_remove(path: str) -> None:
         pass
 
 
+def _probe_media_duration(path: str) -> float:
+    try:
+        probe = ffmpeg.probe(path)
+    except Exception:
+        return 0.0
+
+    try:
+        return max(0.0, float(probe.get("format", {}).get("duration", 0.0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _media_has_audio(path: str) -> bool:
+    try:
+        probe = ffmpeg.probe(path)
+    except Exception:
+        return False
+
+    streams = probe.get("streams", [])
+    return any(stream.get("codec_type") == "audio" for stream in streams)
+
+
 def _resolve_caption_fonts_dir() -> str | None:
     candidates = [
         os.getenv("CAPTION_FONTS_DIR"),
@@ -553,6 +575,211 @@ def add_overlays(
             safe_remove(temp_file)
 
 
+def compose_clip(
+    input_path: str,
+    output_path: str,
+    *,
+    style: str,
+    canvas_w: int,
+    canvas_h: int,
+    vid_w: int,
+    vid_h: int,
+    vid_x: int,
+    vid_y: int,
+    blur_strength: int,
+    video_scale_mode: str,
+    title_lines: list[str],
+    title_show: bool,
+    title_font_size: int,
+    title_font_color: str,
+    title_font_family: str,
+    title_align: str,
+    title_stroke_width: int,
+    title_stroke_color: str,
+    title_bar_enabled: bool,
+    title_bar_color: str,
+    title_bar_x: int,
+    title_bar_w: int,
+    title_padding_x: int,
+    title_bar_y: int,
+    title_text_y: int,
+    title_bar_h: int,
+    caption_ass_path: str | None,
+    qp: QualityPreset,
+    overlay_file_path: str | None = None,
+    overlay_cfg: dict | None = None,
+    background_color: str = "#000000",
+    background_image_path: str | None = None,
+) -> None:
+    """Compose background, source video, title/captions, and overlay in one pass."""
+    logger.info(
+        "Compositing clip (style=%s, overlay=%s, captions=%s, title=%s)",
+        style,
+        bool(overlay_file_path),
+        bool(caption_ass_path),
+        bool(title_show and title_lines),
+    )
+
+    duration_seconds = max(0.1, _probe_media_duration(input_path))
+    scale_mode = normalize_video_scale_mode(video_scale_mode)
+    source = ffmpeg.input(input_path)
+
+    foreground = source.video.filter(
+        "scale",
+        vid_w,
+        vid_h,
+        force_original_aspect_ratio="increase" if scale_mode == "fill" else "decrease",
+    )
+    if scale_mode == "fill":
+        foreground = foreground.filter("crop", vid_w, vid_h)
+
+    if style == "blur":
+        background = (
+            source.video.filter(
+                "scale", canvas_w, canvas_h, force_original_aspect_ratio="increase"
+            )
+            .filter("crop", canvas_w, canvas_h)
+            .filter("boxblur", blur_strength)
+        )
+        stream = ffmpeg.filter([background, foreground], "overlay", vid_x, vid_y)
+    elif style == "solid_color":
+        safe_color = _sanitize_color(background_color)
+        background = ffmpeg.input(
+            f"color=c={safe_color}:s={canvas_w}x{canvas_h}:d={duration_seconds}",
+            f="lavfi",
+        ).video
+        stream = ffmpeg.filter([background, foreground], "overlay", vid_x, vid_y)
+    elif style == "image" and background_image_path:
+        background = (
+            ffmpeg.input(
+                background_image_path,
+                loop=1,
+                t=duration_seconds,
+                framerate=30,
+            )
+            .video.filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase")
+            .filter("crop", canvas_w, canvas_h)
+        )
+        stream = ffmpeg.filter([background, foreground], "overlay", vid_x, vid_y)
+    else:
+        stream = foreground.filter(
+            "pad",
+            canvas_w,
+            canvas_h,
+            vid_x,
+            vid_y,
+            _sanitize_color(background_color),
+        )
+
+    temp_files: list[str] = []
+    if title_show and title_lines:
+        if title_bar_enabled:
+            stream = stream.drawbox(
+                x=max(0, int(title_bar_x)),
+                y=title_bar_y,
+                width=max(2, int(title_bar_w)),
+                height=title_bar_h,
+                color=_sanitize_color(title_bar_color),
+                t="fill",
+            )
+        try:
+            title_ass_path = _build_title_ass(
+                title_lines=title_lines,
+                duration_seconds=duration_seconds,
+                output_path=f"{output_path}.title.ass",
+                canvas_w=canvas_w,
+                canvas_h=canvas_h,
+                title_font_size=title_font_size,
+                title_font_color=title_font_color,
+                title_font_family=title_font_family,
+                title_align=title_align,
+                title_stroke_width=title_stroke_width,
+                title_stroke_color=title_stroke_color,
+                title_padding_x=title_padding_x,
+                title_text_y=title_text_y,
+                title_area_x=title_bar_x,
+                title_area_w=title_bar_w,
+            )
+            if title_ass_path:
+                temp_files.append(title_ass_path)
+                normalized_title_ass = _normalize_ass_filter_path(title_ass_path)
+                fonts_dir = _resolve_caption_fonts_dir()
+                if fonts_dir:
+                    normalized_fonts = _normalize_ass_filter_path(fonts_dir)
+                    stream = stream.filter(
+                        "ass",
+                        filename=normalized_title_ass,
+                        fontsdir=normalized_fonts,
+                    )
+                else:
+                    stream = stream.filter("ass", filename=normalized_title_ass)
+        except Exception:
+            logger.exception("Failed to build title ASS; continuing without title text overlay")
+
+    if caption_ass_path and os.path.isfile(caption_ass_path):
+        normalized_ass_path = _normalize_ass_filter_path(caption_ass_path)
+        fonts_dir = _resolve_caption_fonts_dir()
+        if fonts_dir:
+            normalized_fonts_dir = _normalize_ass_filter_path(fonts_dir)
+            stream = stream.filter(
+                "ass",
+                filename=normalized_ass_path,
+                fontsdir=normalized_fonts_dir,
+            )
+        else:
+            stream = stream.filter("ass", filename=normalized_ass_path)
+
+    if (
+        overlay_file_path
+        and os.path.isfile(overlay_file_path)
+        and overlay_cfg
+        and overlay_cfg.get("enabled")
+    ):
+        overlay_x = max(0, int(overlay_cfg.get("x", 0)))
+        overlay_y = max(0, int(overlay_cfg.get("y", 0)))
+        overlay_w = max(1, min(1920, int(overlay_cfg.get("widthPx", 200))))
+        overlay_input = ffmpeg.input(overlay_file_path).filter("scale", overlay_w, -1)
+        stream = ffmpeg.filter([stream, overlay_input], "overlay", overlay_x, overlay_y)
+
+    audio_stream = source.audio if _media_has_audio(input_path) else None
+    if audio_stream is None:
+        audio_stream = ffmpeg.input(
+            "anullsrc=r=44100:cl=stereo",
+            f="lavfi",
+            t=duration_seconds,
+        ).audio
+    audio_stream = audio_stream.filter("aresample", 44100).filter(
+        "aformat",
+        sample_rates=44100,
+        channel_layouts="stereo",
+    )
+
+    try:
+        (
+            ffmpeg.output(
+                stream,
+                audio_stream,
+                output_path,
+                vcodec="libx264",
+                acodec="aac",
+                crf=qp["crf"],
+                preset=qp["preset"],
+                pix_fmt="yuv420p",
+                audio_bitrate="192k",
+                movflags="+faststart",
+            )
+            .overwrite_output()
+            .run(capture_stderr=True)
+        )
+    except ffmpeg.Error as e:
+        stderr_output = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+        logger.error("FFmpeg compose failed:\n%s", stderr_output)
+        raise
+    finally:
+        for temp_file in temp_files:
+            safe_remove(temp_file)
+
+
 def _prepare_intro_outro_segment(
     file_path: str,
     cfg: dict,
@@ -566,56 +793,64 @@ def _prepare_intro_outro_segment(
     Returns the path to the normalised segment on success, ``None`` on failure.
     """
     media_type = cfg.get("type", "image")
+    duration = max(0.5, min(60.0, float(cfg.get("durationSeconds", 3.0))))
     try:
         if media_type == "image":
-            duration = max(0.5, min(60.0, float(cfg.get("durationSeconds", 3.0))))
-            img = (
+            video_stream = (
                 ffmpeg.input(file_path, loop=1, t=duration, framerate=30)
                 .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="decrease")
                 .filter("pad", canvas_w, canvas_h, "(ow-iw)/2", "(oh-ih)/2", color="black")
+                .filter("setsar", "1")
+                .filter("fps", 30)
+                .filter("setpts", "PTS-STARTPTS")
             )
-            silent = ffmpeg.input(
-                f"anullsrc=r=44100:cl=stereo",
+            audio_stream = ffmpeg.input(
+                "anullsrc=r=44100:cl=stereo",
                 f="lavfi",
                 t=duration,
-            )
-            (
-                ffmpeg.output(
-                    img,
-                    silent,
-                    output_path,
-                    vcodec="libx264",
-                    acodec="aac",
-                    crf=qp["crf"],
-                    preset=qp["preset"],
-                    pix_fmt="yuv420p",
-                    shortest=None,
-                )
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            ).audio
         else:
-            # Video type — scale/pad to canvas size.
-            video = (
-                ffmpeg.input(file_path)
+            # Video type: trim to configured duration before scaling/padding.
+            segment_input = ffmpeg.input(file_path, ss=0, t=duration)
+            video_stream = (
+                segment_input.video
                 .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="decrease")
                 .filter("pad", canvas_w, canvas_h, "(ow-iw)/2", "(oh-ih)/2", color="black")
+                .filter("setsar", "1")
+                .filter("fps", 30)
+                .filter("setpts", "PTS-STARTPTS")
             )
-            audio = ffmpeg.input(file_path).audio
-            (
-                ffmpeg.output(
-                    video,
-                    audio,
-                    output_path,
-                    vcodec="libx264",
-                    acodec="aac",
-                    crf=qp["crf"],
-                    preset=qp["preset"],
-                    pix_fmt="yuv420p",
+
+            if _media_has_audio(file_path):
+                audio_stream = (
+                    segment_input.audio.filter("atrim", duration=duration)
+                    .filter("asetpts", "PTS-STARTPTS")
+                    .filter("aresample", 44100)
+                    .filter("aformat", sample_rates=44100, channel_layouts="stereo")
                 )
-                .overwrite_output()
-                .run(quiet=True)
+            else:
+                audio_stream = ffmpeg.input(
+                    "anullsrc=r=44100:cl=stereo",
+                    f="lavfi",
+                    t=duration,
+                ).audio
+
+        (
+            ffmpeg.output(
+                video_stream,
+                audio_stream,
+                output_path,
+                vcodec="libx264",
+                acodec="aac",
+                crf=qp["crf"],
+                preset=qp["preset"],
+                pix_fmt="yuv420p",
+                movflags="+faststart",
+                shortest=None,
             )
+            .overwrite_output()
+            .run(quiet=True)
+        )
         return output_path
     except Exception:
         logger.exception("Failed to prepare intro/outro segment from %s", file_path)
@@ -635,12 +870,10 @@ def concat_intro_outro(
     canvas_w: int,
     canvas_h: int,
 ) -> list[str]:
-    """Prepend intro and/or append outro to main clip using FFmpeg concat demuxer.
+    """Prepend intro and/or append outro to main clip using FFmpeg concat filter.
 
     Returns a list of temporary intermediate files created (caller should clean up).
     """
-    import tempfile
-
     intermediates: list[str] = []
     segments: list[str] = []
 
@@ -669,29 +902,65 @@ def concat_intro_outro(
             intermediates.append(outro_norm)
 
     if len(segments) <= 1:
-        # Nothing to concat — main clip is the only segment.
         return intermediates
 
-    logger.info("Concatenating %d segments (intro=%s, outro=%s)", len(segments),
-                bool(intro_file_path), bool(outro_file_path))
-
-    # Write a concat list file.
-    concat_list_path = main_clip_path + ".concat.txt"
-    intermediates.append(concat_list_path)
-    with open(concat_list_path, "w", encoding="utf-8") as f:
-        for seg in segments:
-            safe_path = seg.replace("\\", "/").replace("'", "'\\''")
-            f.write(f"file '{safe_path}'\n")
+    logger.info(
+        "Concatenating %d segments (intro=%s, outro=%s)",
+        len(segments),
+        bool(intro_file_path),
+        bool(outro_file_path),
+    )
 
     try:
+        concat_inputs: list = []
+        for segment_path in segments:
+            segment_input = ffmpeg.input(segment_path)
+            segment_duration = max(0.1, _probe_media_duration(segment_path))
+
+            segment_video = (
+                segment_input.video
+                .filter("fps", 30)
+                .filter(
+                    "scale",
+                    canvas_w,
+                    canvas_h,
+                    force_original_aspect_ratio="decrease",
+                )
+                .filter("pad", canvas_w, canvas_h, "(ow-iw)/2", "(oh-ih)/2", color="black")
+                .filter("setsar", "1")
+                .filter("trim", duration=segment_duration)
+                .filter("setpts", "PTS-STARTPTS")
+            )
+
+            if _media_has_audio(segment_path):
+                segment_audio = (
+                    segment_input.audio.filter("atrim", duration=segment_duration)
+                    .filter("asetpts", "PTS-STARTPTS")
+                    .filter("aresample", 44100)
+                    .filter("aformat", sample_rates=44100, channel_layouts="stereo")
+                )
+            else:
+                segment_audio = ffmpeg.input(
+                    "anullsrc=r=44100:cl=stereo",
+                    f="lavfi",
+                    t=segment_duration,
+                ).audio
+
+            concat_inputs.extend([segment_video, segment_audio])
+
+        concat_node = ffmpeg.concat(*concat_inputs, v=1, a=1).node
+        concat_video = concat_node[0]
+        concat_audio = concat_node[1]
         (
-            ffmpeg.input(concat_list_path, f="concat", safe=0)
-            .output(
+            ffmpeg.output(
+                concat_video,
+                concat_audio,
                 output_path,
                 vcodec="libx264",
                 acodec="aac",
                 crf=qp["crf"],
                 preset=qp["preset"],
+                pix_fmt="yuv420p",
                 movflags="+faststart",
             )
             .overwrite_output()

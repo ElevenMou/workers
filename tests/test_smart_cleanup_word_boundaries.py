@@ -223,7 +223,11 @@ def test_generate_flow_reuses_existing_word_timing_for_smart_cleanup(monkeypatch
     )
     monkeypatch.setattr(generate_task_module, "assert_response_ok", lambda *_a, **_k: None)
     monkeypatch.setattr(generate_task_module, "_is_latest_generate_job_for_clip", lambda **_k: True)
-    monkeypatch.setattr(generate_task_module, "_best_effort_cleanup_uploaded_artifacts", lambda **_k: None)
+    monkeypatch.setattr(
+        generate_task_module,
+        "best_effort_cleanup_uploaded_artifacts",
+        lambda **_k: None,
+    )
     monkeypatch.setattr(generate_task_module, "_best_effort_mark_failed", lambda **_k: None)
     monkeypatch.setattr(generate_task_module, "update_job_status", lambda *_a, **_k: None)
     monkeypatch.setattr(generate_task_module, "has_sufficient_credits", lambda **_k: True)
@@ -253,6 +257,9 @@ def test_generate_flow_reuses_existing_word_timing_for_smart_cleanup(monkeypatch
             layout_video={},
             layout_title={},
             layout_captions={},
+            layout_intro={},
+            layout_outro={},
+            layout_overlay={},
             bg_image_storage_path=None,
         ),
     )
@@ -275,6 +282,9 @@ def test_generate_flow_reuses_existing_word_timing_for_smart_cleanup(monkeypatch
                 "positionY": "top",
             },
             {"show": False},
+            {"enabled": False, "type": "image", "storagePath": "", "durationSeconds": 3.0},
+            {"enabled": False, "type": "image", "storagePath": "", "durationSeconds": 3.0},
+            {"enabled": False, "storagePath": "", "widthPx": 200, "x": 0, "y": 0},
         ),
     )
     monkeypatch.setattr(
@@ -330,7 +340,11 @@ def test_custom_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_pat
         ),
     )
     monkeypatch.setattr(custom_task_module, "assert_response_ok", lambda *_a, **_k: None)
-    monkeypatch.setattr(custom_task_module, "_best_effort_cleanup_uploaded_artifacts", lambda **_k: None)
+    monkeypatch.setattr(
+        custom_task_module,
+        "best_effort_cleanup_uploaded_artifacts",
+        lambda **_k: None,
+    )
     monkeypatch.setattr(custom_task_module, "_best_effort_mark_failed", lambda **_k: None)
     monkeypatch.setattr(custom_task_module, "update_job_status", lambda *_a, **_k: None)
     monkeypatch.setattr(custom_task_module, "update_video_status", lambda *_a, **_k: None)
@@ -353,6 +367,9 @@ def test_custom_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_pat
             layout_video={},
             layout_title={},
             layout_captions={},
+            layout_intro={},
+            layout_outro={},
+            layout_overlay={},
             bg_image_storage_path=None,
         ),
     )
@@ -375,6 +392,9 @@ def test_custom_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_pat
                 "positionY": "top",
             },
             {"show": False},
+            {"enabled": False, "type": "image", "storagePath": "", "durationSeconds": 3.0},
+            {"enabled": False, "type": "image", "storagePath": "", "durationSeconds": 3.0},
+            {"enabled": False, "storagePath": "", "widthPx": 200, "x": 0, "y": 0},
         ),
     )
     monkeypatch.setattr(

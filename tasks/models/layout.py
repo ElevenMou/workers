@@ -126,7 +126,7 @@ class IntroOutroLayout(TypedDict, total=False):
     enabled: bool
     type: str  # "video" or "image"
     storagePath: str
-    durationSeconds: float  # used when type == "image"
+    durationSeconds: float  # applied to both image and video segments
 
 
 class OverlayLayout(TypedDict, total=False):

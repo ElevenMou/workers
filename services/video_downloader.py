@@ -105,9 +105,9 @@ class VideoDownloader:
     @staticmethod
     def _base_ydl_opts() -> dict:
         return {
-            # Prefer separate A/V streams (merged locally), then muxed fallback.
-            # This avoids silent "video-only" files for sources with fragmented media.
-            "format": "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
+            # Prefer best separate A/V streams (merged locally), then muxed fallback.
+            # This preserves maximum source quality before clip rendering.
+            "format": "bv*+ba/b",
             "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
             "merge_output_format": "mp4",
             "noplaylist": True,
@@ -126,6 +126,47 @@ class VideoDownloader:
             "fragment_retries": YTDLP_FRAGMENT_RETRIES,
             "extractor_retries": YTDLP_EXTRACTOR_RETRIES,
         }
+
+    @staticmethod
+    def _selected_format_summary(info: dict) -> list[dict[str, object]]:
+        selected = info.get("requested_formats")
+        entries = selected if isinstance(selected, list) and selected else [info]
+        summaries: list[dict[str, object]] = []
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            summaries.append(
+                {
+                    "format_id": entry.get("format_id"),
+                    "ext": entry.get("ext"),
+                    "height": entry.get("height"),
+                    "vcodec": entry.get("vcodec"),
+                    "acodec": entry.get("acodec"),
+                    "fps": entry.get("fps"),
+                }
+            )
+
+        return summaries
+
+    @staticmethod
+    def _format_summary_text(summaries: list[dict[str, object]]) -> str:
+        if not summaries:
+            return "unknown"
+
+        tokens: list[str] = []
+        for summary in summaries:
+            tokens.append(
+                "id={format_id} ext={ext} height={height} fps={fps} vcodec={vcodec} acodec={acodec}".format(
+                    format_id=summary.get("format_id") or "-",
+                    ext=summary.get("ext") or "-",
+                    height=summary.get("height") or "-",
+                    fps=summary.get("fps") or "-",
+                    vcodec=summary.get("vcodec") or "-",
+                    acodec=summary.get("acodec") or "-",
+                )
+            )
+        return "; ".join(tokens)
 
     @staticmethod
     def _has_audio_stream(video_path: str) -> bool:
@@ -177,7 +218,13 @@ class VideoDownloader:
         )
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=True)
+                info = ydl.extract_info(url, download=True)
+                logger.info(
+                    "yt-dlp selected formats (%s): %s",
+                    attempt_label,
+                    self._format_summary_text(self._selected_format_summary(info)),
+                )
+                return info
         finally:
             elapsed = time.monotonic() - started_at
             logger.info(
@@ -195,7 +242,7 @@ class VideoDownloader:
         info = self._download_with_opts(
             url,
             output_path,
-            format_selector="bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
+            format_selector="bv*+ba/b",
             attempt_label="primary_av_merge",
         )
         downloaded_path = self._resolve_output_path(output_path)
@@ -214,8 +261,8 @@ class VideoDownloader:
                 url,
                 output_path,
                 format_selector=(
-                    "b[ext=mp4][height<=720][vcodec!=none][acodec!=none]/"
-                    "b[height<=720][vcodec!=none][acodec!=none]/"
+                    "b[ext=mp4][vcodec!=none][acodec!=none]/"
+                    "b[vcodec!=none][acodec!=none]/"
                     "b[vcodec!=none][acodec!=none]"
                 ),
                 attempt_label="fallback_muxed_av",

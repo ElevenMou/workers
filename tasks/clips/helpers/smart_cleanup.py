@@ -7,6 +7,7 @@ tokens and compresses long silences.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -21,6 +22,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - import-time guard for local envs
     stopwordsiso = None
 
+logger = logging.getLogger(__name__)
+
 BALANCED_SILENCE_CUTOFF_SECONDS = 0.55
 BALANCED_RETAINED_SILENCE_SECONDS = 0.18
 BALANCED_SILENCE_BOUNDARY_GUARD_SECONDS = 0.08
@@ -32,6 +35,7 @@ BALANCED_STOPWORD_MAX_DURATION_SECONDS = 0.22
 BALANCED_STOPWORD_MAX_CHARS = 5
 _MIN_INTERVAL_SECONDS = 0.01
 _SEGMENT_BREAK_GAP_SECONDS = 0.9
+_RENDER_MIN_INTERVAL_SECONDS = 0.05
 DEFAULT_SMART_CLEANUP_LANGUAGE = "en"
 _LANGUAGE_FIELD_KEYS = (
     "language",
@@ -968,6 +972,23 @@ def _probe_video_duration_seconds(path: str) -> float:
     return duration
 
 
+def _probe_source_metadata(path: str) -> tuple[float, bool]:
+    """Return source duration (seconds) and whether an audio stream exists."""
+    try:
+        probe = ffmpeg_lib.probe(path)
+    except Exception:
+        return (0.0, False)
+
+    try:
+        duration = max(0.0, float(probe.get("format", {}).get("duration") or 0.0))
+    except (TypeError, ValueError):
+        duration = 0.0
+
+    streams = probe.get("streams", [])
+    has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
+    return (duration, has_audio)
+
+
 def render_condensed_video_from_keep_intervals(
     *,
     input_video_path: str,
@@ -980,29 +1001,91 @@ def render_condensed_video_from_keep_intervals(
     if not keep_intervals:
         raise RuntimeError("Cannot render Smart Cleanup output without keep intervals.")
 
+    source_duration, source_has_audio = _probe_source_metadata(input_video_path)
     segment_paths: list[str] = []
     for index, (start, end) in enumerate(keep_intervals):
-        duration = float(end) - float(start)
-        if duration < _MIN_INTERVAL_SECONDS:
+        start_f = max(0.0, float(start))
+        end_f = float(end)
+
+        if source_duration > 0.0:
+            if start_f >= source_duration:
+                logger.warning(
+                    "Smart Cleanup skipping interval #%d outside source duration: %.3f-%.3f (source %.3f)",
+                    index,
+                    start_f,
+                    end_f,
+                    source_duration,
+                )
+                continue
+            end_f = min(end_f, source_duration)
+
+        if end_f <= start_f + _MIN_INTERVAL_SECONDS:
             continue
 
-        segment_path = os.path.join(work_dir, f"smart_cleanup_segment_{index:03d}.mp4")
-        # Keep `ss` on the output side for frame-accurate cuts at word boundaries.
-        (
-            ffmpeg_lib.input(input_video_path)
-            .output(
-                segment_path,
-                ss=float(start),
-                t=duration,
-                vcodec="libx264",
-                acodec="aac",
-                crf=crf,
-                preset=preset,
-                movflags="+faststart",
+        duration = end_f - start_f
+        if duration < _RENDER_MIN_INTERVAL_SECONDS:
+            target_end = start_f + _RENDER_MIN_INTERVAL_SECONDS
+            if source_duration > 0.0:
+                target_end = min(target_end, source_duration)
+            if target_end <= start_f + _MIN_INTERVAL_SECONDS:
+                continue
+            logger.debug(
+                "Smart Cleanup expanded short interval #%d %.3f-%.3f to %.3f-%.3f",
+                index,
+                start_f,
+                end_f,
+                start_f,
+                target_end,
             )
-            .overwrite_output()
-            .run(quiet=True, capture_stderr=True)
-        )
+            end_f = target_end
+            duration = end_f - start_f
+
+        segment_path = os.path.join(work_dir, f"smart_cleanup_segment_{index:03d}.mp4")
+        segment_input = ffmpeg_lib.input(input_video_path, ss=start_f, t=duration)
+        video_stream = segment_input.video
+        if source_has_audio:
+            audio_stream = segment_input.audio
+        else:
+            audio_stream = ffmpeg_lib.input(
+                "anullsrc=r=44100:cl=stereo",
+                f="lavfi",
+                t=duration,
+            ).audio
+
+        try:
+            (
+                ffmpeg_lib.output(
+                    video_stream,
+                    audio_stream,
+                    segment_path,
+                    vcodec="libx264",
+                    acodec="aac",
+                    audio_bitrate="192k",
+                    ar=44100,
+                    crf=crf,
+                    preset=preset,
+                    pix_fmt="yuv420p",
+                    movflags="+faststart",
+                )
+                .overwrite_output()
+                .run(quiet=True, capture_stderr=True)
+            )
+        except ffmpeg_lib.Error as exc:
+            stderr_output = (
+                exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
+            )
+            logger.error(
+                "Smart Cleanup segment render failed for %s interval %.3f-%.3f (duration %.3f):\n%s",
+                input_video_path,
+                start_f,
+                end_f,
+                duration,
+                stderr_output,
+            )
+            raise RuntimeError(
+                f"Smart Cleanup failed to render interval {start_f:.3f}-{end_f:.3f}."
+            ) from exc
+
         segment_paths.append(segment_path)
 
     if not segment_paths:
@@ -1018,19 +1101,31 @@ def render_condensed_video_from_keep_intervals(
             normalized_path = path.replace("\\", "/").replace("'", "'\\''")
             concat_file.write(f"file '{normalized_path}'\n")
 
-    (
-        ffmpeg_lib.input(concat_list_path, format="concat", safe=0)
-        .output(
-            output_path,
-            vcodec="libx264",
-            acodec="aac",
-            crf=crf,
-            preset=preset,
-            movflags="+faststart",
+    try:
+        (
+            ffmpeg_lib.input(concat_list_path, format="concat", safe=0)
+            .output(
+                output_path,
+                vcodec="libx264",
+                acodec="aac",
+                audio_bitrate="192k",
+                ar=44100,
+                crf=crf,
+                preset=preset,
+                pix_fmt="yuv420p",
+                movflags="+faststart",
+            )
+            .overwrite_output()
+            .run(quiet=True, capture_stderr=True)
         )
-        .overwrite_output()
-        .run(quiet=True, capture_stderr=True)
-    )
+    except ffmpeg_lib.Error as exc:
+        stderr_output = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
+        logger.error(
+            "Smart Cleanup concat failed (%d segments):\n%s",
+            len(segment_paths),
+            stderr_output,
+        )
+        raise RuntimeError("Smart Cleanup failed while concatenating cleaned segments.") from exc
 
     return _probe_video_duration_seconds(output_path)
 

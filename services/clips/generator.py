@@ -12,9 +12,8 @@ from services.clips.constants import (
     intermediate_quality_preset,
 )
 from services.clips.ffmpeg_ops import (
-    add_overlays,
     concat_intro_outro,
-    create_portrait_background,
+    compose_clip,
     extract_segment,
 )
 from services.clips.layout import compute_layout, compute_video_position, wrap_title
@@ -125,32 +124,21 @@ class ClipGenerator:
             len(title_lines),
         )
 
-        bg_clip_path = os.path.join(self.temp_dir, f"{clip_id}_bg.mp4")
-        create_portrait_background(
-            raw_clip_path,
-            bg_clip_path,
-            background_style,
-            layout["canvas_w"],
-            layout["canvas_h"],
-            layout["vid_w"],
-            layout["vid_h"],
-            layout["vid_x"],
-            layout["vid_y"],
-            blur_strength,
-            video_scale_mode,
-            intermediate_qp,
-            background_color=background_color,
-            background_image_path=background_image_path,
-        )
-        intermediates.append(bg_clip_path)
-
         # If intro/outro concat runs afterward, keep this pass high-fidelity.
         overlay_qp = qp if not (has_intro or has_outro) else intermediate_qp
         composited_path = os.path.join(self.temp_dir, f"{clip_id}_composited.mp4")
-        add_overlays(
-            bg_clip_path,
+        compose_clip(
             raw_clip_path,
             composited_path,
+            style=background_style,
+            canvas_w=layout["canvas_w"],
+            canvas_h=layout["canvas_h"],
+            vid_w=layout["vid_w"],
+            vid_h=layout["vid_h"],
+            vid_x=layout["vid_x"],
+            vid_y=layout["vid_y"],
+            blur_strength=blur_strength,
+            video_scale_mode=video_scale_mode,
             title_lines=title_lines,
             title_show=title_show,
             title_font_size=title_font_size,
@@ -171,6 +159,8 @@ class ClipGenerator:
             qp=overlay_qp,
             overlay_file_path=overlay_file_path,
             overlay_cfg=overlay_cfg,
+            background_color=background_color,
+            background_image_path=background_image_path,
         )
         intermediates.append(composited_path)
 

@@ -9,13 +9,20 @@ import logging
 import os
 import shutil
 import traceback
-from datetime import datetime, timedelta, timezone
 
 from config import normalize_custom_clip_generation_credits
 from services.clip_generator import ClipGenerator, compute_video_position
 from services.clips.constants import canvas_size_for_aspect_ratio
 from services.video_downloader import VideoDownloader
 from tasks.clips.helpers.captions import build_caption_ass
+from tasks.clips.helpers.lifecycle import (
+    asset_expires_at_iso,
+    best_effort_cleanup_uploaded_artifacts,
+    build_progress_result_data,
+    parse_retention_days,
+    update_clip_job_progress,
+    upload_clip_with_replace,
+)
 from tasks.clips.helpers.layout import (
     load_layout_overrides,
     maybe_download_layout_background_image,
@@ -47,124 +54,6 @@ from utils.supabase_client import (
 )
 
 logger = logging.getLogger(__name__)
-
-_VIDEO_UPLOAD_OPTIONS = {"content-type": "video/mp4", "cache-control": "3600"}
-
-
-def _parse_retention_days(value: object) -> int | None:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    if parsed <= 0:
-        return None
-    return parsed
-
-
-def _asset_expires_at_iso(retention_days: int | None) -> str | None:
-    if retention_days is None:
-        return None
-    return (datetime.now(timezone.utc) + timedelta(days=retention_days)).isoformat()
-
-
-def _is_duplicate_storage_error(exc: Exception) -> bool:
-    payload = exc.args[0] if getattr(exc, "args", None) else None
-    if isinstance(payload, dict):
-        status_code = payload.get("statusCode")
-        error_name = str(payload.get("error") or "").lower()
-        message = str(payload.get("message") or "").lower()
-        if status_code == 400 and (
-            error_name == "duplicate" or "already exists" in message
-        ):
-            return True
-
-    text = str(exc).lower()
-    return "duplicate" in text or "already exists" in text
-
-
-def _upload_clip_with_replace(
-    *,
-    local_clip_path: str,
-    storage_path: str,
-    job_id: str,
-):
-    with open(local_clip_path, "rb") as file_obj:
-        try:
-            supabase.storage.from_("generated-clips").upload(
-                storage_path,
-                file_obj,
-                file_options=_VIDEO_UPLOAD_OPTIONS,
-            )
-            return
-        except Exception as exc:
-            if not _is_duplicate_storage_error(exc):
-                raise
-
-            logger.warning(
-                "[%s] Storage path %s already exists. Replacing existing artifact.",
-                job_id,
-                storage_path,
-            )
-            supabase.storage.from_("generated-clips").remove([storage_path])
-            file_obj.seek(0)
-            supabase.storage.from_("generated-clips").upload(
-                storage_path,
-                file_obj,
-                file_options=_VIDEO_UPLOAD_OPTIONS,
-            )
-
-
-def _update_clip_job_progress(job_id: str, progress: int, stage: str):
-    """Persist custom clip-generation progress plus machine-readable stage."""
-    update_job_status(
-        job_id,
-        "processing",
-        progress,
-        result_data={"stage": stage},
-    )
-
-
-def _best_effort_cleanup_uploaded_artifacts(
-    *,
-    job_id: str,
-    clip_id: str,
-    storage_path: str | None,
-):
-    if storage_path:
-        try:
-            supabase.storage.from_("generated-clips").remove([storage_path])
-        except Exception as exc:
-            logger.warning(
-                "[%s] Failed to delete uploaded clip artifact %s: %s",
-                job_id,
-                storage_path,
-                exc,
-            )
-
-    if storage_path:
-        try:
-            clear_resp = (
-                supabase.table("clips")
-                .update(
-                    {
-                        "storage_path": None,
-                        "thumbnail_path": None,
-                        "file_size_bytes": None,
-                        "asset_expires_at": None,
-                        "asset_expired_at": None,
-                    }
-                )
-                .eq("id", clip_id)
-                .execute()
-            )
-            assert_response_ok(clear_resp, f"Failed to clear storage fields for {clip_id}")
-        except Exception as exc:
-            logger.warning(
-                "[%s] Failed to clear clip storage pointers for %s: %s",
-                job_id,
-                clip_id,
-                exc,
-            )
 
 
 def _best_effort_mark_failed(
@@ -246,7 +135,7 @@ def custom_clip_task(job_data: CustomClipJob):
     generation_credits = normalize_custom_clip_generation_credits(
         job_data.get("generationCredits")
     )
-    clip_retention_days = _parse_retention_days(job_data.get("clipRetentionDays"))
+    clip_retention_days = parse_retention_days(job_data.get("clipRetentionDays"))
     smart_cleanup_enabled = bool(job_data.get("smartCleanupEnabled"))
     workspace_team_id = job_data.get("workspaceTeamId")
     billing_owner_user_id = job_data.get("billingOwnerUserId") or user_id
@@ -277,7 +166,12 @@ def custom_clip_task(job_data: CustomClipJob):
     source_video_download_seconds = 0.0
 
     try:
-        _update_clip_job_progress(job_id, 0, "starting")
+        update_clip_job_progress(
+            job_id=job_id,
+            progress=0,
+            stage="starting",
+            detail_key="job_initialized",
+        )
 
         if generation_credits > 0 and not has_sufficient_credits(
             user_id=billing_owner_user_id,
@@ -306,15 +200,26 @@ def custom_clip_task(job_data: CustomClipJob):
         # 1. Resolve source video ---------------------------------------------
         waiting_stage_emitted = False
 
-        def _emit_waiting_for_source(_elapsed_seconds: float):
+        def _emit_waiting_for_source(elapsed_seconds: float):
             nonlocal waiting_stage_emitted
             if waiting_stage_emitted:
                 return
             waiting_stage_emitted = True
-            _update_clip_job_progress(job_id, 12, "waiting_for_source_video_download")
+            update_clip_job_progress(
+                job_id=job_id,
+                progress=12,
+                stage="waiting_for_source_video_download",
+                detail_key="waiting_for_source_video",
+                detail_params={"seconds": round(float(elapsed_seconds), 1)},
+            )
 
         def _emit_downloading_source():
-            _update_clip_job_progress(job_id, 12, "downloading_video")
+            update_clip_job_progress(
+                job_id=job_id,
+                progress=12,
+                stage="downloading_video",
+                detail_key="downloading_source_video",
+            )
 
         source_resolution = resolve_source_video(
             video_id=video_id,
@@ -332,7 +237,12 @@ def custom_clip_task(job_data: CustomClipJob):
         source_video_strategy = str(source_resolution.strategy)
         source_video_wait_seconds = float(source_resolution.wait_seconds)
         source_video_download_seconds = float(source_resolution.download_seconds)
-        _update_clip_job_progress(job_id, 20, "downloading_video")
+        update_clip_job_progress(
+            job_id=job_id,
+            progress=20,
+            stage="downloading_video",
+            detail_key="source_video_ready",
+        )
         logger.info(
             "[%s] Source video resolved for %s via %s (wait=%.2fs, download=%.2fs)",
             job_id,
@@ -391,19 +301,39 @@ def custom_clip_task(job_data: CustomClipJob):
             logger.info("[%s] Reusing transcript already stored on video", job_id)
 
         if not transcript and source_platform == "youtube" and source_external_id:
-            _update_clip_job_progress(job_id, 30, "fetching_source_captions")
+            update_clip_job_progress(
+                job_id=job_id,
+                progress=30,
+                stage="fetching_source_captions",
+                detail_key="checking_existing_captions",
+            )
             logger.info("[%s] Attempting to get YouTube transcript ...", job_id)
             transcript = downloader.get_youtube_transcript(str(source_external_id))
             if transcript:
                 logger.info("[%s] Got transcript from YouTube", job_id)
 
         if not transcript:
-            _update_clip_job_progress(job_id, 30, "extracting_audio")
+            update_clip_job_progress(
+                job_id=job_id,
+                progress=30,
+                stage="extracting_audio",
+                detail_key="preparing_audio_track",
+            )
             logger.info("[%s] Extracting audio for Whisper transcription ...", job_id)
             audio_path = downloader.extract_audio(video_path)
-            _update_clip_job_progress(job_id, 38, "extracting_audio")
+            update_clip_job_progress(
+                job_id=job_id,
+                progress=38,
+                stage="extracting_audio",
+                detail_key="preparing_audio_track",
+            )
 
-            _update_clip_job_progress(job_id, 45, "transcribing_audio")
+            update_clip_job_progress(
+                job_id=job_id,
+                progress=45,
+                stage="transcribing_audio",
+                detail_key="creating_captions_from_speech",
+            )
             transcript = transcribe_clip_window_with_whisper(
                 media_path=audio_path,
                 work_dir=work_dir,
@@ -415,7 +345,12 @@ def custom_clip_task(job_data: CustomClipJob):
             partial_transcript = True
 
         if smart_cleanup_enabled:
-            _update_clip_job_progress(job_id, 45, "transcribing_audio")
+            update_clip_job_progress(
+                job_id=job_id,
+                progress=45,
+                stage="transcribing_audio",
+                detail_key="improving_caption_timing",
+            )
             logger.info(
                 "[%s] Re-transcribing with Whisper for Smart Cleanup (fresh word timing)",
                 job_id,
@@ -434,7 +369,12 @@ def custom_clip_task(job_data: CustomClipJob):
                     "Smart Cleanup requires Whisper word-level timings, but no usable words were returned."
                 )
 
-        _update_clip_job_progress(job_id, 52, "loading_layout")
+        update_clip_job_progress(
+            job_id=job_id,
+            progress=52,
+            stage="loading_layout",
+            detail_key="applying_template_settings",
+        )
 
         # Save transcript on video row only when it represents the full video.
         video_update = {"status": "completed"}
@@ -513,7 +453,12 @@ def custom_clip_task(job_data: CustomClipJob):
         )
 
         if smart_cleanup_enabled:
-            _update_clip_job_progress(job_id, 60, "applying_smart_cleanup")
+            update_clip_job_progress(
+                job_id=job_id,
+                progress=60,
+                stage="applying_smart_cleanup",
+                detail_key="smart_cleanup_balanced",
+            )
             cleanup_result = apply_balanced_smart_cleanup(
                 transcript=transcript,
                 video_path=video_path,
@@ -570,7 +515,12 @@ def custom_clip_task(job_data: CustomClipJob):
             video_scale_mode=video_scale_mode,
         )
 
-        _update_clip_job_progress(job_id, 65, "preparing_captions")
+        update_clip_job_progress(
+            job_id=job_id,
+            progress=65,
+            stage="preparing_captions",
+            detail_key="preparing_caption_text",
+        )
         caption_ass_path = build_caption_ass(
             job_id=job_id,
             clip_id=clip_id,
@@ -588,7 +538,16 @@ def custom_clip_task(job_data: CustomClipJob):
         )
 
         # 6. Generate clip -----------------------------------------------------
-        _update_clip_job_progress(job_id, 75, "rendering_clip")
+        update_clip_job_progress(
+            job_id=job_id,
+            progress=75,
+            stage="rendering_clip",
+            detail_key="building_video",
+            detail_params={
+                "start_seconds": round(start_time, 2),
+                "end_seconds": round(end_time, 2),
+            },
+        )
         generator = ClipGenerator(work_dir=work_dir)
         logger.info("[%s] Generating clip %s ...", job_id, clip_id)
 
@@ -641,18 +600,29 @@ def custom_clip_task(job_data: CustomClipJob):
         # 7. Upload to Supabase Storage ----------------------------------------
         storage_path = f"clips/{clip_id}.mp4"
 
-        _update_clip_job_progress(job_id, 84, "uploading_clip")
+        update_clip_job_progress(
+            job_id=job_id,
+            progress=84,
+            stage="uploading_clip",
+            detail_key="saving_generated_clip",
+        )
         logger.info("[%s] Uploading clip to storage ...", job_id)
 
-        _upload_clip_with_replace(
+        upload_clip_with_replace(
             local_clip_path=result["clip_path"],
             storage_path=storage_path,
             job_id=job_id,
+            logger=logger,
         )
         uploaded_storage_path = storage_path
 
         # 8. Charge credits before finalizing completion state -----------------
-        _update_clip_job_progress(job_id, 90, "charging_credits")
+        update_clip_job_progress(
+            job_id=job_id,
+            progress=90,
+            stage="charging_credits",
+            detail_key="updating_usage_records",
+        )
         charge_clip_generation_credits(
             user_id=user_id,
             amount=generation_credits,
@@ -674,13 +644,18 @@ def custom_clip_task(job_data: CustomClipJob):
         )
 
         # 9. Update clip record ------------------------------------------------
-        _update_clip_job_progress(job_id, 97, "finalizing")
+        update_clip_job_progress(
+            job_id=job_id,
+            progress=97,
+            stage="finalizing",
+            detail_key="finalizing_clip_record",
+        )
         clip_update = {
             "status": "completed",
             "storage_path": storage_path,
             "thumbnail_path": None,
             "file_size_bytes": result["file_size"],
-            "asset_expires_at": _asset_expires_at_iso(clip_retention_days),
+            "asset_expires_at": asset_expires_at_iso(clip_retention_days),
             "asset_expired_at": None,
         }
         if layout_should_persist and layout_id:
@@ -694,17 +669,20 @@ def custom_clip_task(job_data: CustomClipJob):
             job_id,
             "completed",
             100,
-            result_data={
-                "stage": "completed",
-                "storage_path": storage_path,
-                "file_size": result["file_size"],
-                "source_video_strategy": source_video_strategy,
-                "source_video_wait_seconds": round(source_video_wait_seconds, 3),
-                "source_video_download_seconds": round(
-                    source_video_download_seconds, 3
-                ),
-                "smart_cleanup": smart_cleanup_summary,
-            },
+            result_data=build_progress_result_data(
+                stage="completed",
+                detail_key="generation_finished",
+                extra_result_data={
+                    "storage_path": storage_path,
+                    "file_size": result["file_size"],
+                    "source_video_strategy": source_video_strategy,
+                    "source_video_wait_seconds": round(source_video_wait_seconds, 3),
+                    "source_video_download_seconds": round(
+                        source_video_download_seconds, 3
+                    ),
+                    "smart_cleanup": smart_cleanup_summary,
+                },
+            ),
         )
         logger.info("[%s] Custom clip completed: %s", job_id, clip_id)
 
@@ -713,10 +691,11 @@ def custom_clip_task(job_data: CustomClipJob):
         logger.error("[%s] Error generating custom clip: %s", job_id, error_msg)
         logger.debug(traceback.format_exc())
 
-        _best_effort_cleanup_uploaded_artifacts(
+        best_effort_cleanup_uploaded_artifacts(
             job_id=job_id,
             clip_id=clip_id,
             storage_path=uploaded_storage_path,
+            logger=logger,
         )
         _best_effort_mark_failed(
             job_id=job_id,
