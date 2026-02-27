@@ -432,6 +432,25 @@ def _count_monthly_videos_for_owner(owner_user_id: str, supabase_client=supabase
         return 0
 
 
+def _count_active_jobs_for_user(
+    user_id: str,
+    *,
+    max_rows: int,
+    supabase_client=supabase,
+) -> int:
+    """Backwards-compatible alias for tests and older callsites."""
+    return _count_active_jobs_for_owner(
+        user_id,
+        max_rows=max_rows,
+        supabase_client=supabase_client,
+    )
+
+
+def _count_monthly_videos_for_user(user_id: str, supabase_client=supabase) -> int:
+    """Backwards-compatible alias for tests and older callsites."""
+    return _count_monthly_videos_for_owner(user_id, supabase_client=supabase_client)
+
+
 def get_user_access_context(user_id: str, supabase_client=supabase) -> UserAccessContext:
     workspace_team_id = _read_profile_active_team_id(
         user_id,
@@ -533,7 +552,7 @@ def enforce_processing_access_rules(user_id: str, supabase_client=supabase) -> U
             )
 
         owner_user_id = context.billing_owner_user_id or user_id
-        active_jobs = _count_active_jobs_for_owner(
+        active_jobs = _count_active_jobs_for_user(
             owner_user_id,
             max_rows=max_active_jobs,
             supabase_client=supabase_client,
@@ -557,7 +576,7 @@ def enforce_monthly_video_limit(user_id: str, supabase_client=supabase):
         return
 
     owner_user_id = context.billing_owner_user_id or user_id
-    monthly_video_count = _count_monthly_videos_for_owner(
+    monthly_video_count = _count_monthly_videos_for_user(
         owner_user_id,
         supabase_client=supabase_client,
     )
