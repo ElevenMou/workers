@@ -4,8 +4,8 @@ from math import ceil
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+
+from api_app.auth import get_user_rate_key
 
 from api_app.access_rules import (
     UserAccessContext,
@@ -17,7 +17,6 @@ from api_app.access_rules import (
 )
 from api_app.auth import AuthenticatedUser, get_current_user
 
-limiter = Limiter(key_func=get_remote_address)
 from api_app.constants import ANALYZE_TASK_PATH
 from api_app.helpers import enqueue_or_fail, raise_on_error
 from api_app.models import (
@@ -26,6 +25,7 @@ from api_app.models import (
     CreditsCostByUrlRequest,
     CreditsCostByUrlResponse,
 )
+from api_app.rate_limit import limiter
 from api_app.state import logger, whisper_ready
 from config import (
     calculate_video_analysis_cost,
@@ -43,6 +43,13 @@ _STANDARD_VIDEO_QUEUE = "video-processing"
 _PRIORITY_VIDEO_QUEUE = "video-processing-priority"
 _ANALYZE_CLIP_MIN_SECONDS = 10
 _DEFAULT_ANALYZE_LEGACY_CLIP_SECONDS = 90
+
+
+def _best_effort_delete_video(video_id: str):
+    try:
+        supabase.table("videos").delete().eq("id", video_id).execute()
+    except Exception as exc:
+        logger.warning("Failed cleanup delete for video %s: %s", video_id, exc)
 
 
 def _video_queue_for_context(context: UserAccessContext) -> str:
@@ -191,6 +198,7 @@ def _raise_if_insufficient_credits(
 
 @router.post("/videos/analyze", response_model=AnalyzeVideoResponse)
 @limiter.limit("10/minute")
+@limiter.limit("5/minute", key_func=get_user_rate_key)
 def analyze_video(
     request: Request,
     payload: AnalyzeVideoRequest,
@@ -323,6 +331,7 @@ def analyze_video(
         existing_query = existing_query.eq("user_id", user_id).is_("team_id", "null")
     existing = existing_query.limit(1).execute()
     raise_on_error(existing, "Failed to query existing video")
+    created_video_for_request = False
     if existing.data and len(existing.data) > 0:
         video_id = existing.data[0]["id"]
         logger.info("Reusing existing video %s for analyze url", video_id)
@@ -332,6 +341,7 @@ def analyze_video(
         # a user-supplied videoId — it could reference another user's video
         # and the service-role upsert would overwrite it.
         video_id = str(uuid4())
+        created_video_for_request = True
 
     logger.info(
         "Analyze request - user=%s  video=%s  url=%s  numClips=%d  clipRange=%d-%ds  "
@@ -409,6 +419,10 @@ def analyze_video(
     )
     raise_on_error(job_resp, "Failed to upsert job")
 
+    def _cleanup_analyze_queue_full() -> None:
+        if created_video_for_request:
+            _best_effort_delete_video(video_id)
+
     enqueue_or_fail(
         queue_name=_video_queue_for_context(access_context),
         task_path=ANALYZE_TASK_PATH,
@@ -417,6 +431,7 @@ def analyze_video(
         user_id=user_id,
         job_type="analyze_video",
         video_id=video_id,
+        on_queue_full_cleanup=_cleanup_analyze_queue_full,
     )
 
     return AnalyzeVideoResponse(jobId=job_id, videoId=video_id, status="queued")
@@ -424,6 +439,7 @@ def analyze_video(
 
 @router.post("/credits/cost", response_model=CreditsCostByUrlResponse)
 @limiter.limit("15/minute")
+@limiter.limit("10/minute", key_func=get_user_rate_key)
 def get_credit_cost_from_url(
     request: Request,
     payload: CreditsCostByUrlRequest,

@@ -10,6 +10,7 @@ os.environ.setdefault(
     "eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaXNzIjoic3VwYWJhc2UiLCJleHAiOjQxMDI0NDQ4MDB9."
     "test-signature",
 )
+os.environ.setdefault("DISABLE_RATE_LIMITS", "true")
 
 from api_app.app import app  # noqa: E402
 

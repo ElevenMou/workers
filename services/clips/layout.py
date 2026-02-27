@@ -128,13 +128,25 @@ def compute_layout(
     canvas_aspect_ratio: str,
     video_scale_mode: str,
     title_line_count: int = 1,
+    *,
+    source_width: int | None = None,
+    source_height: int | None = None,
 ) -> ClipLayout:
-    """Probe the source clip and return concrete layout pixel values."""
+    """Probe the source clip and return concrete layout pixel values.
+
+    When *source_width* and *source_height* are provided the ffprobe step is
+    skipped, which avoids an extra probe call when the caller already knows the
+    source resolution (e.g. from the original downloaded video).
+    """
     canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
-    probe = ffmpeg.probe(video_path)
-    v_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
-    src_w = int(v_stream["width"])
-    src_h = int(v_stream["height"])
+    if source_width is not None and source_height is not None:
+        src_w = source_width
+        src_h = source_height
+    else:
+        probe = ffmpeg.probe(video_path)
+        v_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
+        src_w = int(v_stream["width"])
+        src_h = int(v_stream["height"])
 
     vid_w, vid_h, vid_x, vid_y = compute_video_position(
         src_w,

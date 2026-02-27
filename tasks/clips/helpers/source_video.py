@@ -17,6 +17,7 @@ from utils.redis_client import get_redis_connection
 _VIDEO_RAW_TTL_HOURS = 24
 _WAIT_STAGE_NOTIFY_INTERVAL_SECONDS = 5.0
 _WAIT_POLL_INTERVAL_SECONDS = 1.0
+_UNSET_SOURCE_MAX_HEIGHT = object()
 
 
 @dataclass(slots=True)
@@ -90,27 +91,31 @@ def resolve_source_video(
     persist_raw_video_path: Callable[[str, str], None],
     logger,
     job_id: str,
+    source_max_height: int | None | object = _UNSET_SOURCE_MAX_HEIGHT,
+    prefer_fresh_download: bool = False,
     on_wait_for_download: Callable[[float], None] | None = None,
     on_download_start: Callable[[], None] | None = None,
 ) -> SourceVideoResolution:
     """Resolve a usable source-video path with same-video download deduplication."""
-    existing = _resolve_existing_video_path(
-        video_id=video_id,
-        job_id=job_id,
-        logger=logger,
-        raw_video_path=initial_raw_video_path,
-    )
-    if existing is not None:
-        path, width, height = existing
-        return SourceVideoResolution(
-            video_path=path,
-            width=width,
-            height=height,
-            strategy="reused_existing",
-            wait_seconds=0.0,
-            download_seconds=0.0,
-            download_metadata=None,
+    baseline_raw_video_path = str(initial_raw_video_path).strip() if initial_raw_video_path else None
+    if not prefer_fresh_download:
+        existing = _resolve_existing_video_path(
+            video_id=video_id,
+            job_id=job_id,
+            logger=logger,
+            raw_video_path=initial_raw_video_path,
         )
+        if existing is not None:
+            path, width, height = existing
+            return SourceVideoResolution(
+                video_path=path,
+                width=width,
+                height=height,
+                strategy="reused_existing",
+                wait_seconds=0.0,
+                download_seconds=0.0,
+                download_metadata=None,
+            )
 
     wait_started_at = time.monotonic()
     lock_wait_seconds = max(1, int(SOURCE_VIDEO_LOCK_WAIT_SECONDS))
@@ -118,6 +123,7 @@ def resolve_source_video(
     lock_key = f"clipry:source-video:{video_id}"
     lock_token = f"{uuid.uuid4()}:{os.getpid()}"
     lock_acquired = False
+    waited_for_lock = False
     last_wait_stage_emit = -_WAIT_STAGE_NOTIFY_INTERVAL_SECONDS
 
     try:
@@ -168,10 +174,13 @@ def resolve_source_video(
             if lock_acquired:
                 break
 
+            waited_for_lock = True
             elapsed = time.monotonic() - wait_started_at
             _emit_wait_stage(float(elapsed))
 
             latest_path, _ = _load_latest_path_and_url()
+            if not baseline_raw_video_path and latest_path:
+                baseline_raw_video_path = latest_path
             latest_existing = _resolve_existing_video_path(
                 video_id=video_id,
                 job_id=job_id,
@@ -179,16 +188,19 @@ def resolve_source_video(
                 raw_video_path=latest_path,
             )
             if latest_existing is not None:
-                path, width, height = latest_existing
-                return SourceVideoResolution(
-                    video_path=path,
-                    width=width,
-                    height=height,
-                    strategy="waited_and_reused",
-                    wait_seconds=float(elapsed),
-                    download_seconds=0.0,
-                    download_metadata=None,
-                )
+                if not prefer_fresh_download or (
+                    baseline_raw_video_path is None or latest_path != baseline_raw_video_path
+                ):
+                    path, width, height = latest_existing
+                    return SourceVideoResolution(
+                        video_path=path,
+                        width=width,
+                        height=height,
+                        strategy="waited_and_reused",
+                        wait_seconds=float(elapsed),
+                        download_seconds=0.0,
+                        download_metadata=None,
+                    )
 
             if elapsed >= lock_wait_seconds:
                 raise RuntimeError(
@@ -199,6 +211,7 @@ def resolve_source_video(
             time.sleep(_WAIT_POLL_INTERVAL_SECONDS)
 
         latest_path, latest_url = _load_latest_path_and_url()
+        waited_seconds = time.monotonic() - wait_started_at
         latest_existing = _resolve_existing_video_path(
             video_id=video_id,
             job_id=job_id,
@@ -206,17 +219,30 @@ def resolve_source_video(
             raw_video_path=latest_path,
         )
         if latest_existing is not None:
-            path, width, height = latest_existing
-            waited_seconds = time.monotonic() - wait_started_at
-            return SourceVideoResolution(
-                video_path=path,
-                width=width,
-                height=height,
-                strategy="waited_and_reused" if waited_seconds > 0 else "reused_existing",
-                wait_seconds=float(max(0.0, waited_seconds)),
-                download_seconds=0.0,
-                download_metadata=None,
-            )
+            if not prefer_fresh_download:
+                path, width, height = latest_existing
+                return SourceVideoResolution(
+                    video_path=path,
+                    width=width,
+                    height=height,
+                    strategy="waited_and_reused" if waited_seconds > 0 else "reused_existing",
+                    wait_seconds=float(max(0.0, waited_seconds)),
+                    download_seconds=0.0,
+                    download_metadata=None,
+                )
+            if waited_for_lock and (
+                baseline_raw_video_path is None or latest_path != baseline_raw_video_path
+            ):
+                path, width, height = latest_existing
+                return SourceVideoResolution(
+                    video_path=path,
+                    width=width,
+                    height=height,
+                    strategy="waited_and_reused",
+                    wait_seconds=float(max(0.0, waited_seconds)),
+                    download_seconds=0.0,
+                    download_metadata=None,
+                )
 
         resolved_url = str(source_url or latest_url or "").strip()
         if not resolved_url:
@@ -226,7 +252,18 @@ def resolve_source_video(
             on_download_start()
 
         download_started_at = time.monotonic()
-        downloaded = downloader.download(resolved_url, video_id)
+        if source_max_height is _UNSET_SOURCE_MAX_HEIGHT:
+            downloaded = downloader.download(resolved_url, video_id)
+        else:
+            try:
+                downloaded = downloader.download(
+                    resolved_url,
+                    video_id,
+                    max_height=source_max_height,
+                )
+            except TypeError:
+                # Backward-compatible fallback for test doubles with legacy signature.
+                downloaded = downloader.download(resolved_url, video_id)
         download_seconds = time.monotonic() - download_started_at
 
         downloaded_path = str(downloaded.get("path") or "").strip()

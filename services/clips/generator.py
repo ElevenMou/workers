@@ -1,7 +1,10 @@
 """High-level clip generation orchestration."""
 
+import logging
 import os
 from typing import Any
+
+import ffmpeg as ffmpeg_lib
 
 from config import TEMP_DIR
 from services.clips.constants import (
@@ -14,10 +17,18 @@ from services.clips.constants import (
 from services.clips.ffmpeg_ops import (
     concat_intro_outro,
     compose_clip,
-    extract_segment,
 )
 from services.clips.layout import compute_layout, compute_video_position, wrap_title
 from services.clips.models import ClipGenerationResult
+
+logger = logging.getLogger(__name__)
+
+
+def _probe_video_resolution(path: str) -> tuple[int, int]:
+    """Return (width, height) of the first video stream in *path*."""
+    probe = ffmpeg_lib.probe(path)
+    v_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
+    return int(v_stream["width"]), int(v_stream["height"])
 
 
 class ClipGenerator:
@@ -71,10 +82,14 @@ class ClipGenerator:
         blur_strength: int = 20,
         output_quality: str = "medium",
     ) -> ClipGenerationResult:
-        """Generate final clip with title and optional captions."""
+        """Generate final clip with title and optional captions.
+
+        The pipeline seeks directly into the source video and renders the
+        composited output in a single FFmpeg invocation, avoiding an extra
+        re-encoding pass from a separate extraction step.
+        """
         intermediates: list[str] = []
         qp = QUALITY_PRESETS.get(output_quality, QUALITY_PRESETS["medium"])
-        intermediate_qp = intermediate_quality_preset(qp)
         canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
 
         has_intro = (
@@ -102,12 +117,11 @@ class ClipGenerator:
         max_text_w = max(120, base_title_width - (2 * horizontal_padding))
         title_lines = wrap_title(title, title_font_size, max_text_w)
 
-        raw_clip_path = os.path.join(self.temp_dir, f"{clip_id}_raw.mp4")
-        extract_segment(video_path, start_time, end_time, raw_clip_path, intermediate_qp)
-        intermediates.append(raw_clip_path)
+        # Probe the source video once for resolution (used by layout computation).
+        src_w, src_h = _probe_video_resolution(video_path)
 
         layout = compute_layout(
-            raw_clip_path,
+            video_path,
             video_width_pct,
             video_position_y,
             video_custom_x,
@@ -122,13 +136,15 @@ class ClipGenerator:
             canvas_aspect_ratio,
             video_scale_mode,
             len(title_lines),
+            source_width=src_w,
+            source_height=src_h,
         )
 
         # If intro/outro concat runs afterward, keep this pass high-fidelity.
-        overlay_qp = qp if not (has_intro or has_outro) else intermediate_qp
+        overlay_qp = qp if not (has_intro or has_outro) else intermediate_quality_preset(qp)
         composited_path = os.path.join(self.temp_dir, f"{clip_id}_composited.mp4")
         compose_clip(
-            raw_clip_path,
+            video_path,
             composited_path,
             style=background_style,
             canvas_w=layout["canvas_w"],
@@ -161,6 +177,8 @@ class ClipGenerator:
             overlay_cfg=overlay_cfg,
             background_color=background_color,
             background_image_path=background_image_path,
+            start_time=start_time,
+            end_time=end_time,
         )
         intermediates.append(composited_path)
 

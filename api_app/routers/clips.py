@@ -3,11 +3,8 @@
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 
-limiter = Limiter(key_func=get_remote_address)
-
+from api_app.auth import get_user_rate_key
 from api_app.access_rules import (
     UserAccessContext,
     enforce_custom_clip_access,
@@ -24,11 +21,13 @@ from api_app.models import (
     GenerateClipRequest,
     GenerateClipResponse,
 )
+from api_app.rate_limit import limiter
 from api_app.state import logger
 from config import (
     calculate_clip_generation_cost,
     calculate_custom_clip_generation_cost,
 )
+from services.clips.quality_policy import resolve_clip_quality_policy
 from utils.supabase_client import (
     get_credit_balance,
     get_team_wallet_balance,
@@ -152,6 +151,13 @@ def _clip_queue_for_context(context: UserAccessContext) -> str:
     return _PRIORITY_CLIP_QUEUE if context.priority_processing else _STANDARD_CLIP_QUEUE
 
 
+def _best_effort_delete_row(table: str, row_id: str):
+    try:
+        supabase.table(table).delete().eq("id", row_id).execute()
+    except Exception as exc:
+        logger.warning("Failed cleanup delete for %s %s: %s", table, row_id, exc)
+
+
 @router.get("/clips/layout-options", response_model=ClipLayoutOptionsResponse)
 def clip_layout_options() -> ClipLayoutOptionsResponse:
     """Return supported clip canvas ratios and video scaling behavior."""
@@ -170,6 +176,7 @@ def clip_layout_options() -> ClipLayoutOptionsResponse:
 
 @router.post("/clips/generate", response_model=GenerateClipResponse)
 @limiter.limit("20/minute")
+@limiter.limit("15/minute", key_func=get_user_rate_key)
 def generate_clip(
     request: Request,
     payload: GenerateClipRequest,
@@ -274,6 +281,16 @@ def generate_clip(
         duration_seconds=clip_duration,
         supabase_client=supabase,
     )
+    quality_policy = resolve_clip_quality_policy(
+        tier=access_context.tier,
+        clip_duration_seconds=clip_duration,
+        requested_output_quality=None,
+    )
+    output_quality_override = (
+        quality_policy.get("output_quality")
+        if quality_policy.get("profile") == "premium_short_clip"
+        else None
+    )
 
     is_ai_suggested = _is_ai_suggested_clip(clip)
     has_prior_generation = _clip_has_prior_generation(
@@ -322,6 +339,10 @@ def generate_clip(
         "billingOwnerUserId": billing_owner_user_id,
         "chargeSource": access_context.charge_source,
         "workspaceRole": access_context.workspace_role,
+        "subscriptionTier": access_context.tier,
+        "sourceMaxHeight": quality_policy.get("source_max_height"),
+        "outputQualityOverride": output_quality_override,
+        "qualityPolicyProfile": quality_policy.get("profile"),
     }
 
     job_resp = (
@@ -365,6 +386,7 @@ def generate_clip(
 
 @router.post("/clips/custom", response_model=GenerateClipResponse)
 @limiter.limit("10/minute")
+@limiter.limit("5/minute", key_func=get_user_rate_key)
 def custom_clip(
     request: Request,
     payload: CustomClipRequest,
@@ -427,12 +449,14 @@ def custom_clip(
     existing = existing_query.limit(1).execute()
     raise_on_error(existing, "Failed to query existing video")
     billing_owner_user_id = access_context.billing_owner_user_id or user_id
+    created_video_for_request = False
     if existing.data and len(existing.data) > 0:
         video_id = existing.data[0]["id"]
         logger.info("Reusing existing video %s for url", video_id)
     else:
         enforce_monthly_video_limit(user_id, supabase_client=supabase)
         video_id = str(uuid4())
+        created_video_for_request = True
         video_resp = (
             supabase.table("videos")
             .insert(
@@ -464,6 +488,18 @@ def custom_clip(
         clip_insert["layout_id"] = payload.layoutId
     clip_resp = supabase.table("clips").insert(clip_insert).execute()
     raise_on_error(clip_resp, "Failed to insert clip")
+    created_clip_for_request = True
+
+    quality_policy = resolve_clip_quality_policy(
+        tier=access_context.tier,
+        clip_duration_seconds=duration,
+        requested_output_quality=None,
+    )
+    output_quality_override = (
+        quality_policy.get("output_quality")
+        if quality_policy.get("profile") == "premium_short_clip"
+        else None
+    )
 
     job_data = {
         "jobId": job_id,
@@ -482,6 +518,10 @@ def custom_clip(
         "billingOwnerUserId": billing_owner_user_id,
         "chargeSource": access_context.charge_source,
         "workspaceRole": access_context.workspace_role,
+        "subscriptionTier": access_context.tier,
+        "sourceMaxHeight": quality_policy.get("source_max_height"),
+        "outputQualityOverride": output_quality_override,
+        "qualityPolicyProfile": quality_policy.get("profile"),
     }
 
     job_resp = (
@@ -503,6 +543,12 @@ def custom_clip(
     )
     raise_on_error(job_resp, "Failed to insert job")
 
+    def _cleanup_custom_queue_full() -> None:
+        if created_clip_for_request:
+            _best_effort_delete_row("clips", clip_id)
+        if created_video_for_request:
+            _best_effort_delete_row("videos", video_id)
+
     enqueue_or_fail(
         queue_name=_clip_queue_for_context(access_context),
         task_path=CUSTOM_CLIP_TASK_PATH,
@@ -512,6 +558,7 @@ def custom_clip(
         job_type="generate_clip",
         video_id=video_id,
         clip_id=clip_id,
+        on_queue_full_cleanup=_cleanup_custom_queue_full,
     )
 
     return GenerateClipResponse(

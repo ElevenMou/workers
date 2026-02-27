@@ -13,6 +13,7 @@ import traceback
 from config import normalize_custom_clip_generation_credits
 from services.clip_generator import ClipGenerator, compute_video_position
 from services.clips.constants import canvas_size_for_aspect_ratio
+from services.clips.quality_policy import resolve_effective_output_quality
 from services.video_downloader import VideoDownloader
 from tasks.clips.helpers.captions import build_caption_ass
 from tasks.clips.helpers.lifecycle import (
@@ -30,6 +31,7 @@ from tasks.clips.helpers.layout import (
     resolve_effective_layout_id,
 )
 from tasks.clips.helpers.media import probe_video_size
+from tasks.clips.helpers.quality_controls import resolve_quality_controls
 from tasks.clips.helpers.smart_cleanup import apply_balanced_smart_cleanup
 from tasks.clips.helpers.source_video import (
     build_raw_video_metadata_update,
@@ -141,6 +143,13 @@ def custom_clip_task(job_data: CustomClipJob):
     billing_owner_user_id = job_data.get("billingOwnerUserId") or user_id
     charge_source = str(job_data.get("chargeSource") or "owner_wallet")
     workspace_role = str(job_data.get("workspaceRole") or "owner")
+    source_max_height = job_data.get("sourceMaxHeight")
+    try:
+        source_max_height = int(source_max_height) if source_max_height is not None else None
+    except (TypeError, ValueError):
+        source_max_height = None
+    output_quality_override = str(job_data.get("outputQualityOverride") or "").strip().lower() or None
+    quality_policy_profile = str(job_data.get("qualityPolicyProfile") or "").strip() or None
     smart_cleanup_summary = {
         "enabled": smart_cleanup_enabled,
         "profile": "balanced",
@@ -161,6 +170,7 @@ def custom_clip_task(job_data: CustomClipJob):
     downloader = VideoDownloader(work_dir=work_dir)
     audio_path: str | None = None
     uploaded_storage_path: str | None = None
+    uploaded_file_size: int | None = None
     source_video_strategy = "reused_existing"
     source_video_wait_seconds = 0.0
     source_video_download_seconds = 0.0
@@ -196,6 +206,77 @@ def custom_clip_task(job_data: CustomClipJob):
         assert_response_ok(clip_status_resp, f"Failed to mark clip {clip_id} generating")
 
         existing_video = _load_video_context_row(video_id)
+        clip_layout_resp = (
+            supabase.table("clips")
+            .select("layout_id")
+            .eq("id", clip_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        assert_response_ok(clip_layout_resp, f"Failed to load clip layout for {clip_id}")
+        clip_rows = clip_layout_resp.data or []
+        clip_layout_id = clip_rows[0].get("layout_id") if clip_rows else None
+
+        layout_selection = resolve_effective_layout_id(
+            user_id=user_id,
+            workspace_team_id=workspace_team_id,
+            workspace_role=workspace_role,
+            job_id=job_id,
+            logger=logger,
+            requested_layout_id=job_data.get("layoutId"),
+            clip_layout_id=clip_layout_id,
+        )
+        layout_id = layout_selection.layout_id
+        layout_should_persist = layout_selection.should_persist_to_clip
+        layout_overrides = load_layout_overrides(
+            user_id=user_id,
+            workspace_team_id=workspace_team_id,
+            workspace_role=workspace_role,
+            layout_id=layout_id,
+            job_id=job_id,
+            logger=logger,
+        )
+        bg_style = layout_overrides.bg_style
+        bg_color = layout_overrides.bg_color
+        blur_strength = layout_overrides.blur_strength
+        output_quality = resolve_effective_output_quality(
+            template_quality=layout_overrides.output_quality,
+            policy_override_quality=output_quality_override,
+        )
+        quality_controls = resolve_quality_controls(
+            output_quality=output_quality,
+            policy_source_max_height=source_max_height,
+        )
+        logger.info(
+            "[%s] Quality controls resolved (output=%s profile=%s policy_max_height=%s "
+            "effective_max_height=%s fresh_download=%s upload_reencode=%s smart_cleanup=%s/%s)",
+            job_id,
+            output_quality,
+            quality_policy_profile or "none",
+            source_max_height if source_max_height is not None else "best",
+            (
+                quality_controls.effective_source_max_height
+                if quality_controls.effective_source_max_height is not None
+                else "best"
+            ),
+            quality_controls.prefer_fresh_source_download,
+            quality_controls.allow_upload_reencode,
+            quality_controls.smart_cleanup_crf,
+            quality_controls.smart_cleanup_preset,
+        )
+
+        vid_cfg, title_cfg, cap_cfg, intro_cfg, outro_cfg, overlay_cfg = merge_layout_configs(
+            layout_overrides.layout_video,
+            layout_overrides.layout_title,
+            layout_overrides.layout_captions,
+            layout_overrides.layout_intro,
+            layout_overrides.layout_outro,
+            layout_overrides.layout_overlay,
+        )
+        canvas_aspect_ratio = str(vid_cfg.get("canvasAspectRatio") or "9:16")
+        video_scale_mode = str(vid_cfg.get("videoScaleMode") or "fit")
+        canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
 
         # 1. Resolve source video ---------------------------------------------
         waiting_stage_emitted = False
@@ -230,6 +311,8 @@ def custom_clip_task(job_data: CustomClipJob):
             persist_raw_video_path=_persist_video_raw_path,
             logger=logger,
             job_id=job_id,
+            source_max_height=quality_controls.effective_source_max_height,
+            prefer_fresh_download=quality_controls.prefer_fresh_source_download,
             on_wait_for_download=_emit_waiting_for_source,
             on_download_start=_emit_downloading_source,
         )
@@ -244,12 +327,18 @@ def custom_clip_task(job_data: CustomClipJob):
             detail_key="source_video_ready",
         )
         logger.info(
-            "[%s] Source video resolved for %s via %s (wait=%.2fs, download=%.2fs)",
+            "[%s] Source video resolved for %s via %s (wait=%.2fs, download=%.2fs, max_height=%s, quality_profile=%s)",
             job_id,
             video_id,
             source_video_strategy,
             source_video_wait_seconds,
             source_video_download_seconds,
+            (
+                quality_controls.effective_source_max_height
+                if quality_controls.effective_source_max_height is not None
+                else "best"
+            ),
+            quality_policy_profile or "none",
         )
 
         download_metadata = source_resolution.download_metadata or {}
@@ -386,55 +475,6 @@ def custom_clip_task(job_data: CustomClipJob):
         )
         assert_response_ok(save_video_resp, f"Failed to save transcript for {video_id}")
 
-        # 3. Load layout -------------------------------------------------------
-        clip_layout_resp = (
-            supabase.table("clips")
-            .select("layout_id")
-            .eq("id", clip_id)
-            .eq("user_id", user_id)
-            .limit(1)
-            .execute()
-        )
-        assert_response_ok(clip_layout_resp, f"Failed to load clip layout for {clip_id}")
-        clip_rows = clip_layout_resp.data or []
-        clip_layout_id = clip_rows[0].get("layout_id") if clip_rows else None
-
-        layout_selection = resolve_effective_layout_id(
-            user_id=user_id,
-            workspace_team_id=workspace_team_id,
-            workspace_role=workspace_role,
-            job_id=job_id,
-            logger=logger,
-            requested_layout_id=job_data.get("layoutId"),
-            clip_layout_id=clip_layout_id,
-        )
-        layout_id = layout_selection.layout_id
-        layout_should_persist = layout_selection.should_persist_to_clip
-        layout_overrides = load_layout_overrides(
-            user_id=user_id,
-            workspace_team_id=workspace_team_id,
-            workspace_role=workspace_role,
-            layout_id=layout_id,
-            job_id=job_id,
-            logger=logger,
-        )
-        bg_style = layout_overrides.bg_style
-        bg_color = layout_overrides.bg_color
-        blur_strength = layout_overrides.blur_strength
-        output_quality = layout_overrides.output_quality
-
-        vid_cfg, title_cfg, cap_cfg, intro_cfg, outro_cfg, overlay_cfg = merge_layout_configs(
-            layout_overrides.layout_video,
-            layout_overrides.layout_title,
-            layout_overrides.layout_captions,
-            layout_overrides.layout_intro,
-            layout_overrides.layout_outro,
-            layout_overrides.layout_overlay,
-        )
-        canvas_aspect_ratio = str(vid_cfg.get("canvasAspectRatio") or "9:16")
-        video_scale_mode = str(vid_cfg.get("videoScaleMode") or "fit")
-        canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
-
         bg_style, bg_image_path = maybe_download_layout_background_image(
             bg_style=bg_style,
             bg_image_storage_path=layout_overrides.bg_image_storage_path,
@@ -466,6 +506,8 @@ def custom_clip_task(job_data: CustomClipJob):
                 work_dir=work_dir,
                 start_time=start_time,
                 end_time=end_time,
+                crf=quality_controls.smart_cleanup_crf,
+                preset=quality_controls.smart_cleanup_preset,
             )
             video_path = cleanup_result["video_path"]
             transcript = cleanup_result["transcript"]
@@ -608,11 +650,12 @@ def custom_clip_task(job_data: CustomClipJob):
         )
         logger.info("[%s] Uploading clip to storage ...", job_id)
 
-        upload_clip_with_replace(
+        uploaded_file_size = upload_clip_with_replace(
             local_clip_path=result["clip_path"],
             storage_path=storage_path,
             job_id=job_id,
             logger=logger,
+            allow_reencode=quality_controls.allow_upload_reencode,
         )
         uploaded_storage_path = storage_path
 
@@ -654,7 +697,7 @@ def custom_clip_task(job_data: CustomClipJob):
             "status": "completed",
             "storage_path": storage_path,
             "thumbnail_path": None,
-            "file_size_bytes": result["file_size"],
+            "file_size_bytes": uploaded_file_size or result["file_size"],
             "asset_expires_at": asset_expires_at_iso(clip_retention_days),
             "asset_expired_at": None,
         }
@@ -674,7 +717,7 @@ def custom_clip_task(job_data: CustomClipJob):
                 detail_key="generation_finished",
                 extra_result_data={
                     "storage_path": storage_path,
-                    "file_size": result["file_size"],
+                    "file_size": uploaded_file_size or result["file_size"],
                     "source_video_strategy": source_video_strategy,
                     "source_video_wait_seconds": round(source_video_wait_seconds, 3),
                     "source_video_download_seconds": round(

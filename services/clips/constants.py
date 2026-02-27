@@ -40,9 +40,9 @@ TITLE_GAP = 12
 TITLE_LINE_HEIGHT_RATIO = 1.1
 
 QUALITY_PRESETS: dict[str, QualityPreset] = {
-    "low": {"crf": 28, "preset": "veryfast"},
-    "medium": {"crf": 23, "preset": "medium"},
-    "high": {"crf": 18, "preset": "slow"},
+    "low": {"crf": 23, "preset": "fast"},
+    "medium": {"crf": 18, "preset": "medium"},
+    "high": {"crf": 15, "preset": "slow"},
 }
 
 

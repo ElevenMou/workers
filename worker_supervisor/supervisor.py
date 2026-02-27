@@ -31,6 +31,8 @@ CLIP_PREFIX = "clip-worker"
 
 def run_supervisor() -> int:
     """Run the worker supervisor until interrupted."""
+    import os
+
     from config import (
         CLIP_ASSET_CLEANUP_INTERVAL_SECONDS,
         NUM_CLIP_WORKERS,
@@ -43,35 +45,89 @@ def run_supervisor() -> int:
     from tasks.videos.cleanup import cleanup_expired_raw_videos
     from utils.redis_client import (
         get_redis_connection,
+        get_group_worker_scale_target,
         get_worker_scale_target,
+        set_group_worker_scale_target,
         set_worker_scale_target,
     )
 
     validate_env()
+
+    # Optional WORKER_MODE restricts this supervisor to one worker group.
+    worker_mode = (os.getenv("WORKER_MODE") or "").strip().lower()
+    if worker_mode == "video":
+        effective_num_video = NUM_VIDEO_WORKERS
+        effective_num_clip = 0
+        logger.info("WORKER_MODE=video — only video workers will be managed")
+    elif worker_mode == "clip":
+        effective_num_video = 0
+        effective_num_clip = NUM_CLIP_WORKERS
+        logger.info("WORKER_MODE=clip — only clip workers will be managed")
+    else:
+        effective_num_video = NUM_VIDEO_WORKERS
+        effective_num_clip = NUM_CLIP_WORKERS
 
     worker_specs: dict[str, list[str]] = {}
     processes: dict[str, multiprocessing.Process] = {}
     startup_conn = get_redis_connection()
 
     if env_bool("RESET_WORKER_SCALE_ON_START", True):
-        desired_video_workers, desired_clip_workers = set_worker_scale_target(
-            connection=startup_conn,
-            video_workers=NUM_VIDEO_WORKERS,
-            clip_workers=NUM_CLIP_WORKERS,
-            default_video=NUM_VIDEO_WORKERS,
-            default_clip=NUM_CLIP_WORKERS,
-        )
+        if worker_mode == "video":
+            desired_video_workers = set_group_worker_scale_target(
+                group="video",
+                workers=effective_num_video,
+                connection=startup_conn,
+                default=effective_num_video,
+            )
+            desired_clip_workers = 0
+        elif worker_mode == "clip":
+            desired_video_workers = 0
+            desired_clip_workers = set_group_worker_scale_target(
+                group="clip",
+                workers=effective_num_clip,
+                connection=startup_conn,
+                default=effective_num_clip,
+            )
+        else:
+            desired_video_workers, desired_clip_workers = set_worker_scale_target(
+                connection=startup_conn,
+                video_workers=effective_num_video,
+                clip_workers=effective_num_clip,
+                default_video=effective_num_video,
+                default_clip=effective_num_clip,
+            )
         logger.info(
             "Reset worker scale target on startup to defaults: video=%d clip=%d",
             desired_video_workers,
             desired_clip_workers,
         )
     else:
-        desired_video_workers, desired_clip_workers = get_worker_scale_target(
-            connection=startup_conn,
-            default_video=NUM_VIDEO_WORKERS,
-            default_clip=NUM_CLIP_WORKERS,
-        )
+        if worker_mode == "video":
+            desired_video_workers = get_group_worker_scale_target(
+                group="video",
+                connection=startup_conn,
+                default=effective_num_video,
+            )
+            desired_clip_workers = 0
+        elif worker_mode == "clip":
+            desired_video_workers = 0
+            desired_clip_workers = get_group_worker_scale_target(
+                group="clip",
+                connection=startup_conn,
+                default=effective_num_clip,
+            )
+        else:
+            desired_video_workers, desired_clip_workers = get_worker_scale_target(
+                connection=startup_conn,
+                default_video=effective_num_video,
+                default_clip=effective_num_clip,
+            )
+
+    # Enforce WORKER_MODE limits even when reading from Redis.
+    if worker_mode == "video":
+        desired_clip_workers = 0
+    elif worker_mode == "clip":
+        desired_video_workers = 0
 
     for i in range(desired_video_workers):
         worker_specs[f"{VIDEO_PREFIX}-{i}"] = list(VIDEO_QUEUE_ORDER)
@@ -161,11 +217,26 @@ def run_supervisor() -> int:
                     last_processing_recovery_run = now
 
             try:
-                target_video_workers, target_clip_workers = get_worker_scale_target(
-                    connection=startup_conn,
-                    default_video=current_video_workers,
-                    default_clip=current_clip_workers,
-                )
+                if worker_mode == "video":
+                    target_video_workers = get_group_worker_scale_target(
+                        group="video",
+                        connection=startup_conn,
+                        default=current_video_workers,
+                    )
+                    target_clip_workers = 0
+                elif worker_mode == "clip":
+                    target_video_workers = 0
+                    target_clip_workers = get_group_worker_scale_target(
+                        group="clip",
+                        connection=startup_conn,
+                        default=current_clip_workers,
+                    )
+                else:
+                    target_video_workers, target_clip_workers = get_worker_scale_target(
+                        connection=startup_conn,
+                        default_video=current_video_workers,
+                        default_clip=current_clip_workers,
+                    )
             except Exception as exc:
                 logger.warning("Failed to read scale target from Redis: %s", exc)
                 target_video_workers = current_video_workers

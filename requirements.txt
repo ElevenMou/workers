@@ -15,5 +15,7 @@ openai-whisper==20250625
 stopwordsiso==0.6.1
 fastapi==0.115.0
 uvicorn==0.32.0
+gunicorn==23.0.0
 slowapi==0.1.9
+PyJWT[crypto]==2.10.1
 pytest==8.3.4

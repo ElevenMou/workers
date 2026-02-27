@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from api_app.jwt_verifier import extract_rate_limit_user_id
 from config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 
 _bearer = HTTPBearer(auto_error=False)
@@ -116,3 +117,23 @@ def require_admin_user(
         detail="Admin access required",
     )
 
+
+def get_user_rate_key(request: Request) -> str:
+    """Extract the authenticated user ID for per-user rate limiting.
+
+    Falls back to the client IP when the user cannot be resolved (e.g.
+    unauthenticated preflight requests) so the limiter always gets a key.
+    """
+    try:
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+            if token:
+                user_id = extract_rate_limit_user_id(token)
+                if user_id:
+                    return f"user:{user_id}"
+    except Exception:
+        pass
+    from slowapi.util import get_remote_address
+
+    return get_remote_address(request)

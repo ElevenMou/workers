@@ -1138,6 +1138,8 @@ def apply_balanced_smart_cleanup(
     work_dir: str,
     start_time: float,
     end_time: float,
+    crf: int = 21,
+    preset: str = "medium",
 ) -> SmartCleanupResult:
     plan = plan_balanced_smart_cleanup(
         transcript=transcript,
@@ -1151,6 +1153,8 @@ def apply_balanced_smart_cleanup(
         keep_intervals=plan["keep_intervals"],
         output_path=output_path,
         work_dir=work_dir,
+        crf=crf,
+        preset=preset,
     )
 
     summary = dict(plan["summary"])

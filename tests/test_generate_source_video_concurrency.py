@@ -162,6 +162,168 @@ def test_resolve_source_video_reuses_existing_raw_path_without_download(
     assert result.video_path == str(existing_path)
 
 
+def test_resolve_source_video_prefers_fresh_download_when_requested(
+    monkeypatch,
+    tmp_path: Path,
+):
+    existing_path = tmp_path / "cached.mp4"
+    existing_path.write_bytes(b"cached")
+    fresh_path = tmp_path / "fresh.mp4"
+    persisted_path = {"value": None}
+    download_called = {"value": False}
+
+    class _FakeDownloader:
+        def download(self, _url: str, _video_id: str):
+            download_called["value"] = True
+            fresh_path.write_bytes(b"fresh")
+            return {"path": str(fresh_path), "duration": 60}
+
+    monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
+    monkeypatch.setattr(source_video, "get_redis_connection", lambda: None)
+
+    result = source_video.resolve_source_video(
+        video_id="video-fresh",
+        source_url="https://example.com/watch?v=fresh",
+        initial_raw_video_path=str(existing_path),
+        downloader=_FakeDownloader(),
+        load_video_row=lambda _video_id: {
+            "raw_video_path": str(existing_path),
+            "url": "https://example.com/watch?v=fresh",
+        },
+        persist_raw_video_path=lambda _video_id, raw_path: persisted_path.__setitem__(
+            "value", raw_path
+        ),
+        logger=type(
+            "Logger",
+            (),
+            {
+                "warning": lambda *args, **kwargs: None,
+                "info": lambda *args, **kwargs: None,
+            },
+        )(),
+        job_id="job-fresh",
+        prefer_fresh_download=True,
+    )
+
+    assert download_called["value"] is True
+    assert persisted_path["value"] == str(fresh_path)
+    assert result.strategy == "downloaded_now"
+    assert result.video_path == str(fresh_path)
+
+
+def test_resolve_source_video_can_request_unbounded_source_height(
+    monkeypatch,
+    tmp_path: Path,
+):
+    captured_max_height = {"value": "unset"}
+    fresh_path = tmp_path / "fresh-best.mp4"
+
+    class _FakeDownloader:
+        def download(self, _url: str, _video_id: str, *, max_height: int | None = 1080):
+            captured_max_height["value"] = max_height
+            fresh_path.write_bytes(b"fresh")
+            return {"path": str(fresh_path), "duration": 60}
+
+    monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
+    monkeypatch.setattr(source_video, "get_redis_connection", lambda: None)
+
+    result = source_video.resolve_source_video(
+        video_id="video-best-source",
+        source_url="https://example.com/watch?v=best",
+        initial_raw_video_path=None,
+        downloader=_FakeDownloader(),
+        load_video_row=lambda _video_id: {"raw_video_path": None, "url": None},
+        persist_raw_video_path=lambda *_args, **_kwargs: None,
+        logger=type("Logger", (), {"warning": lambda *args, **kwargs: None})(),
+        job_id="job-best-source",
+        source_max_height=None,
+        prefer_fresh_download=True,
+    )
+
+    assert captured_max_height["value"] is None
+    assert result.video_path == str(fresh_path)
+
+
+def test_resolve_source_video_prefers_fresh_but_reuses_waited_download(
+    monkeypatch,
+    tmp_path: Path,
+):
+    stale_path = tmp_path / "stale.mp4"
+    stale_path.write_bytes(b"stale")
+    fresh_path = tmp_path / "fresh.mp4"
+    shared_row = {
+        "raw_video_path": str(stale_path),
+        "url": "https://example.com/watch?v=fresh-wait",
+    }
+    row_lock = threading.Lock()
+    fake_redis = _FakeRedis()
+    download_calls: list[str] = []
+
+    class _FakeDownloader:
+        def download(self, _url: str, video_id: str):
+            download_calls.append(video_id)
+            time.sleep(0.08)
+            fresh_path.write_bytes(b"fresh")
+            return {
+                "path": str(fresh_path),
+                "duration": 120,
+            }
+
+    def _load_video_row(_video_id: str) -> dict:
+        with row_lock:
+            return dict(shared_row)
+
+    def _persist_raw_video_path(_video_id: str, raw_path: str):
+        with row_lock:
+            shared_row["raw_video_path"] = raw_path
+
+    monkeypatch.setattr(source_video, "get_redis_connection", lambda: fake_redis)
+    monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
+    monkeypatch.setattr(source_video, "SOURCE_VIDEO_LOCK_WAIT_SECONDS", 5)
+    monkeypatch.setattr(source_video, "_WAIT_POLL_INTERVAL_SECONDS", 0.01)
+
+    results: dict[str, source_video.SourceVideoResolution] = {}
+    errors: list[Exception] = []
+    barrier = threading.Barrier(2)
+
+    def _run(worker_name: str):
+        try:
+            barrier.wait(timeout=2)
+            resolution = source_video.resolve_source_video(
+                video_id="video-fresh-wait",
+                source_url=shared_row["url"],
+                initial_raw_video_path=str(stale_path),
+                downloader=_FakeDownloader(),
+                load_video_row=_load_video_row,
+                persist_raw_video_path=_persist_raw_video_path,
+                logger=type("Logger", (), {"warning": lambda *args, **kwargs: None})(),
+                job_id=worker_name,
+                prefer_fresh_download=True,
+                on_wait_for_download=lambda _elapsed: None,
+                on_download_start=lambda: None,
+            )
+            results[worker_name] = resolution
+        except Exception as exc:  # pragma: no cover - assertion path
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_run, args=("job-a",), daemon=True)
+    t2 = threading.Thread(target=_run, args=("job-b",), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(timeout=2)
+    t2.join(timeout=2)
+
+    assert not errors
+    assert len(download_calls) == 1
+    assert len(results) == 2
+    strategies = {resolution.strategy for resolution in results.values()}
+    assert "downloaded_now" in strategies
+    assert "waited_and_reused" in strategies
+    reused = [resolution for resolution in results.values() if resolution.strategy == "waited_and_reused"]
+    assert reused
+    assert reused[0].video_path == str(fresh_path)
+
+
 def test_resolve_source_video_times_out_when_lock_is_never_released(monkeypatch):
     wait_events = {"count": 0}
 

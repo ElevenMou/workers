@@ -8,6 +8,10 @@ from tasks.clips.helpers.layout import (
     resolve_effective_layout_id,
 )
 from tasks.clips.helpers.media import probe_video_size
+from tasks.clips.helpers.quality_controls import (
+    ClipQualityControls,
+    resolve_quality_controls,
+)
 from tasks.clips.helpers.source_video import (
     SourceVideoResolution,
     build_raw_video_metadata_update,
@@ -16,12 +20,14 @@ from tasks.clips.helpers.source_video import (
 
 __all__ = [
     "LayoutOverrides",
+    "ClipQualityControls",
     "SourceVideoResolution",
     "build_caption_ass",
     "build_raw_video_metadata_update",
     "load_layout_overrides",
     "maybe_download_layout_background_image",
     "probe_video_size",
+    "resolve_quality_controls",
     "resolve_source_video",
     "resolve_effective_layout_id",
 ]

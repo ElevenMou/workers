@@ -31,6 +31,30 @@ def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
     return parsed
 
 
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    value = os.getenv(name)
+    if value is None:
+        parsed = float(default)
+    else:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            logger.warning("Invalid %s=%r; using default %s", name, value, default)
+            parsed = float(default)
+
+    if minimum is not None:
+        parsed = max(float(minimum), parsed)
+    if maximum is not None:
+        parsed = min(float(maximum), parsed)
+    return parsed
+
+
 # ---------------------------------------------------------------------------
 # Supabase
 # ---------------------------------------------------------------------------
@@ -43,6 +67,18 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB = int(os.getenv("REDIS_DB", 0))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
+REDIS_MAX_CONNECTIONS = _env_int("REDIS_MAX_CONNECTIONS", 20, minimum=5)
+REDIS_CONNECTION_ALERT_THRESHOLD = _env_float(
+    "REDIS_CONNECTION_ALERT_THRESHOLD",
+    0.80,
+    minimum=0.05,
+    maximum=1.0,
+)
+
+# Queue backpressure - reject enqueues above these depths.
+MAX_VIDEO_QUEUE_DEPTH = _env_int("MAX_VIDEO_QUEUE_DEPTH", 500, minimum=10)
+MAX_CLIP_QUEUE_DEPTH = _env_int("MAX_CLIP_QUEUE_DEPTH", 1000, minimum=10)
 
 # ---------------------------------------------------------------------------
 # Storage

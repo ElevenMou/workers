@@ -35,6 +35,10 @@ class GenerateClipJob(TypedDict):
     billingOwnerUserId: NotRequired[str | None]
     chargeSource: NotRequired[str]
     workspaceRole: NotRequired[str]
+    subscriptionTier: NotRequired[str]
+    sourceMaxHeight: NotRequired[int | None]
+    outputQualityOverride: NotRequired[str | None]
+    qualityPolicyProfile: NotRequired[str]
 
 
 class CustomClipJob(TypedDict):
@@ -54,3 +58,7 @@ class CustomClipJob(TypedDict):
     billingOwnerUserId: NotRequired[str | None]
     chargeSource: NotRequired[str]
     workspaceRole: NotRequired[str]
+    subscriptionTier: NotRequired[str]
+    sourceMaxHeight: NotRequired[int | None]
+    outputQualityOverride: NotRequired[str | None]
+    qualityPolicyProfile: NotRequired[str]

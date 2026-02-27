@@ -261,6 +261,11 @@ def extract_segment(
                 crf=qp["crf"],
                 preset=qp["preset"],
                 pix_fmt="yuv420p",
+                ar=48000,
+                audio_bitrate="256k",
+                colorspace="bt709",
+                color_primaries="bt709",
+                color_trc="bt709",
                 movflags="+faststart",
             )
             .overwrite_output()
@@ -319,6 +324,7 @@ def create_portrait_background(
             force_original_aspect_ratio="increase"
             if scale_mode == "fill"
             else "decrease",
+            flags="lanczos",
         )
         if scale_mode == "fill":
             stream = stream.filter("crop", vid_w, vid_h)
@@ -329,7 +335,7 @@ def create_portrait_background(
 
         (
             ffmpeg.input(input_path)
-            .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase")
+            .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase", flags="lanczos")
             .filter("crop", canvas_w, canvas_h)
             .filter("boxblur", blur_strength)
             .output(bg_temp)
@@ -387,7 +393,7 @@ def create_portrait_background(
 
         (
             ffmpeg.input(background_image_path)
-            .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase")
+            .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase", flags="lanczos")
             .filter("crop", canvas_w, canvas_h)
             .output(bg_img_scaled, vframes=1)
             .overwrite_output()
@@ -560,7 +566,11 @@ def add_overlays(
                 acodec="aac",
                 crf=qp["crf"],
                 preset=qp["preset"],
-                audio_bitrate="192k",
+                pix_fmt="yuv420p",
+                audio_bitrate="256k",
+                colorspace="bt709",
+                color_primaries="bt709",
+                color_trc="bt709",
                 movflags="+faststart",
             )
             .overwrite_output()
@@ -610,25 +620,39 @@ def compose_clip(
     overlay_cfg: dict | None = None,
     background_color: str = "#000000",
     background_image_path: str | None = None,
+    start_time: float | None = None,
+    end_time: float | None = None,
 ) -> None:
-    """Compose background, source video, title/captions, and overlay in one pass."""
+    """Compose background, source video, title/captions, and overlay in one pass.
+
+    When *start_time* and *end_time* are provided the source is seeked directly,
+    eliminating the need for a separate ``extract_segment()`` call and avoiding
+    an extra re-encoding pass.
+    """
     logger.info(
-        "Compositing clip (style=%s, overlay=%s, captions=%s, title=%s)",
+        "Compositing clip (style=%s, overlay=%s, captions=%s, title=%s, seek=%s)",
         style,
         bool(overlay_file_path),
         bool(caption_ass_path),
         bool(title_show and title_lines),
+        f"{start_time:.2f}-{end_time:.2f}" if start_time is not None else "none",
     )
 
-    duration_seconds = max(0.1, _probe_media_duration(input_path))
+    if start_time is not None and end_time is not None:
+        duration_seconds = max(0.1, end_time - start_time)
+        source = ffmpeg.input(input_path, ss=start_time, t=duration_seconds)
+    else:
+        duration_seconds = max(0.1, _probe_media_duration(input_path))
+        source = ffmpeg.input(input_path)
+
     scale_mode = normalize_video_scale_mode(video_scale_mode)
-    source = ffmpeg.input(input_path)
 
     foreground = source.video.filter(
         "scale",
         vid_w,
         vid_h,
         force_original_aspect_ratio="increase" if scale_mode == "fill" else "decrease",
+        flags="lanczos",
     )
     if scale_mode == "fill":
         foreground = foreground.filter("crop", vid_w, vid_h)
@@ -636,7 +660,9 @@ def compose_clip(
     if style == "blur":
         background = (
             source.video.filter(
-                "scale", canvas_w, canvas_h, force_original_aspect_ratio="increase"
+                "scale", canvas_w, canvas_h,
+                force_original_aspect_ratio="increase",
+                flags="lanczos",
             )
             .filter("crop", canvas_w, canvas_h)
             .filter("boxblur", blur_strength)
@@ -657,7 +683,11 @@ def compose_clip(
                 t=duration_seconds,
                 framerate=30,
             )
-            .video.filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase")
+            .video.filter(
+                "scale", canvas_w, canvas_h,
+                force_original_aspect_ratio="increase",
+                flags="lanczos",
+            )
             .filter("crop", canvas_w, canvas_h)
         )
         stream = ffmpeg.filter([background, foreground], "overlay", vid_x, vid_y)
@@ -744,13 +774,13 @@ def compose_clip(
     audio_stream = source.audio if _media_has_audio(input_path) else None
     if audio_stream is None:
         audio_stream = ffmpeg.input(
-            "anullsrc=r=44100:cl=stereo",
+            "anullsrc=r=48000:cl=stereo",
             f="lavfi",
             t=duration_seconds,
         ).audio
-    audio_stream = audio_stream.filter("aresample", 44100).filter(
+    audio_stream = audio_stream.filter("aresample", 48000).filter(
         "aformat",
-        sample_rates=44100,
+        sample_rates=48000,
         channel_layouts="stereo",
     )
 
@@ -765,7 +795,10 @@ def compose_clip(
                 crf=qp["crf"],
                 preset=qp["preset"],
                 pix_fmt="yuv420p",
-                audio_bitrate="192k",
+                audio_bitrate="256k",
+                colorspace="bt709",
+                color_primaries="bt709",
+                color_trc="bt709",
                 movflags="+faststart",
             )
             .overwrite_output()
@@ -798,14 +831,14 @@ def _prepare_intro_outro_segment(
         if media_type == "image":
             video_stream = (
                 ffmpeg.input(file_path, loop=1, t=duration, framerate=30)
-                .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="decrease")
+                .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="decrease", flags="lanczos")
                 .filter("pad", canvas_w, canvas_h, "(ow-iw)/2", "(oh-ih)/2", color="black")
                 .filter("setsar", "1")
                 .filter("fps", 30)
                 .filter("setpts", "PTS-STARTPTS")
             )
             audio_stream = ffmpeg.input(
-                "anullsrc=r=44100:cl=stereo",
+                "anullsrc=r=48000:cl=stereo",
                 f="lavfi",
                 t=duration,
             ).audio
@@ -814,7 +847,7 @@ def _prepare_intro_outro_segment(
             segment_input = ffmpeg.input(file_path, ss=0, t=duration)
             video_stream = (
                 segment_input.video
-                .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="decrease")
+                .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="decrease", flags="lanczos")
                 .filter("pad", canvas_w, canvas_h, "(ow-iw)/2", "(oh-ih)/2", color="black")
                 .filter("setsar", "1")
                 .filter("fps", 30)
@@ -825,12 +858,12 @@ def _prepare_intro_outro_segment(
                 audio_stream = (
                     segment_input.audio.filter("atrim", duration=duration)
                     .filter("asetpts", "PTS-STARTPTS")
-                    .filter("aresample", 44100)
-                    .filter("aformat", sample_rates=44100, channel_layouts="stereo")
+                    .filter("aresample", 48000)
+                    .filter("aformat", sample_rates=48000, channel_layouts="stereo")
                 )
             else:
                 audio_stream = ffmpeg.input(
-                    "anullsrc=r=44100:cl=stereo",
+                    "anullsrc=r=48000:cl=stereo",
                     f="lavfi",
                     t=duration,
                 ).audio
@@ -845,6 +878,10 @@ def _prepare_intro_outro_segment(
                 crf=qp["crf"],
                 preset=qp["preset"],
                 pix_fmt="yuv420p",
+                audio_bitrate="256k",
+                colorspace="bt709",
+                color_primaries="bt709",
+                color_trc="bt709",
                 movflags="+faststart",
                 shortest=None,
             )
@@ -925,6 +962,7 @@ def concat_intro_outro(
                     canvas_w,
                     canvas_h,
                     force_original_aspect_ratio="decrease",
+                    flags="lanczos",
                 )
                 .filter("pad", canvas_w, canvas_h, "(ow-iw)/2", "(oh-ih)/2", color="black")
                 .filter("setsar", "1")
@@ -936,12 +974,12 @@ def concat_intro_outro(
                 segment_audio = (
                     segment_input.audio.filter("atrim", duration=segment_duration)
                     .filter("asetpts", "PTS-STARTPTS")
-                    .filter("aresample", 44100)
-                    .filter("aformat", sample_rates=44100, channel_layouts="stereo")
+                    .filter("aresample", 48000)
+                    .filter("aformat", sample_rates=48000, channel_layouts="stereo")
                 )
             else:
                 segment_audio = ffmpeg.input(
-                    "anullsrc=r=44100:cl=stereo",
+                    "anullsrc=r=48000:cl=stereo",
                     f="lavfi",
                     t=segment_duration,
                 ).audio
@@ -961,6 +999,10 @@ def concat_intro_outro(
                 crf=qp["crf"],
                 preset=qp["preset"],
                 pix_fmt="yuv420p",
+                audio_bitrate="256k",
+                colorspace="bt709",
+                color_primaries="bt709",
+                color_trc="bt709",
                 movflags="+faststart",
             )
             .overwrite_output()
@@ -974,11 +1016,30 @@ def concat_intro_outro(
     return intermediates
 
 
-def generate_thumbnail(video_path: str, output_path: str) -> None:
-    """Generate a thumbnail image from the clip."""
-    (
-        ffmpeg.input(video_path, ss=1)
-        .output(output_path, vframes=1)
-        .overwrite_output()
-        .run(quiet=True)
-    )
+def generate_thumbnail(
+    video_path: str,
+    output_path: str,
+    *,
+    width: int = 720,
+    quality: int = 2,
+) -> None:
+    """Generate a high-quality thumbnail image from the clip.
+
+    Seeks to ~10 % of the clip duration to avoid black frames and title cards.
+    Scales to a consistent width with lanczos and applies JPEG quality control.
+    """
+    duration = _probe_media_duration(video_path)
+    seek = max(0.5, duration * 0.1) if duration > 2.0 else 0.0
+
+    try:
+        (
+            ffmpeg.input(video_path, ss=seek)
+            .filter("scale", width, -1, flags="lanczos")
+            .output(output_path, vframes=1, **{"q:v": quality})
+            .overwrite_output()
+            .run(capture_stderr=True)
+        )
+    except ffmpeg.Error as e:
+        stderr_output = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+        logger.error("Thumbnail generation failed for %s:\n%s", video_path, stderr_output)
+        raise

@@ -265,37 +265,48 @@ def recover_stale_processing_rows(
 
     cutoff_iso = (datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)).isoformat()
 
-    started_rows_resp = (
+    _PAGE_SIZE = 500
+
+    def _paginated_query(query_builder, context_msg: str) -> list[dict]:
+        """Fetch all matching rows in pages of _PAGE_SIZE."""
+        all_rows: list[dict] = []
+        offset = 0
+        while True:
+            page_resp = (
+                query_builder
+                .range(offset, offset + _PAGE_SIZE - 1)
+                .execute()
+            )
+            assert_response_ok(page_resp, context_msg)
+            page = list(page_resp.data or [])
+            all_rows.extend(page)
+            if len(page) < _PAGE_SIZE:
+                break
+            offset += _PAGE_SIZE
+        return all_rows
+
+    rows = _paginated_query(
         supabase.table("jobs")
         .select("id,type,clip_id,video_id,started_at,created_at")
         .eq("status", "processing")
-        .lt("started_at", cutoff_iso)
-        .limit(500)
-        .execute()
-    )
-    assert_response_ok(
-        started_rows_resp,
+        .lt("started_at", cutoff_iso),
         "Failed to query stale processing jobs by started_at",
     )
-    rows = list(started_rows_resp.data or [])
 
-    created_rows_resp = (
+    seen_ids = {row.get("id") for row in rows}
+    created_rows = _paginated_query(
         supabase.table("jobs")
         .select("id,type,clip_id,video_id,started_at,created_at")
         .eq("status", "processing")
         .is_("started_at", "null")
-        .lt("created_at", cutoff_iso)
-        .limit(500)
-        .execute()
-    )
-    assert_response_ok(
-        created_rows_resp,
+        .lt("created_at", cutoff_iso),
         "Failed to query stale processing jobs by created_at fallback",
     )
-    for row in created_rows_resp.data or []:
+    for row in created_rows:
         row_id = row.get("id")
-        if row_id and not any(existing.get("id") == row_id for existing in rows):
+        if row_id and row_id not in seen_ids:
             rows.append(row)
+            seen_ids.add(row_id)
 
     if not rows:
         return 0

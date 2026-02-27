@@ -78,8 +78,11 @@ def _resolve_font_size_for_play_res(
     play_res: tuple[int, int],
 ) -> int:
     font_size = _to_int(preset.get("font_size"), 64)
-    if play_res[0] >= 1920 and play_res[1] <= 1080:
-        font_size = max(36, int(math.floor(font_size * 0.72)))
+    # Scale proportionally to the 1080×1920 (9:16) reference canvas.
+    reference_height = 1920
+    scale_factor = play_res[1] / reference_height
+    if abs(scale_factor - 1.0) > 0.05:
+        font_size = max(42, int(math.floor(font_size * max(0.6, scale_factor))))
     return max(8, font_size)
 
 
@@ -568,14 +571,20 @@ def _style_line(
     alignment, margin_v = _resolve_alignment_and_margin(preset, play_res)
     margin_l = _to_int(preset.get("margin_l"), _to_int(preset.get("safe_margin_x"), 56))
     margin_r = _to_int(preset.get("margin_r"), _to_int(preset.get("safe_margin_x"), 56))
-    outline = max(0, _to_int(preset.get("outline"), 3))
-    shadow = max(0, _to_int(preset.get("shadow"), 1))
+    base_outline = max(0, _to_int(preset.get("outline"), 3))
+    base_shadow = max(0, _to_int(preset.get("shadow"), 1))
     border_style = 3 if bool(preset.get("background_box", False)) else 1
     bold_flag = -1 if bool(preset.get("bold", True)) else 0
     italic_flag = -1 if bool(preset.get("italic", False)) else 0
     underline_flag = -1 if bool(preset.get("underline", False)) else 0
 
     font_size = _resolve_font_size_for_play_res(preset, play_res=play_res)
+
+    # Scale outline and shadow proportionally to font size change.
+    base_font_size = max(1, _to_int(preset.get("font_size"), 64))
+    size_ratio = font_size / base_font_size
+    outline = max(0, int(round(base_outline * size_ratio)))
+    shadow = max(0, int(round(base_shadow * size_ratio)))
 
     return (
         "Style: Default,"

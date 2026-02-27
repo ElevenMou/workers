@@ -5,21 +5,15 @@ import os
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
+from api_app.rate_limit import limiter
 from api_app.routers.captions import router as captions_router
 from api_app.routers.clips import router as clips_router
 from api_app.routers.health import router as health_router
 from api_app.routers.videos import router as videos_router
 from api_app.routers.workers import router as workers_router
 from config import validate_env
-
-# ---------------------------------------------------------------------------
-# Rate limiting
-# ---------------------------------------------------------------------------
-limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(title="Clipry Workers API", version="1.0.0")
 app.state.limiter = limiter
