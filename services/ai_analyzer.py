@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List
 
 from anthropic import Anthropic
@@ -12,11 +13,23 @@ logger = logging.getLogger(__name__)
 DEFAULT_ANALYZER_MODEL = os.getenv("CLAUDE_ANALYZER_MODEL", "claude-sonnet-4-20250514")
 # Approx 4 chars per token; cap transcript to stay within context and reduce cost
 MAX_TRANSCRIPT_CHARS = int(os.getenv("CLAUDE_ANALYZER_MAX_TRANSCRIPT_CHARS", "-1"))
+# Claude API call timeout
+_CLAUDE_TIMEOUT_SECONDS = float(os.getenv("CLAUDE_ANALYZER_TIMEOUT_SECONDS", "120"))
+# Circuit breaker settings
+_CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CLAUDE_CIRCUIT_BREAKER_THRESHOLD", "3"))
+_CIRCUIT_BREAKER_COOLDOWN = float(os.getenv("CLAUDE_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "60"))
 
 
 class AIAnalyzer:
+    # Circuit breaker state (shared across instances within a worker process)
+    _consecutive_failures: int = 0
+    _circuit_open_until: float = 0.0
+
     def __init__(self):
-        self.client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        self.client = Anthropic(
+            api_key=os.getenv("ANTHROPIC_API_KEY"),
+            timeout=_CLAUDE_TIMEOUT_SECONDS,
+        )
         self.model = DEFAULT_ANALYZER_MODEL
 
     @staticmethod
@@ -251,6 +264,18 @@ Transcript (each: text, start, duration):
 Return ONLY valid JSON matching the schema. Do not return clips shorter than {min_duration}s.
 Do not include intro/outro/CTA/sponsor/filler clips."""
 
+        # Circuit breaker: fail fast if Claude API has been failing repeatedly
+        if AIAnalyzer._consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD:
+            if time.monotonic() < AIAnalyzer._circuit_open_until:
+                raise RuntimeError(
+                    f"Claude API circuit breaker open after {_CIRCUIT_BREAKER_THRESHOLD} "
+                    f"consecutive failures. Cooldown until "
+                    f"{AIAnalyzer._circuit_open_until - time.monotonic():.0f}s remaining."
+                )
+            # Cooldown expired — allow a single probe attempt
+            logger.info("Circuit breaker cooldown expired, attempting probe request")
+            AIAnalyzer._consecutive_failures = 0
+
         try:
             message = self.client.messages.create(
                 model=self.model,
@@ -258,6 +283,8 @@ Do not include intro/outro/CTA/sponsor/filler clips."""
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_message}],
             )
+            # Reset circuit breaker on success
+            AIAnalyzer._consecutive_failures = 0
 
             if not message.content:
                 raise RuntimeError("Analyzer returned no content blocks")
@@ -296,5 +323,14 @@ Do not include intro/outro/CTA/sponsor/filler clips."""
             return normalized[: max(1, int(num_clips))]
 
         except Exception as e:
+            AIAnalyzer._consecutive_failures += 1
+            if AIAnalyzer._consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD:
+                AIAnalyzer._circuit_open_until = time.monotonic() + _CIRCUIT_BREAKER_COOLDOWN
+                logger.warning(
+                    "Claude API circuit breaker opened after %d consecutive failures. "
+                    "Cooldown: %.0fs",
+                    AIAnalyzer._consecutive_failures,
+                    _CIRCUIT_BREAKER_COOLDOWN,
+                )
             logger.exception("Claude analyzer call failed: %s", e)
             raise

@@ -495,6 +495,17 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             "downloading_video",
             billing_state=billing_state,
         )
+
+        # Pre-flight disk space check to fail fast before a large download
+        import shutil as _shutil
+        _disk = _shutil.disk_usage(work_dir)
+        _free_gb = _disk.free / (1024 ** 3)
+        if _free_gb < 1.0:
+            raise RuntimeError(
+                f"Insufficient disk space for video download: {_free_gb:.2f} GB free "
+                f"(minimum 1 GB required)"
+            )
+
         logger.info("[%s] Downloading video: %s", job_id, url)
         video_data = downloader.download(url, video_id)
         video_path = video_data["path"]
@@ -1023,7 +1034,21 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         raise
 
     finally:
-        # Clean up audio (video stays - needed for clip generation)
+        # Clean up audio file
         if audio_path and os.path.exists(audio_path):
             os.remove(audio_path)
             logger.debug("[%s] Removed temp audio %s", job_id, audio_path)
+
+        # Clean up work directory if video was successfully uploaded to storage.
+        # If upload didn't happen, keep local files for clip generation until
+        # the maintenance cleanup runs (raw_video_expires_at).
+        if work_dir and os.path.isdir(work_dir):
+            import shutil as _shutil_cleanup
+            try:
+                _shutil_cleanup.rmtree(work_dir, ignore_errors=True)
+                logger.debug("[%s] Cleaned up work directory %s", job_id, work_dir)
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "[%s] Failed to clean work_dir %s: %s",
+                    job_id, work_dir, cleanup_exc,
+                )

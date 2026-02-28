@@ -1,5 +1,8 @@
 """Video analysis and credit-cost endpoints."""
 
+from __future__ import annotations
+
+import asyncio
 from math import ceil
 from uuid import uuid4
 
@@ -199,7 +202,7 @@ def _raise_if_insufficient_credits(
 @router.post("/videos/analyze", response_model=AnalyzeVideoResponse)
 @limiter.limit("10/minute")
 @limiter.limit("5/minute", key_func=get_user_rate_key)
-def analyze_video(
+async def analyze_video(
     request: Request,
     payload: AnalyzeVideoRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
@@ -218,7 +221,17 @@ def analyze_video(
     )
 
     # Enforce validation gate equivalent to /credits/cost before job enqueue.
-    url_probe = _probe_credit_cost_for_url(url_str)
+    # Run in a thread with timeout to avoid blocking the event loop.
+    try:
+        url_probe = await asyncio.wait_for(
+            asyncio.to_thread(_probe_credit_cost_for_url, url_str),
+            timeout=15.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Video URL probe timed out. Please try again.",
+        )
     if not url_probe["valid_url"]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -440,7 +453,7 @@ def analyze_video(
 @router.post("/credits/cost", response_model=CreditsCostByUrlResponse)
 @limiter.limit("15/minute")
 @limiter.limit("10/minute", key_func=get_user_rate_key)
-def get_credit_cost_from_url(
+async def get_credit_cost_from_url(
     request: Request,
     payload: CreditsCostByUrlRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
@@ -453,7 +466,16 @@ def get_credit_cost_from_url(
     # Suggested clips created from AI analysis are free on first generation.
     clip_generation_credits_per_clip = 0
     smart_cleanup_surcharge_per_clip = 0
-    probe = _probe_credit_cost_for_url(url_str)
+    try:
+        probe = await asyncio.wait_for(
+            asyncio.to_thread(_probe_credit_cost_for_url, url_str),
+            timeout=15.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Video URL probe timed out. Please try again.",
+        )
     max_analysis_duration_seconds = access_context.max_analysis_duration_seconds
     analysis_duration_seconds = int(probe.get("duration_seconds") or 0)
     duration_limit_exceeded = not is_analysis_duration_allowed(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from urllib.parse import quote
 import redis
+from fastapi import Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -22,6 +23,15 @@ _rate_limits_enabled = os.getenv("DISABLE_RATE_LIMITS", "").strip().lower() not 
 }
 
 
+def _get_real_client_ip(request: Request) -> str:
+    """Extract the real client IP, handling reverse proxies via X-Forwarded-For."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        # First IP in the chain is the original client
+        return forwarded.split(",")[0].strip()
+    return get_remote_address(request)
+
+
 def _build_limiter() -> Limiter:
     try:
         redis.Redis(
@@ -33,7 +43,7 @@ def _build_limiter() -> Limiter:
         ).ping()
         logger.info("Rate limiter initialized with redis backend: %s", _rate_limit_log_uri)
         return Limiter(
-            key_func=get_remote_address,
+            key_func=_get_real_client_ip,
             storage_uri=_rate_limit_storage_uri,
             enabled=_rate_limits_enabled,
         )
@@ -42,7 +52,7 @@ def _build_limiter() -> Limiter:
             "Rate limiter redis backend unavailable (%s). Falling back to in-memory limits.",
             exc,
         )
-        return Limiter(key_func=get_remote_address, enabled=_rate_limits_enabled)
+        return Limiter(key_func=_get_real_client_ip, enabled=_rate_limits_enabled)
 
 
 limiter = _build_limiter()

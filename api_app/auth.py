@@ -10,7 +10,7 @@ import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from api_app.jwt_verifier import extract_rate_limit_user_id
+from api_app.jwt_verifier import extract_rate_limit_user_id, verify_supabase_jwt_locally
 from config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 
 _bearer = HTTPBearer(auto_error=False)
@@ -97,7 +97,23 @@ def get_current_user(
             detail="Missing bearer token",
         )
 
-    payload = _fetch_user_from_token(credentials.credentials)
+    token = credentials.credentials
+
+    # Try fast local JWT verification first (avoids HTTP round-trip per request).
+    try:
+        claims = verify_supabase_jwt_locally(token)
+        user_id = claims.get("sub") or claims.get("id")
+        if user_id:
+            return AuthenticatedUser(
+                id=str(user_id),
+                email=claims.get("email"),
+                claims=claims,
+            )
+    except Exception:
+        pass  # Fall through to remote verification
+
+    # Fallback: verify against Supabase Auth HTTP endpoint.
+    payload = _fetch_user_from_token(token)
     return AuthenticatedUser(
         id=str(payload["id"]),
         email=payload.get("email"),

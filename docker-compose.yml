@@ -10,12 +10,17 @@ services:
       - "${REDIS_MAXMEMORY:-1500mb}"
       - "--maxmemory-policy"
       - "noeviction"
+      - "--appendonly"
+      - "yes"
+      - "--appendfsync"
+      - "everysec"
     # SECURITY: Do not expose Redis to the host network in production.
     # Uncomment only for local development if needed.
     # ports:
     #   - "6379:6379"
     volumes:
       - redis_data:/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "--no-auth-warning", "ping"]
       interval: 10s
@@ -49,12 +54,26 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     mem_limit: ${API_MEM_LIMIT:-2g}
     cpus: ${API_CPU_LIMIT:-2}
 
   # ---------- Video Workers (CPU + memory heavy: Whisper) ----------
   video-workers:
     build: .
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
@@ -94,6 +113,13 @@ services:
   # ---------- Clip Workers (CPU + IO heavy: FFmpeg) ----------
   clip-workers:
     build: .
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
@@ -133,6 +159,13 @@ services:
   # ---------- Maintenance Supervisor (single logical leader via Redis lock) ----------
   maintenance-supervisor:
     build: .
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     environment:
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}

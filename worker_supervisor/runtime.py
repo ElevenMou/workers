@@ -2,9 +2,11 @@
 
 import multiprocessing
 import os
+import threading
 
 from rq import SimpleWorker, Worker
 
+from worker_supervisor.heartbeat import beat, clear_heartbeat
 from worker_supervisor.state import logger
 
 
@@ -92,6 +94,18 @@ def cleanup_named_workers(conn, worker_names: set[str]):
             logger.warning("Failed to deregister %s: %s", w.name, exc)
 
 
+_HEARTBEAT_INTERVAL_SECONDS = 30
+
+
+def _heartbeat_loop(conn, worker_name: str, stop_event: threading.Event) -> None:
+    """Background thread that sends periodic heartbeats to Redis."""
+    while not stop_event.wait(timeout=_HEARTBEAT_INTERVAL_SECONDS):
+        try:
+            beat(conn, worker_name)
+        except Exception:
+            pass  # Best-effort; supervisor will detect missing beats
+
+
 def run_worker(queue_names: list[str], worker_name: str):
     """Start a single RQ worker inside a subprocess."""
     from utils.redis_client import get_queues, get_redis_connection  # noqa: E402
@@ -114,20 +128,36 @@ def run_worker(queue_names: list[str], worker_name: str):
         except Exception as exc:
             logger.warning("Worker %s failed to preload Whisper model: %s", worker_name, exc)
 
+    # Start heartbeat thread so the supervisor can detect hung workers
+    stop_event = threading.Event()
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop, args=(conn, worker_name, stop_event), daemon=True
+    )
+    hb_thread.start()
+    beat(conn, worker_name)  # Immediate first heartbeat
+
     logger.info("Worker %s starting - queues: %s", worker_name, queue_names)
-    for attempt in range(2):
-        worker = cls(queues, connection=conn, name=worker_name)
+    try:
+        for attempt in range(2):
+            worker = cls(queues, connection=conn, name=worker_name)
+            try:
+                worker.work(with_scheduler=False)
+                return
+            except ValueError as exc:
+                if "There exists an active worker named" not in str(exc) or attempt > 0:
+                    raise
+                logger.warning(
+                    "Detected worker-name collision for %s; forcing Redis cleanup and retrying once.",
+                    worker_name,
+                )
+                _force_remove_worker_registration(conn, worker_name)
+    finally:
+        stop_event.set()
+        hb_thread.join(timeout=5)
         try:
-            worker.work(with_scheduler=False)
-            return
-        except ValueError as exc:
-            if "There exists an active worker named" not in str(exc) or attempt > 0:
-                raise
-            logger.warning(
-                "Detected worker-name collision for %s; forcing Redis cleanup and retrying once.",
-                worker_name,
-            )
-            _force_remove_worker_registration(conn, worker_name)
+            clear_heartbeat(conn, worker_name)
+        except Exception:
+            pass
 
 
 def spawn_worker(queue_names: list[str], worker_name: str) -> multiprocessing.Process:

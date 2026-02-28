@@ -101,6 +101,45 @@ class _MaintenanceLeaderLock:
         self.acquired = False
 
 
+def _cleanup_failed_job_registries(
+    conn,
+    queue_names: list[str],
+    max_age_seconds: int = 86400 * 7,  # 7 days
+) -> int:
+    """Remove failed jobs older than max_age_seconds from all queue registries."""
+    from rq import Queue
+    from rq.job import Job
+
+    cleaned = 0
+    for queue_name in queue_names:
+        try:
+            queue = Queue(queue_name, connection=conn)
+            registry = queue.failed_job_registry
+            job_ids = registry.get_job_ids()
+            for job_id in job_ids:
+                try:
+                    job = Job.fetch(job_id, connection=conn)
+                    if job.ended_at:
+                        age = time.time() - job.ended_at.timestamp()
+                        if age > max_age_seconds:
+                            registry.remove(job)
+                            job.delete()
+                            cleaned += 1
+                except Exception:
+                    # Job data may be gone; remove the registry entry
+                    try:
+                        registry.remove(job_id)
+                        cleaned += 1
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning("Failed to clean failed registry for %s: %s", queue_name, exc)
+
+    if cleaned:
+        logger.info("Cleaned %d stale entries from failed job registries", cleaned)
+    return cleaned
+
+
 def _run_maintenance_loop(
     *,
     startup_conn,
@@ -129,6 +168,10 @@ def _run_maintenance_loop(
         ),
     )
     last_processing_recovery_run = 0.0
+    last_admission_reconciliation = 0.0
+    admission_reconcile_interval = 300.0  # 5 minutes
+    last_failed_job_cleanup = 0.0
+    failed_job_cleanup_interval = 86400.0  # daily
     last_lock_renewal = 0.0
     renew_every = max(1, int(leader_renew_seconds))
     has_logged_standby = False
@@ -209,6 +252,30 @@ def _run_maintenance_loop(
                     logger.warning("Runtime stale-processing recovery tick failed: %s", exc)
                 finally:
                     last_processing_recovery_run = now
+
+            # Periodic admission counter reconciliation (every 5 min)
+            if now - last_admission_reconciliation >= admission_reconcile_interval:
+                try:
+                    from utils.redis_client import reconcile_admission_counts
+                    reconciled = reconcile_admission_counts(startup_conn)
+                    logger.debug(
+                        "Periodic admission reconciliation: video=%s clip=%s",
+                        reconciled.get("video-processing", 0),
+                        reconciled.get("clip-generation", 0),
+                    )
+                except Exception as exc:
+                    logger.warning("Periodic admission reconciliation failed: %s", exc)
+                finally:
+                    last_admission_reconciliation = now
+
+            # Periodic failed job registry cleanup (daily)
+            if now - last_failed_job_cleanup >= failed_job_cleanup_interval:
+                try:
+                    _cleanup_failed_job_registries(startup_conn, queue_names)
+                except Exception as exc:
+                    logger.warning("Failed job cleanup tick failed: %s", exc)
+                finally:
+                    last_failed_job_cleanup = now
 
             time.sleep(1)
     except KeyboardInterrupt:
@@ -454,19 +521,34 @@ def run_supervisor() -> int:
                 )
 
             for name, p in list(processes.items()):
-                if p.is_alive():
+                if not p.is_alive():
+                    exit_code = p.exitcode
+                    logger.warning(
+                        "Worker %s exited unexpectedly (exit code %s). Restarting.",
+                        name,
+                        exit_code,
+                    )
+                    cleanup_named_workers(startup_conn, {name})
+                    replacement = spawn_worker(worker_specs[name], name)
+                    processes[name] = replacement
+                    logger.info("Respawned %s (pid %d)", name, replacement.pid)
                     continue
 
-                exit_code = p.exitcode
-                logger.warning(
-                    "Worker %s exited unexpectedly (exit code %s). Restarting.",
-                    name,
-                    exit_code,
-                )
-                cleanup_named_workers(startup_conn, {name})
-                replacement = spawn_worker(worker_specs[name], name)
-                processes[name] = replacement
-                logger.info("Respawned %s (pid %d)", name, replacement.pid)
+                # Check heartbeat: detect alive-but-hung workers
+                from worker_supervisor.heartbeat import get_heartbeat_age
+                hb_age = get_heartbeat_age(startup_conn, name)
+                if hb_age is not None and hb_age > 120:
+                    logger.warning(
+                        "Worker %s heartbeat stale (%.0fs). Killing and restarting.",
+                        name,
+                        hb_age,
+                    )
+                    p.kill()
+                    p.join(timeout=5)
+                    cleanup_named_workers(startup_conn, {name})
+                    replacement = spawn_worker(worker_specs[name], name)
+                    processes[name] = replacement
+                    logger.info("Respawned hung worker %s (pid %d)", name, replacement.pid)
 
             time.sleep(1)
     except KeyboardInterrupt:
