@@ -18,7 +18,9 @@ if "anthropic" not in sys.modules:
     anthropic_stub = ModuleType("anthropic")
     anthropic_stub.Anthropic = lambda *_args, **_kwargs: SimpleNamespace(
         messages=SimpleNamespace(
-            create=lambda **_k: SimpleNamespace(content=[SimpleNamespace(text='{"clips": []}')])
+            create=lambda **_k: SimpleNamespace(
+                content=[SimpleNamespace(type="tool_use", id="call_stub", name="submit_clips", input={"clips": []})]
+            )
         )
     )
     sys.modules["anthropic"] = anthropic_stub
@@ -671,50 +673,55 @@ def test_legacy_clip_length_payload_maps_to_deterministic_range(monkeypatch, tmp
 
 
 class _FakeAnthropicClient:
-    def __init__(self, response_text: str):
+    """Fake Anthropic client that can return tool_use blocks or text blocks."""
+
+    def __init__(self, response_text: str = "", *, tool_input: dict[str, Any] | None = None):
         self._response_text = response_text
+        self._tool_input = tool_input
         self.messages = SimpleNamespace(create=self._create)
 
     def _create(self, **_kwargs):
-        return SimpleNamespace(content=[SimpleNamespace(text=self._response_text)])
+        if self._tool_input is not None:
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="tool_use", id="call_1", name="submit_clips", input=self._tool_input)]
+            )
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=self._response_text)]
+        )
 
 
 def test_ai_analyzer_salvages_valid_clips_from_mixed_payload(monkeypatch):
-    response_text = """
-```json
-{
-  "clips": [
-    {
-      "rank": 2,
-      "start_time": 12.0,
-      "end_time": 58.0,
-      "duration": 46.0,
-      "clip_title": "Valid clip",
-      "hook": "Hook",
-      "summary": "Valid summary",
-      "confidence_score": 0.91,
-      "tags": ["one"]
-    },
-    {
-      "rank": "bad-rank",
-      "start_time": "oops",
-      "end_time": 99.0,
-      "duration": 30.0,
-      "clip_title": "Invalid clip",
-      "hook": "",
-      "summary": "Invalid",
-      "confidence_score": 0.4,
-      "tags": []
+    tool_input = {
+        "clips": [
+            {
+                "rank": 2,
+                "start_time": 12.0,
+                "end_time": 58.0,
+                "duration": 46.0,
+                "clip_title": "Valid clip",
+                "hook": "Hook",
+                "summary": "Valid summary",
+                "confidence_score": 0.91,
+                "tags": ["one"],
+            },
+            {
+                "rank": 1,
+                "start_time": None,
+                "end_time": 99.0,
+                "duration": 30.0,
+                "clip_title": "Invalid clip",
+                "hook": "",
+                "summary": "Invalid",
+                "confidence_score": 0.4,
+                "tags": [],
+            },
+        ]
     }
-  ]
-}
-```
-""".strip()
 
     monkeypatch.setattr(
         ai_analyzer_module,
         "Anthropic",
-        lambda **_kwargs: _FakeAnthropicClient(response_text),
+        lambda **_kwargs: _FakeAnthropicClient(tool_input=tool_input),
     )
     analyzer = ai_analyzer_module.AIAnalyzer()
 
@@ -731,6 +738,7 @@ def test_ai_analyzer_salvages_valid_clips_from_mixed_payload(monkeypatch):
 
 
 def test_ai_analyzer_raises_clean_error_for_non_json_response(monkeypatch):
+    """When model returns text instead of tool_use (fallback path), non-JSON raises."""
     monkeypatch.setattr(
         ai_analyzer_module,
         "Anthropic",
@@ -745,3 +753,55 @@ def test_ai_analyzer_raises_clean_error_for_non_json_response(monkeypatch):
             min_duration=40,
             max_duration=90,
         )
+
+
+def test_ai_analyzer_handles_tool_use_response(monkeypatch):
+    """Primary path: model returns a tool_use block with structured clip data."""
+    tool_input = {
+        "clips": [
+            {
+                "rank": 1,
+                "start_time": 0.0,
+                "end_time": 60.0,
+                "duration": 60.0,
+                "clip_title": "Great insight",
+                "hook": "Did you know...",
+                "summary": "An amazing insight about the topic",
+                "confidence_score": 0.95,
+                "tags": ["educational", "insight"],
+            },
+            {
+                "rank": 2,
+                "start_time": 60.0,
+                "end_time": 120.0,
+                "duration": 60.0,
+                "clip_title": "Key takeaway",
+                "hook": "The most important thing...",
+                "summary": "Summary of the key takeaway",
+                "confidence_score": 0.88,
+                "tags": ["takeaway"],
+            },
+        ]
+    }
+
+    monkeypatch.setattr(
+        ai_analyzer_module,
+        "Anthropic",
+        lambda **_kwargs: _FakeAnthropicClient(tool_input=tool_input),
+    )
+    analyzer = ai_analyzer_module.AIAnalyzer()
+
+    clips = analyzer.find_best_clips(
+        transcript=_base_transcript(),
+        num_clips=2,
+        min_duration=40,
+        max_duration=90,
+    )
+
+    assert len(clips) == 2
+    assert clips[0]["title"] == "Great insight"
+    assert clips[0]["score"] == pytest.approx(0.95)
+    assert clips[0]["start"] == pytest.approx(0.0)
+    assert clips[0]["end"] == pytest.approx(60.0)
+    assert clips[1]["title"] == "Key takeaway"
+    assert clips[1]["hook"] == "The most important thing..."

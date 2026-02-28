@@ -8,9 +8,9 @@ from anthropic import Anthropic
 
 logger = logging.getLogger(__name__)
 
-# Default to Sonnet for ~5x lower cost vs Opus; set CLAUDE_ANALYZER_MODEL for override
-# e.g. claude-3-5-haiku-20241022 (cheapest/fastest), claude-opus-4-20250514 (highest quality)
-DEFAULT_ANALYZER_MODEL = os.getenv("CLAUDE_ANALYZER_MODEL", "claude-sonnet-4-20250514")
+# Default to Haiku 4.5 for best cost/quality ratio on structured extraction tasks.
+# Override with CLAUDE_ANALYZER_MODEL for higher quality (e.g. claude-sonnet-4-20250514)
+DEFAULT_ANALYZER_MODEL = os.getenv("CLAUDE_ANALYZER_MODEL", "claude-haiku-4-5-20241022")
 # Approx 4 chars per token; cap transcript to stay within context and reduce cost
 MAX_TRANSCRIPT_CHARS = int(os.getenv("CLAUDE_ANALYZER_MAX_TRANSCRIPT_CHARS", "-1"))
 # Claude API call timeout
@@ -18,6 +18,97 @@ _CLAUDE_TIMEOUT_SECONDS = float(os.getenv("CLAUDE_ANALYZER_TIMEOUT_SECONDS", "12
 # Circuit breaker settings
 _CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CLAUDE_CIRCUIT_BREAKER_THRESHOLD", "3"))
 _CIRCUIT_BREAKER_COOLDOWN = float(os.getenv("CLAUDE_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "60"))
+
+# ---------------------------------------------------------------------------
+# Static system prompt (cacheable — identical across all calls)
+# ---------------------------------------------------------------------------
+_STATIC_SYSTEM_PROMPT = """\
+You are a short-form clip editor. Your job is to identify the best segments from a video transcript for TikTok/Reels/Shorts.
+
+TRANSCRIPT FORMAT: Each line is "start|end|text" where start and end are seconds.
+
+TIMESTAMPS (strict): Use ONLY timestamps present in the transcript. No inventing or rounding. Clips = consecutive entries only. start_time = first entry start; end_time = last entry end. duration = end_time - start_time. Never exceed transcript bounds. Boundaries must match transcript entry boundaries exactly.
+
+EDITORIAL (viral-first): Prioritize clips with strong standalone value: surprising insight, clear transformation, high emotion, conflict, actionable steps, or memorable one-liners. Strong hook in first 3-5s. Self-contained. Never cut a sentence or idea mid-way.
+
+STRICT EXCLUSIONS: Reject segments that are:
+- intros, greetings, scene-setting, "in this video/episode" setup, housekeeping
+- outros, wrap-ups, "thanks for watching", "see you next time"
+- engagement CTAs ("like/subscribe/follow/comment/share", "link in bio/description")
+- sponsor/affiliate/promotional reads, discount-code plugs, admin announcements
+- low-information filler, repetition, apologies, or technical notes
+
+POSITIONAL BIAS: Avoid likely intro/outro zones in the first/last ~8% of the timeline unless the content is immediately high-value.
+
+Use the submit_clips tool to return your results. Verify that duration = end_time - start_time for each clip."""
+
+# ---------------------------------------------------------------------------
+# Tool schema for structured output (guarantees valid JSON)
+# ---------------------------------------------------------------------------
+_CLIP_ANALYSIS_TOOL = {
+    "name": "submit_clips",
+    "description": "Submit the identified clip segments from the transcript analysis.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "clips": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "rank": {
+                            "type": "integer",
+                            "description": "Priority rank (1 = best)",
+                        },
+                        "start_time": {
+                            "type": "number",
+                            "description": "Start time in seconds (must match a transcript entry start)",
+                        },
+                        "end_time": {
+                            "type": "number",
+                            "description": "End time in seconds (must match a transcript entry end)",
+                        },
+                        "duration": {
+                            "type": "number",
+                            "description": "Duration in seconds (end_time - start_time)",
+                        },
+                        "clip_title": {
+                            "type": "string",
+                            "description": "Short, catchy title for the clip",
+                        },
+                        "hook": {
+                            "type": "string",
+                            "description": "The opening hook line (first 3-5 seconds)",
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Why this clip has viral potential",
+                        },
+                        "confidence_score": {
+                            "type": "number",
+                            "description": "Confidence score 0.0-1.0",
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Content tags for categorization",
+                        },
+                    },
+                    "required": [
+                        "rank",
+                        "start_time",
+                        "end_time",
+                        "duration",
+                        "clip_title",
+                        "summary",
+                        "confidence_score",
+                    ],
+                },
+            }
+        },
+        "required": ["clips"],
+    },
+}
 
 
 class AIAnalyzer:
@@ -31,6 +122,17 @@ class AIAnalyzer:
             timeout=_CLAUDE_TIMEOUT_SECONDS,
         )
         self.model = DEFAULT_ANALYZER_MODEL
+
+    @staticmethod
+    def _format_transcript_compact(snippets: List[Dict]) -> str:
+        """Convert snippets to compact pipe-delimited format (~57% fewer tokens than JSON)."""
+        lines: list[str] = []
+        for s in snippets:
+            start = f"{s['start']:.2f}"
+            end = f"{s['start'] + s['duration']:.2f}"
+            text = s["text"].replace("|", " ").replace("\n", " ")
+            lines.append(f"{start}|{end}|{text}")
+        return "\n".join(lines)
 
     @staticmethod
     def _truncate_snippets(snippets: List[Dict], max_chars: int) -> List[Dict]:
@@ -48,7 +150,7 @@ class AIAnalyzer:
 
     @staticmethod
     def _extract_json_payload(response_text: str) -> str:
-        """Extract a JSON object payload from raw model output."""
+        """Extract a JSON object payload from raw model output (fallback for non-tool responses)."""
         text = (response_text or "").strip()
         if not text:
             raise ValueError("Analyzer returned an empty response")
@@ -128,12 +230,7 @@ class AIAnalyzer:
         if start is None or end is None or end <= start:
             return None
 
-        duration = cls._as_float(clip.get("duration"))
-        computed_duration = end - start
-        if duration is None or duration <= 0:
-            duration = computed_duration
-        else:
-            duration = computed_duration
+        duration = end - start
 
         title = str(clip.get("clip_title") or clip.get("title") or "").strip()
         summary = str(
@@ -191,7 +288,10 @@ class AIAnalyzer:
         max_duration: int = 60,
         extra_prompt: str | None = None,
     ) -> List[Dict]:
-        """Analyze transcript using Claude to find best clips (model configurable via CLAUDE_ANALYZER_MODEL).
+        """Analyze transcript using Claude to find best clips.
+
+        Uses prompt caching, tool use for structured output, and compact
+        transcript format to minimize cost while maximizing clip quality.
 
         Args:
             transcript: Video transcript with segments
@@ -226,43 +326,44 @@ class AIAnalyzer:
         transcript_end = max(float(item["start"]) + float(item["duration"]) for item in snippets)
         transcript_duration = max(0.0, transcript_end - transcript_start)
 
-        system_prompt = f"""You are a short-form clip editor. Extract exactly {num_clips} clip(s) from the transcript for TikTok/Reels/Shorts.
+        # Compact transcript format (~57% fewer tokens than json.dumps)
+        transcript_text = self._format_transcript_compact(snippets)
 
-TIMESTAMPS (strict): Use ONLY timestamps from the transcript. No inventing or rounding. Clips = consecutive entries only. start_time = first entry start; end_time = last entry (start+duration). duration = end_time - start_time. Never exceed transcript bounds. Boundaries must match transcript entry boundaries exactly.
+        # System prompt: static cached block + small dynamic block
+        system_blocks = [
+            {
+                "type": "text",
+                "text": _STATIC_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {
+                "type": "text",
+                "text": (
+                    f"For this request: extract {num_clips} clip(s), "
+                    f"each {min_duration}-{max_duration}s duration. "
+                    f"Return exactly {num_clips} if possible; fewer if video is too short. "
+                    f"Quality over quantity."
+                ),
+            },
+        ]
 
-DURATION: Clips must be between {min_duration}-{max_duration}s. If a valid clip under {min_duration}s would be required, return fewer clips instead. Do not force exact duration.
-
-COUNT: Return exactly {num_clips} clip(s) if possible; fewer if video too short. Quality over quantity.
-
-EDITORIAL (viral-first): Prioritize clips with strong standalone value: surprising insight, clear transformation, high emotion, conflict, actionable steps, or memorable one-liners. Strong hook in first 3-5s. Self-contained. Never cut a sentence or idea mid-way.
-
-STRICT EXCLUSIONS: Reject segments that are:
-- intros, greetings, scene-setting, "in this video/episode" setup, housekeeping
-- outros, wrap-ups, "thanks for watching", "see you next time"
-- engagement CTAs ("like/subscribe/follow/comment/share", "link in bio/description")
-- sponsor/affiliate/promotional reads, discount-code plugs, admin announcements
-- low-information filler, repetition, apologies, or technical notes
-
-POSITIONAL BIAS: By default avoid likely intro/outro zones in the first/last ~8% of the timeline unless the content is immediately high-value and highly clip-worthy.
-
-OUTPUT: Valid JSON only. No markdown, no comments. Timestamps in numeric seconds. Schema: {{"clips": [{{"rank", "start_time", "end_time", "duration", "clip_title", "hook", "summary", "confidence_score", "tags"}}]}} max {num_clips} items. Verify duration = end_time - start_time and duration <= {max_duration}."""
-
+        # User message: transcript data + optional extra prompt only
         extra_prompt_text = (extra_prompt or "").strip()
-        extra_prompt_section = (
+        extra_section = (
             f"\nAdditional user guidance:\n{extra_prompt_text}\n"
             if extra_prompt_text
             else ""
         )
 
-        user_message = f"""Extract {num_clips} clip(s). Use ONLY transcript timestamps. Return exactly {num_clips} if possible.
-Estimated transcript span: {transcript_start:.2f}s to {transcript_end:.2f}s ({transcript_duration:.2f}s total).
+        user_message = (
+            f"Transcript span: {transcript_start:.2f}s to {transcript_end:.2f}s "
+            f"({transcript_duration:.2f}s total).\n\n"
+            f"{transcript_text}"
+            f"{extra_section}"
+        )
 
-Transcript (each: text, start, duration):
-{json.dumps(snippets)}
-{extra_prompt_section}
-
-Return ONLY valid JSON matching the schema. Do not return clips shorter than {min_duration}s.
-Do not include intro/outro/CTA/sponsor/filler clips."""
+        # Dynamic max_tokens: ~200 tokens per clip + overhead
+        max_tokens = min(4096, max(512, num_clips * 200 + 100))
 
         # Circuit breaker: fail fast if Claude API has been failing repeatedly
         if AIAnalyzer._consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD:
@@ -279,9 +380,12 @@ Do not include intro/outro/CTA/sponsor/filler clips."""
         try:
             message = self.client.messages.create(
                 model=self.model,
-                max_tokens=2048,
-                system=system_prompt,
+                max_tokens=max_tokens,
+                temperature=0,
+                system=system_blocks,
                 messages=[{"role": "user", "content": user_message}],
+                tools=[_CLIP_ANALYSIS_TOOL],
+                tool_choice={"type": "tool", "name": "submit_clips"},
             )
             # Reset circuit breaker on success
             AIAnalyzer._consecutive_failures = 0
@@ -289,18 +393,29 @@ Do not include intro/outro/CTA/sponsor/filler clips."""
             if not message.content:
                 raise RuntimeError("Analyzer returned no content blocks")
 
-            text_blocks = []
-            for block in message.content:
-                block_text = getattr(block, "text", None)
-                if isinstance(block_text, str):
-                    text_blocks.append(block_text)
-            response_text = "\n".join(text_blocks).strip()
-            if not response_text:
-                raise RuntimeError("Analyzer returned empty text content")
+            # Extract from tool_use block (primary path with structured output)
+            tool_block = next(
+                (block for block in message.content if block.type == "tool_use"),
+                None,
+            )
 
-            payload = self._extract_json_payload(response_text)
-            result = json.loads(payload)
-            raw_clips = result.get("clips") if isinstance(result, dict) else None
+            if tool_block is not None:
+                result = tool_block.input
+                raw_clips = result.get("clips") if isinstance(result, dict) else None
+            else:
+                # Fallback: extract JSON from text (shouldn't happen with tool_choice)
+                text_blocks = []
+                for block in message.content:
+                    block_text = getattr(block, "text", None)
+                    if isinstance(block_text, str):
+                        text_blocks.append(block_text)
+                response_text = "\n".join(text_blocks).strip()
+                if not response_text:
+                    raise RuntimeError("Analyzer returned empty text content")
+                payload = self._extract_json_payload(response_text)
+                result = json.loads(payload)
+                raw_clips = result.get("clips") if isinstance(result, dict) else None
+
             if not isinstance(raw_clips, list):
                 raise ValueError("Analyzer JSON must include a 'clips' array")
 
