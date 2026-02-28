@@ -67,6 +67,8 @@ def test_run_worker_retries_once_after_name_collision(monkeypatch):
     monkeypatch.setattr(redis_client, "get_redis_connection", lambda: fake_conn)
     monkeypatch.setattr(redis_client, "get_queues", lambda names, conn: ["q"])
     monkeypatch.setattr(runtime, "worker_cls", lambda: _FakeWorker)
+    monkeypatch.setattr(runtime, "beat", lambda *_a, **_k: None)
+    monkeypatch.setattr(runtime, "clear_heartbeat", lambda *_a, **_k: None)
     monkeypatch.setattr(
         runtime,
         "_force_remove_worker_registration",

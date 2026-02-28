@@ -246,18 +246,24 @@ YTDLP_DOWNLOAD_RETRIES = _env_int("YTDLP_DOWNLOAD_RETRIES", 3, minimum=1)
 YTDLP_FRAGMENT_RETRIES = _env_int("YTDLP_FRAGMENT_RETRIES", 3, minimum=1)
 YTDLP_EXTRACTOR_RETRIES = _env_int("YTDLP_EXTRACTOR_RETRIES", 3, minimum=1)
 FFMPEG_THREADS = _env_int("FFMPEG_THREADS", 2, minimum=1)
+RAW_VIDEO_STORAGE_BUCKET = (
+    os.getenv("RAW_VIDEO_STORAGE_BUCKET", "raw-videos").strip() or "raw-videos"
+)
 
 
 # ---------------------------------------------------------------------------
 # Startup validation
 # ---------------------------------------------------------------------------
-_REQUIRED_ENV = ["SUPABASE_URL", "SUPABASE_SERVICE_KEY", "ANTHROPIC_API_KEY"]
+_REQUIRED_ENV = ["SUPABASE_URL", "SUPABASE_SERVICE_KEY"]
+_ANALYZER_API_KEYS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")
 
 
 def validate_env(extra: list[str] | None = None):
     """Check that critical env vars are set.  Call at process startup."""
     required = list(_REQUIRED_ENV) + (extra or [])
     missing = [v for v in required if not os.getenv(v)]
+    if not any(os.getenv(name) for name in _ANALYZER_API_KEYS):
+        missing.append("OPENAI_API_KEY or ANTHROPIC_API_KEY")
     if missing:
         logger.error("Missing required environment variables: %s", ", ".join(missing))
         raise SystemExit(1)

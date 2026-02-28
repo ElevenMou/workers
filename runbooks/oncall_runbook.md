@@ -5,7 +5,7 @@ This runbook covers:
 - Redis saturation or connection pressure
 - Supabase latency/errors
 - yt-dlp extraction failures
-- Anthropic/API dependency failures
+- OpenAI/API dependency failures
 - Storage upload failures
 
 ## Primary Dashboards
@@ -43,7 +43,7 @@ This runbook covers:
 2. Validate JS runtime availability (`node`) in worker image.
 3. If source-specific, retry with degraded queue intake and notify support.
 
-## Anthropic/API Failures
+## OpenAI/API Failures
 1. Check model API latency and error ratio.
 2. Confirm retries are occurring and jobs are not stuck in processing.
 3. If outage persists, temporarily pause new analyze requests.
@@ -58,4 +58,3 @@ Rollback immediately if any of the following occurs:
 - Duplicate processing charges observed
 - Cross-node worker interference (unexpected stale-failure spikes after deploy)
 - Queue age p95 doubles from baseline for > 15 minutes
-

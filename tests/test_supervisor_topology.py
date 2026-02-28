@@ -57,7 +57,7 @@ def test_worker_role_uses_instance_scoped_worker_names(monkeypatch):
     monkeypatch.setattr(config, "validate_env", lambda: None)
     monkeypatch.setenv("WORKER_MODE", "video")
 
-    fake_conn = SimpleNamespace()
+    fake_conn = SimpleNamespace(get=lambda *_a, **_k: None)
     monkeypatch.setattr(redis_client, "get_redis_connection", lambda: fake_conn)
     monkeypatch.setattr(
         redis_client,
@@ -85,7 +85,6 @@ def test_worker_role_uses_instance_scoped_worker_names(monkeypatch):
         "stop_worker_process",
         lambda _conn, name, _proc: stop_calls.append(name),
     )
-
     sleep_calls = {"count": 0}
 
     def _sleep_and_interrupt(_seconds: float):

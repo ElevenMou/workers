@@ -61,12 +61,15 @@ REDIS_HOST=localhost
 REDIS_PORT=6379
 TEMP_DIR=/tmp/video_clipper
 WHISPER_MODEL=base
-ANTHROPIC_API_KEY=sk-ant-your-key
+OPENAI_API_KEY=sk-openai-your-key
+OPENAI_ANALYZER_MODEL=gpt-4.1-mini
+OPENAI_ANALYZER_FALLBACK_MODELS=gpt-4.1-mini,gpt-4.1
 WORKER_SCALE_ADMIN_USER_IDS=uuid-admin-1,uuid-admin-2
 PURGE_QUEUED_JOBS_ON_START=false
 FAIL_STARTED_JOBS_ON_START=true
 FAIL_PROCESSING_ROWS_ON_START=true
 RAW_VIDEO_CLEANUP_INTERVAL_SECONDS=300
+RAW_VIDEO_STORAGE_BUCKET=raw-videos
 SUPERVISOR_ROLE=worker
 WORKER_INSTANCE_ID=node-a
 MAINTENANCE_LEADER_LOCK_TTL_SECONDS=15
@@ -86,6 +89,7 @@ POLAR_USAGE_EVENT_TIMEOUT_SECONDS=5
 
 Notes:
 - `PURGE_QUEUED_JOBS_ON_START` now defaults to `false` and should stay `false` in production.
+- Legacy `ANTHROPIC_API_KEY` and `CLAUDE_ANALYZER_*` env vars are still accepted during the migration window, but new deployments should use the `OPENAI_*` names above.
 - Run a dedicated `maintenance-supervisor` instance with `SUPERVISOR_ROLE=maintenance`.
 - Use `WORKER_SCALE_ADMIN_USER_IDS` (comma-separated) to allow `/workers/scale` admin access.
 - Mutating API routes (`/videos/analyze`, `/clips/generate`, `/clips/custom`, `/workers/scale`) now require a valid `Authorization: Bearer <supabase-jwt>` header.

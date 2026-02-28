@@ -6,6 +6,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
+from config import RAW_VIDEO_STORAGE_BUCKET
 from utils.supabase_client import assert_response_ok, supabase
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ def cleanup_expired_raw_videos(batch_size: int = 100) -> dict[str, int]:
         storage_cleared = False
         if raw_video_storage_path:
             try:
-                supabase.storage.from_("raw-videos").remove([raw_video_storage_path])
+                supabase.storage.from_(RAW_VIDEO_STORAGE_BUCKET).remove([raw_video_storage_path])
                 storage_cleared = True
             except Exception as exc:
                 logger.warning(

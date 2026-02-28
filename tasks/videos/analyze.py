@@ -136,6 +136,21 @@ def _as_float(value: Any, default: float | None = None) -> float | None:
         return default
 
 
+def _as_optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 def _clip_transcript_for_analysis_window(
     *,
     transcript: dict[str, Any],
@@ -396,11 +411,18 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
     )
     extra_prompt = str(job_data.get("extraPrompt") or "").strip() or None
     expected_credits = int(job_data.get("analysisCredits") or 0)
+    source_title = str(job_data.get("sourceTitle") or "").strip() or None
+    source_thumbnail_url = str(job_data.get("sourceThumbnailUrl") or "").strip() or None
+    source_platform = str(job_data.get("sourcePlatform") or "").strip().lower() or None
+    source_external_id = str(job_data.get("sourceExternalId") or "").strip() or None
+    source_has_captions = _as_optional_bool(job_data.get("sourceHasCaptions"))
+    source_has_audio = _as_optional_bool(job_data.get("sourceHasAudio"))
 
     work_dir: str | None = None
     downloader: VideoDownloader | None = None
     analyzer: AIAnalyzer | None = None
     video_path: str | None = None
+    source_media_path: str | None = None
     audio_path: str | None = None
     credits_required = expected_credits if expected_credits > 0 else 0
     duration_seconds = 0
@@ -486,38 +508,62 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 billing_state=billing_state,
             )
 
-        update_video_status(video_id, "downloading")
-
-        # 1. Download video --------------------------------------------------
+        # 1. Resolve source metadata (no full media download by default) -----
         _update_analysis_job_progress(
             job_id,
             5,
-            "downloading_video",
+            "resolving_source",
             billing_state=billing_state,
         )
 
-        # Pre-flight disk space check to fail fast before a large download
-        import shutil as _shutil
-        _disk = _shutil.disk_usage(work_dir)
-        _free_gb = _disk.free / (1024 ** 3)
-        if _free_gb < 1.0:
-            raise RuntimeError(
-                f"Insufficient disk space for video download: {_free_gb:.2f} GB free "
-                f"(minimum 1 GB required)"
+        source_info: dict[str, Any] = {
+            "title": source_title,
+            "thumbnail": source_thumbnail_url,
+            "platform": source_platform,
+            "external_id": source_external_id,
+            "has_captions": source_has_captions,
+            "has_audio": source_has_audio,
+            "duration": int(job_data.get("analysisDurationSeconds") or 0),
+        }
+        needs_probe = (
+            int(source_info.get("duration") or 0) <= 0
+            or not str(source_info.get("platform") or "").strip()
+            or source_info.get("has_captions") is None
+            or source_info.get("has_audio") is None
+        )
+        if needs_probe:
+            logger.info("[%s] Probing source metadata without media download ...", job_id)
+            probe_data = downloader.probe_url(url)
+            source_info["duration"] = int(
+                source_info.get("duration") or probe_data.get("duration_seconds") or 0
             )
+            source_info["title"] = source_info.get("title") or probe_data.get("title")
+            source_info["thumbnail"] = source_info.get("thumbnail") or probe_data.get("thumbnail")
+            source_info["platform"] = (
+                str(source_info.get("platform") or probe_data.get("platform") or "")
+                .strip()
+                .lower()
+            ) or None
+            source_info["external_id"] = (
+                str(source_info.get("external_id") or probe_data.get("external_id") or "")
+                .strip()
+            ) or None
+            if source_info.get("has_captions") is None:
+                source_info["has_captions"] = bool(probe_data.get("has_captions"))
+            if source_info.get("has_audio") is None:
+                source_info["has_audio"] = bool(probe_data.get("has_audio"))
 
-        logger.info("[%s] Downloading video: %s", job_id, url)
-        video_data = downloader.download(url, video_id)
-        video_path = video_data["path"]
         _update_analysis_job_progress(
             job_id,
             20,
-            "downloading_video",
+            "resolving_source",
             billing_state=billing_state,
         )
 
-        # Calculate credits based on billed processing window (fallback).
-        duration_seconds = int(video_data.get("duration") or 0)
+        # Calculate credits based on billed processing window.
+        duration_seconds = int(source_info.get("duration") or 0)
+        if duration_seconds <= 0:
+            raise RuntimeError("Could not determine source video duration for analysis")
 
         processing_end_seconds = (
             min(float(duration_seconds), processing_end_seconds)
@@ -588,39 +634,22 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 billing_state=billing_state,
             )
 
-        raw_video_metadata = build_raw_video_metadata_update(video_path)
-        try:
-            raw_storage_path, raw_storage_etag = upload_raw_video_to_storage(
-                video_id=video_id,
-                local_video_path=video_path,
-                logger=logger,
-                job_id=job_id,
-            )
-            raw_video_metadata["raw_video_storage_path"] = raw_storage_path
-            raw_video_metadata["raw_video_storage_etag"] = raw_storage_etag
-        except Exception as exc:
-            logger.warning(
-                "[%s] Canonical raw-source upload failed for %s: %s",
-                job_id,
-                video_id,
-                exc,
-            )
-
-        # Update video metadata (keep local raw path for backward compatibility)
+        # Update video metadata as soon as source metadata is available.
         update_video_status(
             video_id,
             "analyzing",
-            title=video_data["title"],
+            title=source_info.get("title"),
             duration_seconds=duration_seconds,
-            thumbnail_url=video_data["thumbnail"],
-            platform=video_data["platform"],
-            external_id=video_data.get("external_id"),
-            **raw_video_metadata,
+            thumbnail_url=source_info.get("thumbnail"),
+            platform=source_info.get("platform"),
+            external_id=source_info.get("external_id"),
         )
 
         # 2. Get transcript ---------------------------------------------------
         transcript = None
-        if video_data["platform"] == "youtube" and video_data.get("external_id"):
+        platform = str(source_info.get("platform") or "").strip().lower()
+        external_id = str(source_info.get("external_id") or "").strip() or None
+        if platform == "youtube" and external_id:
             _update_analysis_job_progress(
                 job_id,
                 35,
@@ -628,7 +657,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 billing_state=billing_state,
             )
             logger.info("[%s] Attempting to get YouTube transcript ...", job_id)
-            transcript = downloader.get_youtube_transcript(video_data["external_id"])
+            transcript = downloader.get_youtube_transcript(external_id)
             if transcript:
                 logger.info("[%s] Got transcript from YouTube", job_id)
                 _update_analysis_job_progress(
@@ -639,24 +668,80 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 )
 
         if not transcript:
+            if source_info.get("has_audio") is False:
+                raise RuntimeError(
+                    "Source does not expose downloadable audio and no source captions were found"
+                )
+
             _update_analysis_job_progress(
                 job_id,
-                35,
+                40,
+                "downloading_source_media",
+                billing_state=billing_state,
+            )
+            logger.info("[%s] Downloading source audio for Whisper transcription ...", job_id)
+            try:
+                audio_download = downloader.download_audio_only(url, video_id)
+                source_media_path = audio_download["path"]
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Audio-only download failed for %s; falling back to full video download: %s",
+                    job_id,
+                    video_id,
+                    exc,
+                )
+                full_video_data = downloader.download(url, video_id)
+                video_path = full_video_data["path"]
+                source_media_path = video_path
+                source_info["title"] = source_info.get("title") or full_video_data.get("title")
+                source_info["thumbnail"] = source_info.get("thumbnail") or full_video_data.get("thumbnail")
+                source_info["platform"] = source_info.get("platform") or full_video_data.get("platform")
+                source_info["external_id"] = source_info.get("external_id") or full_video_data.get("external_id")
+                raw_video_metadata = build_raw_video_metadata_update(video_path)
+                try:
+                    raw_storage_path, raw_storage_etag = upload_raw_video_to_storage(
+                        video_id=video_id,
+                        local_video_path=video_path,
+                        logger=logger,
+                        job_id=job_id,
+                    )
+                    raw_video_metadata["raw_video_storage_path"] = raw_storage_path
+                    raw_video_metadata["raw_video_storage_etag"] = raw_storage_etag
+                except Exception as raw_exc:
+                    logger.warning(
+                        "[%s] Canonical raw-source upload failed for %s: %s",
+                        job_id,
+                        video_id,
+                        raw_exc,
+                    )
+                update_video_status(
+                    video_id,
+                    "analyzing",
+                    title=source_info.get("title"),
+                    thumbnail_url=source_info.get("thumbnail"),
+                    platform=source_info.get("platform"),
+                    external_id=source_info.get("external_id"),
+                    **raw_video_metadata,
+                )
+
+            _update_analysis_job_progress(
+                job_id,
+                45,
                 "extracting_audio",
                 billing_state=billing_state,
             )
             logger.info("[%s] Extracting audio for Whisper transcription ...", job_id)
-            audio_path = downloader.extract_audio(video_path)
+            audio_path = downloader.extract_audio(source_media_path or video_path)
             _update_analysis_job_progress(
                 job_id,
-                40,
+                50,
                 "extracting_audio",
                 billing_state=billing_state,
             )
 
             _update_analysis_job_progress(
                 job_id,
-                50,
+                55,
                 "transcribing_audio",
                 billing_state=billing_state,
             )
@@ -684,14 +769,14 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         transcript_for_analysis = dict(transcript)
         transcript_for_analysis["segments"] = analysis_segments
 
-        # 3. Analyse with Claude -----------------------------------------------
+        # 3. Analyze with OpenAI -----------------------------------------------
         _update_analysis_job_progress(
             job_id,
             70,
             "analyzing_transcript",
             billing_state=billing_state,
         )
-        logger.info("[%s] Analysing for %d clips with Claude ...", job_id, num_clips)
+        logger.info("[%s] Analysing for %d clips with OpenAI ...", job_id, num_clips)
         clips = analyzer.find_best_clips(
             transcript_for_analysis,
             num_clips=num_clips,
@@ -874,7 +959,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
 
         charge_description = (
             f"Video analysis ({processing_window_seconds / 60:.1f}min window): "
-            f'{(video_data.get("title") or "")[:50]}'
+            f'{(source_info.get("title") or "")[:50]}'
         )
         usage_metadata = {
             "analyses_count": 1,
@@ -890,7 +975,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             "suggested_clip_count": inserted_count,
             "transcript_window_stats": transcript_window_stats,
             "clip_validation_stats": clip_validation_stats,
-            "platform": video_data.get("platform"),
+            "platform": source_info.get("platform"),
         }
 
         if charge_source == "owner_wallet":

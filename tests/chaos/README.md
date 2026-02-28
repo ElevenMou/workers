@@ -12,7 +12,7 @@ Run these scenarios before production rollout:
 - Inject temporary network loss or 5xx responses.
 - Confirm retries for transient failures and no duplicate billing charges.
 
-3. Anthropic timeout burst
+3. OpenAI timeout burst
 - Inject repeated timeout failures for analyzer calls.
 - Confirm queue does not collapse and retrying jobs are visible.
 

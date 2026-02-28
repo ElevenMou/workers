@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from config import (
+    RAW_VIDEO_STORAGE_BUCKET,
     RAW_VIDEO_CACHE_DIR,
     SOURCE_VIDEO_LOCK_TTL_SECONDS,
     SOURCE_VIDEO_LOCK_WAIT_SECONDS,
@@ -25,7 +26,7 @@ _VIDEO_RAW_TTL_HOURS = 24
 _WAIT_STAGE_NOTIFY_INTERVAL_SECONDS = 5.0
 _WAIT_POLL_INTERVAL_SECONDS = 1.0
 _UNSET_SOURCE_MAX_HEIGHT = object()
-_RAW_VIDEO_STORAGE_BUCKET = "raw-videos"
+_RAW_VIDEO_STORAGE_BUCKET = RAW_VIDEO_STORAGE_BUCKET
 _RAW_VIDEO_UPLOAD_OPTIONS = {
     "content-type": "video/mp4",
     "x-upsert": "true",

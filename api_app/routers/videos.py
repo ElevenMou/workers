@@ -1,12 +1,10 @@
 """Video analysis and credit-cost endpoints."""
 
-from __future__ import annotations
-
 import asyncio
 from math import ceil
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 
 from api_app.auth import get_user_rate_key
 
@@ -112,6 +110,9 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
             "video_title": None,
             "thumbnail_url": None,
             "platform": None,
+            "external_id": None,
+            "has_captions": None,
+            "has_audio": None,
             "detected_language": None,
         }
 
@@ -119,7 +120,9 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
     can_download = bool(probe.get("can_download"))
     has_source_captions = bool(probe.get("has_captions"))
     has_audio = bool(probe.get("has_audio"))
-    can_use_whisper = has_audio and whisper_ready()
+    can_use_whisper = False
+    if not has_source_captions and has_audio:
+        can_use_whisper = whisper_ready()
     has_captions = has_source_captions or can_use_whisper
 
     valid_url = can_download and has_captions and duration_seconds > 0
@@ -131,6 +134,9 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
             "video_title": probe.get("title"),
             "thumbnail_url": probe.get("thumbnail"),
             "platform": probe.get("platform"),
+            "external_id": probe.get("external_id"),
+            "has_captions": has_source_captions,
+            "has_audio": has_audio,
             "detected_language": probe.get("detected_language"),
         }
 
@@ -142,6 +148,9 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
         "video_title": probe.get("title"),
         "thumbnail_url": probe.get("thumbnail"),
         "platform": probe.get("platform"),
+        "external_id": probe.get("external_id"),
+        "has_captions": has_source_captions,
+        "has_audio": has_audio,
         "detected_language": probe.get("detected_language"),
     }
 
@@ -204,7 +213,7 @@ def _raise_if_insufficient_credits(
 @limiter.limit("5/minute", key_func=get_user_rate_key)
 async def analyze_video(
     request: Request,
-    payload: AnalyzeVideoRequest,
+    payload: AnalyzeVideoRequest = Body(...),
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> AnalyzeVideoResponse:
     """Create and enqueue a video analysis job."""
@@ -407,6 +416,12 @@ async def analyze_video(
         "extraPrompt": (payload.extraPrompt.strip() if payload.extraPrompt else None),
         "analysisCredits": billed_analysis_credits,
         "analysisDurationSeconds": analysis_duration_seconds,
+        "sourceTitle": url_probe.get("video_title"),
+        "sourceThumbnailUrl": url_probe.get("thumbnail_url"),
+        "sourcePlatform": url_probe.get("platform"),
+        "sourceExternalId": url_probe.get("external_id"),
+        "sourceHasCaptions": url_probe.get("has_captions"),
+        "sourceHasAudio": url_probe.get("has_audio"),
         "workspaceTeamId": access_context.workspace_team_id,
         "billingOwnerUserId": access_context.billing_owner_user_id or user_id,
         "chargeSource": access_context.charge_source,
@@ -455,7 +470,7 @@ async def analyze_video(
 @limiter.limit("10/minute", key_func=get_user_rate_key)
 async def get_credit_cost_from_url(
     request: Request,
-    payload: CreditsCostByUrlRequest,
+    payload: CreditsCostByUrlRequest = Body(...),
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> CreditsCostByUrlResponse:
     """Validate URL and return analysis cost plus first-generation estimate."""

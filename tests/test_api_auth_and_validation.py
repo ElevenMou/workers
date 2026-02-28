@@ -399,6 +399,62 @@ def test_credit_cost_endpoint_returns_explicit_fields(client, monkeypatch):
     assert payload["hasEnoughCreditsForEstimatedTotal"] is True
 
 
+def test_probe_credit_cost_skips_whisper_check_when_source_captions_exist(monkeypatch):
+    whisper_checks = {"count": 0}
+
+    def _fake_probe(self, _url: str):
+        return {
+            "duration_seconds": 120,
+            "can_download": True,
+            "has_captions": True,
+            "has_audio": True,
+            "title": "Captioned video",
+            "thumbnail": "https://example.com/thumb.jpg",
+            "platform": "youtube",
+            "external_id": "yt123",
+        }
+
+    monkeypatch.setattr(videos_router.VideoDownloader, "probe_url", _fake_probe)
+    monkeypatch.setattr(
+        videos_router,
+        "whisper_ready",
+        lambda: whisper_checks.__setitem__("count", whisper_checks["count"] + 1) or True,
+    )
+
+    probe = videos_router._probe_credit_cost_for_url("https://www.youtube.com/watch?v=FWkVBjcVw18")
+
+    assert probe["valid_url"] is True
+    assert whisper_checks["count"] == 0
+
+
+def test_probe_credit_cost_checks_whisper_only_when_needed(monkeypatch):
+    whisper_checks = {"count": 0}
+
+    def _fake_probe(self, _url: str):
+        return {
+            "duration_seconds": 120,
+            "can_download": True,
+            "has_captions": False,
+            "has_audio": True,
+            "title": "Audio only video",
+            "thumbnail": "https://example.com/thumb.jpg",
+            "platform": "youtube",
+            "external_id": "yt123",
+        }
+
+    monkeypatch.setattr(videos_router.VideoDownloader, "probe_url", _fake_probe)
+    monkeypatch.setattr(
+        videos_router,
+        "whisper_ready",
+        lambda: whisper_checks.__setitem__("count", whisper_checks["count"] + 1) or True,
+    )
+
+    probe = videos_router._probe_credit_cost_for_url("https://www.youtube.com/watch?v=FWkVBjcVw18")
+
+    assert probe["valid_url"] is True
+    assert whisper_checks["count"] == 1
+
+
 def test_credit_cost_endpoint_waives_smart_cleanup_surcharge_for_pro_tier(client, monkeypatch):
     from api_app.app import app
 
@@ -558,6 +614,20 @@ def test_analyze_video_fails_early_when_no_credits(client, monkeypatch):
         id="user-id",
         email=None,
         claims={},
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_args, **_kwargs: access_rules.UserAccessContext(
+            tier="basic",
+            status="active",
+            interval="month",
+            max_videos_per_month=60,
+            max_clip_duration_seconds=90,
+            max_analysis_duration_seconds=45 * 60,
+            allow_custom_clips=True,
+            max_active_jobs=2,
+        ),
     )
 
     monkeypatch.setattr(
@@ -775,6 +845,12 @@ def test_analyze_video_queues_range_based_analysis_credits(client, monkeypatch):
             "valid_url": True,
             "analysis_credits": 10,
             "duration_seconds": 10 * 60,
+            "video_title": "Queued metadata title",
+            "thumbnail_url": "https://example.com/thumb.jpg",
+            "platform": "youtube",
+            "external_id": "yt123",
+            "has_captions": True,
+            "has_audio": True,
         },
     )
 
@@ -794,6 +870,12 @@ def test_analyze_video_queues_range_based_analysis_credits(client, monkeypatch):
     assert checked_amounts == [1, 2]
     assert enqueued_payload["clipLengthMinSeconds"] == 60
     assert enqueued_payload["clipLengthMaxSeconds"] == 90
+    assert enqueued_payload["sourceTitle"] == "Queued metadata title"
+    assert enqueued_payload["sourceThumbnailUrl"] == "https://example.com/thumb.jpg"
+    assert enqueued_payload["sourcePlatform"] == "youtube"
+    assert enqueued_payload["sourceExternalId"] == "yt123"
+    assert enqueued_payload["sourceHasCaptions"] is True
+    assert enqueued_payload["sourceHasAudio"] is True
 
 
 def test_analyze_video_accepts_explicit_clip_length_range(client, monkeypatch):

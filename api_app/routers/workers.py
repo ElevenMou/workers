@@ -1,6 +1,6 @@
 """Worker-scaling endpoints (admin only)."""
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 
 from api_app.auth import AuthenticatedUser, require_admin_user
 from api_app.models import WorkerScaleRequest, WorkerScaleResponse
@@ -42,7 +42,7 @@ def get_worker_scale(
 
 @router.post("/workers/scale", response_model=WorkerScaleResponse)
 def set_worker_scale(
-    payload: WorkerScaleRequest,
+    payload: WorkerScaleRequest = Body(...),
     _: AuthenticatedUser = Depends(require_admin_user),
 ) -> WorkerScaleResponse:
     """Set desired worker counts. Worker supervisor applies changes at runtime."""

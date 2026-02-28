@@ -1,7 +1,7 @@
 """Video-analysis task feature package.
 
 Use lazy attribute loading so importing ``tasks.videos`` does not pull heavy
-dependencies (e.g. Anthropic) during unrelated test collection.
+dependencies (e.g. the OpenAI SDK) during unrelated test collection.
 """
 
 from importlib import import_module

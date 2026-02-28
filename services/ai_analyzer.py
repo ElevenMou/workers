@@ -4,24 +4,104 @@ import os
 import time
 from typing import Any, Dict, List
 
-from anthropic import Anthropic
+from openai import NotFoundError, OpenAI
+from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
 
-# Default to Haiku 4.5 for best cost/quality ratio on structured extraction tasks.
-# Override with CLAUDE_ANALYZER_MODEL for higher quality (e.g. claude-sonnet-4-20250514)
-DEFAULT_ANALYZER_MODEL = os.getenv("CLAUDE_ANALYZER_MODEL", "claude-haiku-4-5-20241022")
-# Approx 4 chars per token; cap transcript to stay within context and reduce cost
-MAX_TRANSCRIPT_CHARS = int(os.getenv("CLAUDE_ANALYZER_MAX_TRANSCRIPT_CHARS", "-1"))
-# Claude API call timeout
-_CLAUDE_TIMEOUT_SECONDS = float(os.getenv("CLAUDE_ANALYZER_TIMEOUT_SECONDS", "120"))
-# Circuit breaker settings
-_CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CLAUDE_CIRCUIT_BREAKER_THRESHOLD", "3"))
-_CIRCUIT_BREAKER_COOLDOWN = float(os.getenv("CLAUDE_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "60"))
 
-# ---------------------------------------------------------------------------
-# Static system prompt (cacheable — identical across all calls)
-# ---------------------------------------------------------------------------
+def _get_env_text(*names: str, default: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return str(default)
+
+
+def _get_env_int(*names: str, default: int) -> int:
+    for name in names:
+        value = os.getenv(name)
+        if value is None or not str(value).strip():
+            continue
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            logger.warning("Invalid %s=%r; using default %d", name, value, default)
+            break
+    return int(default)
+
+
+def _get_env_float(*names: str, default: float) -> float:
+    for name in names:
+        value = os.getenv(name)
+        if value is None or not str(value).strip():
+            continue
+        try:
+            return float(str(value).strip())
+        except (TypeError, ValueError):
+            logger.warning("Invalid %s=%r; using default %s", name, value, default)
+            break
+    return float(default)
+
+
+DEFAULT_ANALYZER_MODEL = _get_env_text(
+    "OPENAI_ANALYZER_MODEL",
+    "CLAUDE_ANALYZER_MODEL",
+    default="gpt-4.1-mini",
+)
+_DEFAULT_FALLBACK_MODELS = "gpt-4.1-mini,gpt-4.1"
+# Approx 4 chars per token; cap transcript to stay within context and reduce cost.
+MAX_TRANSCRIPT_CHARS = _get_env_int(
+    "OPENAI_ANALYZER_MAX_TRANSCRIPT_CHARS",
+    "CLAUDE_ANALYZER_MAX_TRANSCRIPT_CHARS",
+    default=-1,
+)
+_OPENAI_TIMEOUT_SECONDS = _get_env_float(
+    "OPENAI_ANALYZER_TIMEOUT_SECONDS",
+    "CLAUDE_ANALYZER_TIMEOUT_SECONDS",
+    default=120.0,
+)
+_CIRCUIT_BREAKER_THRESHOLD = _get_env_int(
+    "OPENAI_CIRCUIT_BREAKER_THRESHOLD",
+    "CLAUDE_CIRCUIT_BREAKER_THRESHOLD",
+    default=3,
+)
+_CIRCUIT_BREAKER_COOLDOWN = _get_env_float(
+    "OPENAI_CIRCUIT_BREAKER_COOLDOWN_SECONDS",
+    "CLAUDE_CIRCUIT_BREAKER_COOLDOWN_SECONDS",
+    default=60.0,
+)
+
+
+def _parse_model_candidates(primary_model: str) -> list[str]:
+    candidates: list[str] = []
+    first = str(primary_model or "").strip()
+    if first:
+        candidates.append(first)
+
+    fallback_models_raw = _get_env_text(
+        "OPENAI_ANALYZER_FALLBACK_MODELS",
+        "CLAUDE_ANALYZER_FALLBACK_MODELS",
+        default=_DEFAULT_FALLBACK_MODELS,
+    )
+    for item in str(fallback_models_raw or "").split(","):
+        model = item.strip()
+        if model and model not in candidates:
+            candidates.append(model)
+    return candidates
+
+
+def _resolve_api_key() -> str:
+    return _get_env_text(
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        default="",
+    )
+
+
 _STATIC_SYSTEM_PROMPT = """\
 You are a short-form clip editor. Your job is to identify the best segments from a video transcript for TikTok/Reels/Shorts.
 
@@ -40,88 +120,53 @@ STRICT EXCLUSIONS: Reject segments that are:
 
 POSITIONAL BIAS: Avoid likely intro/outro zones in the first/last ~8% of the timeline unless the content is immediately high-value.
 
-Use the submit_clips tool to return your results. Verify that duration = end_time - start_time for each clip."""
+Return a JSON object with a top-level "clips" array that matches the requested response format. Verify that duration = end_time - start_time for each clip."""
 
-# ---------------------------------------------------------------------------
-# Tool schema for structured output (guarantees valid JSON)
-# ---------------------------------------------------------------------------
-_CLIP_ANALYSIS_TOOL = {
-    "name": "submit_clips",
-    "description": "Submit the identified clip segments from the transcript analysis.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "clips": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "rank": {
-                            "type": "integer",
-                            "description": "Priority rank (1 = best)",
-                        },
-                        "start_time": {
-                            "type": "number",
-                            "description": "Start time in seconds (must match a transcript entry start)",
-                        },
-                        "end_time": {
-                            "type": "number",
-                            "description": "End time in seconds (must match a transcript entry end)",
-                        },
-                        "duration": {
-                            "type": "number",
-                            "description": "Duration in seconds (end_time - start_time)",
-                        },
-                        "clip_title": {
-                            "type": "string",
-                            "description": "Short, catchy title for the clip",
-                        },
-                        "hook": {
-                            "type": "string",
-                            "description": "The opening hook line (first 3-5 seconds)",
-                        },
-                        "summary": {
-                            "type": "string",
-                            "description": "Why this clip has viral potential",
-                        },
-                        "confidence_score": {
-                            "type": "number",
-                            "description": "Confidence score 0.0-1.0",
-                        },
-                        "tags": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Content tags for categorization",
-                        },
-                    },
-                    "required": [
-                        "rank",
-                        "start_time",
-                        "end_time",
-                        "duration",
-                        "clip_title",
-                        "summary",
-                        "confidence_score",
-                    ],
-                },
-            }
-        },
-        "required": ["clips"],
-    },
-}
+
+class ClipCandidate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    rank: int | None = None
+    start_time: float | None = None
+    end_time: float | None = None
+    duration: float | None = None
+    clip_title: str | None = None
+    hook: str | None = None
+    summary: str | None = None
+    confidence_score: float | None = None
+    tags: list[str] | None = None
+
+
+class ClipAnalysisResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    clips: list[ClipCandidate]
 
 
 class AIAnalyzer:
-    # Circuit breaker state (shared across instances within a worker process)
+    # Circuit breaker state (shared across instances within a worker process).
     _consecutive_failures: int = 0
     _circuit_open_until: float = 0.0
+    _model_resolution_cache: dict[str, str] = {}
 
     def __init__(self):
-        self.client = Anthropic(
-            api_key=os.getenv("ANTHROPIC_API_KEY"),
-            timeout=_CLAUDE_TIMEOUT_SECONDS,
+        self.client = OpenAI(
+            api_key=_resolve_api_key(),
+            timeout=_OPENAI_TIMEOUT_SECONDS,
         )
-        self.model = DEFAULT_ANALYZER_MODEL
+        configured_model = str(DEFAULT_ANALYZER_MODEL or "").strip()
+        self.configured_model = configured_model if configured_model else DEFAULT_ANALYZER_MODEL
+        self.model_candidates = _parse_model_candidates(self.configured_model)
+        resolved_model = AIAnalyzer._model_resolution_cache.get(self.configured_model)
+        if resolved_model:
+            if resolved_model in self.model_candidates:
+                self.model_candidates = [
+                    resolved_model,
+                    *[m for m in self.model_candidates if m != resolved_model],
+                ]
+            else:
+                self.model_candidates = [resolved_model, *self.model_candidates]
+        self.model = self.model_candidates[0]
 
     @staticmethod
     def _format_transcript_compact(snippets: List[Dict]) -> str:
@@ -150,7 +195,7 @@ class AIAnalyzer:
 
     @staticmethod
     def _extract_json_payload(response_text: str) -> str:
-        """Extract a JSON object payload from raw model output (fallback for non-tool responses)."""
+        """Extract a JSON object payload from raw model output."""
         text = (response_text or "").strip()
         if not text:
             raise ValueError("Analyzer returned an empty response")
@@ -204,6 +249,165 @@ class AIAnalyzer:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _looks_like_clip_mapping(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        has_start = any(key in value for key in ("start_time", "start", "startTime"))
+        has_end = any(key in value for key in ("end_time", "end", "endTime"))
+        has_duration = "duration" in value
+        return (has_start and has_end) or has_duration
+
+    @classmethod
+    def _extract_raw_clips(cls, value: Any, *, key_hint: str | None = None) -> list[Any] | None:
+        key = str(key_hint or "").strip().lower()
+        if isinstance(value, list):
+            if key in {"clips", "segments", "highlights", "moments"}:
+                return value
+            if any(cls._looks_like_clip_mapping(item) for item in value):
+                return value
+            return None
+
+        if not isinstance(value, dict):
+            return None
+
+        preferred_keys = (
+            "clips",
+            "segments",
+            "highlights",
+            "moments",
+            "clip_candidates",
+            "clipCandidates",
+            "items",
+        )
+        for preferred in preferred_keys:
+            child = value.get(preferred)
+            extracted = cls._extract_raw_clips(child, key_hint=preferred)
+            if extracted is not None:
+                return extracted
+
+        container_keys = (
+            "input",
+            "output",
+            "result",
+            "results",
+            "data",
+            "response",
+            "payload",
+            "analysis",
+        )
+        for container in container_keys:
+            child = value.get(container)
+            extracted = cls._extract_raw_clips(child, key_hint=container)
+            if extracted is not None:
+                return extracted
+
+        for nested_key, child in value.items():
+            if not isinstance(child, (dict, list)):
+                continue
+            extracted = cls._extract_raw_clips(child, key_hint=nested_key)
+            if extracted is not None:
+                return extracted
+        return None
+
+    @staticmethod
+    def _is_model_not_found_error(exc: Exception) -> bool:
+        if isinstance(exc, NotFoundError):
+            return True
+
+        status_code = getattr(exc, "status_code", None)
+        text = str(exc).lower()
+        if status_code in {400, 404} and "model" in text:
+            if any(marker in text for marker in ("not found", "not_found", "invalid", "does not exist")):
+                return True
+        return False
+
+    @staticmethod
+    def _message_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+
+        if not isinstance(content, list):
+            return ""
+
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    text_parts.append(text)
+                continue
+
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    text_parts.append(text.strip())
+                    continue
+                if isinstance(text, dict):
+                    value = text.get("value")
+                    if isinstance(value, str) and value.strip():
+                        text_parts.append(value.strip())
+                        continue
+
+            for attr_name in ("text", "value", "content"):
+                attr_value = getattr(item, attr_name, None)
+                if isinstance(attr_value, str) and attr_value.strip():
+                    text_parts.append(attr_value.strip())
+                    break
+
+        return "\n".join(text_parts).strip()
+
+    @staticmethod
+    def _coerce_parsed_payload(parsed: Any) -> Any:
+        if parsed is None:
+            return None
+        if hasattr(parsed, "model_dump"):
+            return parsed.model_dump()
+        if hasattr(parsed, "dict"):
+            return parsed.dict()
+        return parsed
+
+    def _create_with_model_fallback(self, *, max_tokens: int, system_prompt: str, user_message: str):
+        last_error: Exception | None = None
+        for index, candidate_model in enumerate(self.model_candidates):
+            try:
+                completion = self.client.beta.chat.completions.parse(
+                    model=candidate_model,
+                    max_completion_tokens=max_tokens,
+                    temperature=0,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    response_format=ClipAnalysisResponse,
+                )
+                if candidate_model != self.configured_model:
+                    logger.warning(
+                        "Configured OpenAI model '%s' unavailable; using fallback '%s'.",
+                        self.configured_model,
+                        candidate_model,
+                    )
+                    AIAnalyzer._model_resolution_cache[self.configured_model] = candidate_model
+                else:
+                    AIAnalyzer._model_resolution_cache.pop(self.configured_model, None)
+                self.model = candidate_model
+                return completion
+            except Exception as exc:
+                last_error = exc
+                is_model_not_found = self._is_model_not_found_error(exc)
+                has_next_candidate = index < len(self.model_candidates) - 1
+                if not is_model_not_found or not has_next_candidate:
+                    raise
+                logger.warning(
+                    "OpenAI model '%s' not found; retrying with fallback '%s'.",
+                    candidate_model,
+                    self.model_candidates[index + 1],
+                )
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("OpenAI analyzer failed without a concrete error")
 
     @classmethod
     def _normalize_clip(
@@ -288,20 +492,8 @@ class AIAnalyzer:
         max_duration: int = 60,
         extra_prompt: str | None = None,
     ) -> List[Dict]:
-        """Analyze transcript using Claude to find best clips.
+        """Analyze transcript using OpenAI to find best clips."""
 
-        Uses prompt caching, tool use for structured output, and compact
-        transcript format to minimize cost while maximizing clip quality.
-
-        Args:
-            transcript: Video transcript with segments
-            num_clips: Number of clips to generate (1-n)
-            min_duration: Minimum clip duration in seconds
-            max_duration: Maximum clip duration in seconds
-            extra_prompt: Optional user-provided editorial guidance
-        """
-
-        # Format transcript for Claude
         segments = transcript.get("segments") or []
         snippets = []
         for segment in segments:
@@ -326,28 +518,15 @@ class AIAnalyzer:
         transcript_end = max(float(item["start"]) + float(item["duration"]) for item in snippets)
         transcript_duration = max(0.0, transcript_end - transcript_start)
 
-        # Compact transcript format (~57% fewer tokens than json.dumps)
         transcript_text = self._format_transcript_compact(snippets)
+        system_prompt = (
+            f"{_STATIC_SYSTEM_PROMPT}\n\n"
+            f"For this request: extract {num_clips} clip(s), "
+            f"each {min_duration}-{max_duration}s duration. "
+            f"Return exactly {num_clips} if possible; fewer if video is too short. "
+            f"Quality over quantity."
+        )
 
-        # System prompt: static cached block + small dynamic block
-        system_blocks = [
-            {
-                "type": "text",
-                "text": _STATIC_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            },
-            {
-                "type": "text",
-                "text": (
-                    f"For this request: extract {num_clips} clip(s), "
-                    f"each {min_duration}-{max_duration}s duration. "
-                    f"Return exactly {num_clips} if possible; fewer if video is too short. "
-                    f"Quality over quantity."
-                ),
-            },
-        ]
-
-        # User message: transcript data + optional extra prompt only
         extra_prompt_text = (extra_prompt or "").strip()
         extra_section = (
             f"\nAdditional user guidance:\n{extra_prompt_text}\n"
@@ -362,62 +541,72 @@ class AIAnalyzer:
             f"{extra_section}"
         )
 
-        # Dynamic max_tokens: ~200 tokens per clip + overhead
         max_tokens = min(4096, max(512, num_clips * 200 + 100))
 
-        # Circuit breaker: fail fast if Claude API has been failing repeatedly
         if AIAnalyzer._consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD:
             if time.monotonic() < AIAnalyzer._circuit_open_until:
                 raise RuntimeError(
-                    f"Claude API circuit breaker open after {_CIRCUIT_BREAKER_THRESHOLD} "
+                    f"OpenAI API circuit breaker open after {_CIRCUIT_BREAKER_THRESHOLD} "
                     f"consecutive failures. Cooldown until "
                     f"{AIAnalyzer._circuit_open_until - time.monotonic():.0f}s remaining."
                 )
-            # Cooldown expired — allow a single probe attempt
             logger.info("Circuit breaker cooldown expired, attempting probe request")
             AIAnalyzer._consecutive_failures = 0
 
         try:
-            message = self.client.messages.create(
-                model=self.model,
+            completion = self._create_with_model_fallback(
                 max_tokens=max_tokens,
-                temperature=0,
-                system=system_blocks,
-                messages=[{"role": "user", "content": user_message}],
-                tools=[_CLIP_ANALYSIS_TOOL],
-                tool_choice={"type": "tool", "name": "submit_clips"},
+                system_prompt=system_prompt,
+                user_message=user_message,
             )
-            # Reset circuit breaker on success
             AIAnalyzer._consecutive_failures = 0
 
-            if not message.content:
-                raise RuntimeError("Analyzer returned no content blocks")
+            choices = list(getattr(completion, "choices", []) or [])
+            if not choices:
+                raise RuntimeError("Analyzer returned no choices")
 
-            # Extract from tool_use block (primary path with structured output)
-            tool_block = next(
-                (block for block in message.content if block.type == "tool_use"),
-                None,
-            )
+            message = getattr(choices[0], "message", None)
+            if message is None:
+                raise RuntimeError("Analyzer returned no message")
 
-            if tool_block is not None:
-                result = tool_block.input
-                raw_clips = result.get("clips") if isinstance(result, dict) else None
-            else:
-                # Fallback: extract JSON from text (shouldn't happen with tool_choice)
-                text_blocks = []
-                for block in message.content:
-                    block_text = getattr(block, "text", None)
-                    if isinstance(block_text, str):
-                        text_blocks.append(block_text)
-                response_text = "\n".join(text_blocks).strip()
-                if not response_text:
-                    raise RuntimeError("Analyzer returned empty text content")
-                payload = self._extract_json_payload(response_text)
-                result = json.loads(payload)
-                raw_clips = result.get("clips") if isinstance(result, dict) else None
+            refusal = str(getattr(message, "refusal", "") or "").strip()
+            if refusal:
+                raise RuntimeError(f"OpenAI analyzer refusal: {refusal}")
+
+            result: Any = None
+            raw_clips: list[Any] | None = None
+            candidate_source: str | None = None
+
+            parsed = self._coerce_parsed_payload(getattr(message, "parsed", None))
+            if parsed is not None:
+                result = parsed
+                raw_clips = self._extract_raw_clips(parsed)
+                if isinstance(raw_clips, list):
+                    candidate_source = "parsed_response"
+
+            if raw_clips is None:
+                response_text = self._message_text(getattr(message, "content", None))
+                if response_text:
+                    payload = self._extract_json_payload(response_text)
+                    result = json.loads(payload)
+                    raw_clips = self._extract_raw_clips(result)
+                    candidate_source = "text_fallback"
 
             if not isinstance(raw_clips, list):
-                raise ValueError("Analyzer JSON must include a 'clips' array")
+                if isinstance(result, dict):
+                    logger.warning(
+                        "Analyzer payload missing clips-like array. Top-level keys: %s",
+                        list(result.keys())[:20],
+                    )
+                else:
+                    logger.warning(
+                        "Analyzer payload missing clips-like array. Payload type: %s",
+                        type(result).__name__,
+                    )
+                raise ValueError("Analyzer JSON must include a recognizable clips array")
+
+            if candidate_source:
+                logger.info("Analyzer clips payload accepted from %s", candidate_source)
 
             normalized: List[Dict[str, Any]] = []
             for idx, clip in enumerate(raw_clips, start=1):
@@ -442,10 +631,10 @@ class AIAnalyzer:
             if AIAnalyzer._consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD:
                 AIAnalyzer._circuit_open_until = time.monotonic() + _CIRCUIT_BREAKER_COOLDOWN
                 logger.warning(
-                    "Claude API circuit breaker opened after %d consecutive failures. "
+                    "OpenAI API circuit breaker opened after %d consecutive failures. "
                     "Cooldown: %.0fs",
                     AIAnalyzer._consecutive_failures,
                     _CIRCUIT_BREAKER_COOLDOWN,
                 )
-            logger.exception("Claude analyzer call failed: %s", e)
+            logger.exception("OpenAI analyzer call failed: %s", e)
             raise

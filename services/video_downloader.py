@@ -354,6 +354,60 @@ class VideoDownloader:
             "external_id": info.get("id"),
         }
 
+    def download_audio_only(self, url: str, video_id: str) -> dict:
+        """Download source audio without fetching the full video stream."""
+        _validate_url(url)
+        output_template = os.path.join(self.temp_dir, f"{video_id}.audio.%(ext)s")
+        legacy_client_overrides = {
+            "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}
+        }
+
+        try:
+            info = self._download_with_opts(
+                url,
+                output_template,
+                format_selector=(
+                    "bestaudio[acodec!=none]/"
+                    "bestaudio/"
+                    "b[acodec!=none]"
+                ),
+                attempt_label="audio_only_default",
+                max_height=None,
+                ydl_overrides={
+                    "noplaylist": True,
+                },
+            )
+        except yt_dlp.utils.DownloadError as exc:
+            if not self._is_youtube_url(url):
+                raise
+            logger.warning(
+                "yt-dlp default-client audio download failed for %s; retrying with legacy YouTube clients: %s",
+                video_id,
+                exc,
+            )
+            info = self._download_with_opts(
+                url,
+                output_template,
+                format_selector=(
+                    "bestaudio[acodec!=none]/"
+                    "bestaudio/"
+                    "b[acodec!=none]"
+                ),
+                attempt_label="audio_only_legacy_clients",
+                max_height=None,
+                ydl_overrides=legacy_client_overrides,
+            )
+
+        downloaded_path = self._resolve_output_path(output_template)
+        return {
+            "path": downloaded_path,
+            "title": info.get("title"),
+            "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+            "platform": info.get("extractor_key", "unknown").lower(),
+            "external_id": info.get("id"),
+        }
+
     def probe_url(self, url: str) -> dict:
         """Validate URL with yt-dlp and return probe metadata.
 
@@ -461,7 +515,7 @@ class VideoDownloader:
         """Extract audio from video for Whisper transcription."""
         import ffmpeg
 
-        audio_path = video_path.replace(".mp4", ".wav")
+        audio_path = f"{os.path.splitext(video_path)[0]}.wav"
 
         (
             ffmpeg.input(video_path)

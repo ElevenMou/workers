@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -14,19 +15,50 @@ if "whisper" not in sys.modules:
     )
     sys.modules["whisper"] = whisper_stub
 
-if "anthropic" not in sys.modules:
-    anthropic_stub = ModuleType("anthropic")
-    anthropic_stub.Anthropic = lambda *_args, **_kwargs: SimpleNamespace(
-        messages=SimpleNamespace(
-            create=lambda **_k: SimpleNamespace(
-                content=[SimpleNamespace(type="tool_use", id="call_stub", name="submit_clips", input={"clips": []})]
+if "openai" not in sys.modules:
+    openai_stub = ModuleType("openai")
+
+    class _StubNotFoundError(Exception):
+        def __init__(self, message: str = "model not found", *, status_code: int = 404):
+            super().__init__(message)
+            self.status_code = status_code
+
+    openai_stub.NotFoundError = _StubNotFoundError
+    openai_stub.OpenAI = lambda *_args, **_kwargs: SimpleNamespace(
+        beta=SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    parse=lambda **_k: SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    parsed={"clips": []},
+                                    content='{"clips":[]}',
+                                    refusal=None,
+                                )
+                            )
+                        ]
+                    )
+                )
             )
         )
     )
-    sys.modules["anthropic"] = anthropic_stub
+    sys.modules["openai"] = openai_stub
 
+import config as config_module
 from services import ai_analyzer as ai_analyzer_module
 from tasks.videos import analyze as analyze_task_module
+
+
+@pytest.fixture(autouse=True)
+def _reset_ai_analyzer_state():
+    ai_analyzer_module.AIAnalyzer._consecutive_failures = 0
+    ai_analyzer_module.AIAnalyzer._circuit_open_until = 0.0
+    ai_analyzer_module.AIAnalyzer._model_resolution_cache.clear()
+    yield
+    ai_analyzer_module.AIAnalyzer._consecutive_failures = 0
+    ai_analyzer_module.AIAnalyzer._circuit_open_until = 0.0
+    ai_analyzer_module.AIAnalyzer._model_resolution_cache.clear()
 
 
 class _FakeResponse:
@@ -141,13 +173,21 @@ class _FakeDownloader:
         work_dir: str,
         transcript: dict[str, Any] | None,
         duration_seconds: int = 180,
+        has_captions: bool = True,
+        has_audio: bool = True,
     ):
         self.work_dir = work_dir
         self._transcript = transcript
         self._duration_seconds = duration_seconds
+        self._has_captions = has_captions
+        self._has_audio = has_audio
         self.extract_audio_calls = 0
+        self.download_calls = 0
+        self.download_audio_only_calls = 0
+        self.probe_calls = 0
 
     def download(self, _url: str, video_id: str):
+        self.download_calls += 1
         return {
             "path": str(Path(self.work_dir) / f"{video_id}.mp4"),
             "title": "Hardening Test Video",
@@ -155,6 +195,29 @@ class _FakeDownloader:
             "thumbnail": "https://example.com/thumb.jpg",
             "platform": "youtube",
             "external_id": "yt123",
+        }
+
+    def download_audio_only(self, _url: str, video_id: str):
+        self.download_audio_only_calls += 1
+        return {
+            "path": str(Path(self.work_dir) / f"{video_id}.m4a"),
+            "title": "Hardening Test Video",
+            "duration": self._duration_seconds,
+            "thumbnail": "https://example.com/thumb.jpg",
+            "platform": "youtube",
+            "external_id": "yt123",
+        }
+
+    def probe_url(self, _url: str):
+        self.probe_calls += 1
+        return {
+            "duration_seconds": self._duration_seconds,
+            "title": "Hardening Test Video",
+            "thumbnail": "https://example.com/thumb.jpg",
+            "platform": "youtube",
+            "external_id": "yt123",
+            "has_captions": self._has_captions,
+            "has_audio": self._has_audio,
         }
 
     def get_youtube_transcript(self, _video_id: str):
@@ -210,7 +273,11 @@ def _install_common_patches(
 
     monkeypatch.setattr(analyze_task_module, "supabase", supabase)
     monkeypatch.setattr(analyze_task_module, "assert_response_ok", lambda *_a, **_k: None)
-    monkeypatch.setattr(analyze_task_module, "create_work_dir", lambda _name: str(tmp_path))
+    monkeypatch.setattr(
+        analyze_task_module,
+        "create_work_dir",
+        lambda _name: str(tmp_path.mkdir(parents=True, exist_ok=True) or tmp_path),
+    )
     monkeypatch.setattr(analyze_task_module, "has_sufficient_credits", lambda **_k: True)
     monkeypatch.setattr(analyze_task_module, "get_credit_balance", lambda *_a, **_k: 999)
     monkeypatch.setattr(analyze_task_module, "get_team_wallet_balance", lambda *_a, **_k: 999)
@@ -357,6 +424,49 @@ def test_youtube_transcript_path_does_not_init_transcriber(monkeypatch, tmp_path
 
     analyze_task_module.analyze_video_task(_job_data())
 
+    assert downloader.extract_audio_calls == 0
+    assert downloader.download_calls == 0
+    assert downloader.download_audio_only_calls == 0
+
+
+def test_analysis_uses_precomputed_source_metadata_before_any_media_download(
+    monkeypatch, tmp_path: Path
+):
+    supabase = _FakeSupabase()
+    downloader = _FakeDownloader(
+        work_dir=str(tmp_path),
+        transcript=_base_transcript(),
+        duration_seconds=180,
+    )
+    _install_common_patches(
+        monkeypatch,
+        tmp_path=tmp_path,
+        supabase=supabase,
+        downloader=downloader,
+        analyzer_clips=[],
+        transcriber_factory=lambda: (_ for _ in ()).throw(RuntimeError("transcriber should not be initialized")),
+    )
+    monkeypatch.setattr(
+        analyze_task_module,
+        "AIAnalyzer",
+        lambda: SimpleNamespace(find_best_clips=lambda *_a, **_k: []),
+    )
+
+    analyze_task_module.analyze_video_task(
+        _job_data(
+            analysisDurationSeconds=180,
+            sourceTitle="Preloaded metadata title",
+            sourceThumbnailUrl="https://example.com/thumb.jpg",
+            sourcePlatform="youtube",
+            sourceExternalId="yt123",
+            sourceHasCaptions=True,
+            sourceHasAudio=True,
+        )
+    )
+
+    assert downloader.probe_calls == 0
+    assert downloader.download_calls == 0
+    assert downloader.download_audio_only_calls == 0
     assert downloader.extract_audio_calls == 0
 
 
@@ -672,26 +782,114 @@ def test_legacy_clip_length_payload_maps_to_deterministic_range(monkeypatch, tmp
     assert result_data["max_clip_seconds"] == 90
 
 
-class _FakeAnthropicClient:
-    """Fake Anthropic client that can return tool_use blocks or text blocks."""
+def _parsed_payload(payload: dict[str, Any]) -> ai_analyzer_module.ClipAnalysisResponse:
+    return ai_analyzer_module.ClipAnalysisResponse.model_validate(payload)
 
-    def __init__(self, response_text: str = "", *, tool_input: dict[str, Any] | None = None):
+
+class _FakeOpenAIClient:
+    """Fake OpenAI client that can return parsed or text fallback responses."""
+
+    def __init__(
+        self,
+        response_text: str = "",
+        *,
+        parsed_payload: dict[str, Any] | None = None,
+        refusal: str | None = None,
+    ):
         self._response_text = response_text
-        self._tool_input = tool_input
-        self.messages = SimpleNamespace(create=self._create)
-
-    def _create(self, **_kwargs):
-        if self._tool_input is not None:
-            return SimpleNamespace(
-                content=[SimpleNamespace(type="tool_use", id="call_1", name="submit_clips", input=self._tool_input)]
+        self._parsed_payload = parsed_payload
+        self._refusal = refusal
+        self.beta = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(parse=self._parse)
             )
+        )
+
+    def _parse(self, **_kwargs):
         return SimpleNamespace(
-            content=[SimpleNamespace(type="text", text=self._response_text)]
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        parsed=(
+                            _parsed_payload(self._parsed_payload)
+                            if self._parsed_payload is not None
+                            else None
+                        ),
+                        content=self._response_text,
+                        refusal=self._refusal,
+                    )
+                )
+            ]
         )
 
 
+class _FakeOpenAIFallbackClient:
+    """Fake OpenAI client that fails on one model and succeeds on another."""
+
+    def __init__(self, *, failing_model: str, fallback_model: str):
+        self.failing_model = failing_model
+        self.fallback_model = fallback_model
+        self.calls: list[str] = []
+        self.beta = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(parse=self._parse)
+            )
+        )
+
+    def _parse(self, **kwargs):
+        model = str(kwargs.get("model") or "")
+        self.calls.append(model)
+        if model == self.failing_model:
+            raise ai_analyzer_module.NotFoundError(
+                "The model `invalid-model` does not exist.",
+                status_code=404,
+            )
+        if model != self.fallback_model:
+            raise RuntimeError(f"Unexpected model used: {model}")
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        parsed=_parsed_payload(
+                            {
+                                "clips": [
+                                    {
+                                        "rank": 1,
+                                        "start_time": 0.0,
+                                        "end_time": 60.0,
+                                        "duration": 60.0,
+                                        "clip_title": "Fallback clip",
+                                        "hook": "hook",
+                                        "summary": "summary",
+                                        "confidence_score": 0.9,
+                                        "tags": [],
+                                    }
+                                ]
+                            }
+                        ),
+                        content="",
+                        refusal=None,
+                    )
+                )
+            ]
+        )
+
+
+class _FakeOpenAIFailingClient:
+    def __init__(self, error: Exception):
+        self.error = error
+        self.beta = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(parse=self._parse)
+            )
+        )
+
+    def _parse(self, **_kwargs):
+        raise self.error
+
+
 def test_ai_analyzer_salvages_valid_clips_from_mixed_payload(monkeypatch):
-    tool_input = {
+    parsed_payload = {
         "clips": [
             {
                 "rank": 2,
@@ -720,8 +918,8 @@ def test_ai_analyzer_salvages_valid_clips_from_mixed_payload(monkeypatch):
 
     monkeypatch.setattr(
         ai_analyzer_module,
-        "Anthropic",
-        lambda **_kwargs: _FakeAnthropicClient(tool_input=tool_input),
+        "OpenAI",
+        lambda **_kwargs: _FakeOpenAIClient(parsed_payload=parsed_payload),
     )
     analyzer = ai_analyzer_module.AIAnalyzer()
 
@@ -738,11 +936,11 @@ def test_ai_analyzer_salvages_valid_clips_from_mixed_payload(monkeypatch):
 
 
 def test_ai_analyzer_raises_clean_error_for_non_json_response(monkeypatch):
-    """When model returns text instead of tool_use (fallback path), non-JSON raises."""
+    """When model returns text instead of parsed JSON, non-JSON raises."""
     monkeypatch.setattr(
         ai_analyzer_module,
-        "Anthropic",
-        lambda **_kwargs: _FakeAnthropicClient("No JSON payload here"),
+        "OpenAI",
+        lambda **_kwargs: _FakeOpenAIClient("No JSON payload here"),
     )
     analyzer = ai_analyzer_module.AIAnalyzer()
 
@@ -755,9 +953,9 @@ def test_ai_analyzer_raises_clean_error_for_non_json_response(monkeypatch):
         )
 
 
-def test_ai_analyzer_handles_tool_use_response(monkeypatch):
-    """Primary path: model returns a tool_use block with structured clip data."""
-    tool_input = {
+def test_ai_analyzer_handles_structured_parse_response(monkeypatch):
+    """Primary path: model returns a parsed structured response."""
+    parsed_payload = {
         "clips": [
             {
                 "rank": 1,
@@ -786,8 +984,8 @@ def test_ai_analyzer_handles_tool_use_response(monkeypatch):
 
     monkeypatch.setattr(
         ai_analyzer_module,
-        "Anthropic",
-        lambda **_kwargs: _FakeAnthropicClient(tool_input=tool_input),
+        "OpenAI",
+        lambda **_kwargs: _FakeOpenAIClient(parsed_payload=parsed_payload),
     )
     analyzer = ai_analyzer_module.AIAnalyzer()
 
@@ -805,3 +1003,226 @@ def test_ai_analyzer_handles_tool_use_response(monkeypatch):
     assert clips[0]["end"] == pytest.approx(60.0)
     assert clips[1]["title"] == "Key takeaway"
     assert clips[1]["hook"] == "The most important thing..."
+
+
+def test_ai_analyzer_accepts_nested_segments_payload(monkeypatch):
+    response_text = json.dumps(
+        {
+            "output": {
+                "segments": [
+                    {
+                        "rank": 1,
+                        "start_time": 0.0,
+                        "end_time": 45.0,
+                        "duration": 45.0,
+                        "clip_title": "Nested payload clip",
+                        "summary": "Nested summary",
+                        "confidence_score": 0.8,
+                        "tags": [],
+                    }
+                ]
+            }
+        }
+    )
+
+    monkeypatch.setattr(
+        ai_analyzer_module,
+        "OpenAI",
+        lambda **_kwargs: _FakeOpenAIClient(response_text=response_text),
+    )
+    analyzer = ai_analyzer_module.AIAnalyzer()
+
+    clips = analyzer.find_best_clips(
+        transcript=_base_transcript(),
+        num_clips=1,
+        min_duration=30,
+        max_duration=90,
+    )
+
+    assert len(clips) == 1
+    assert clips[0]["title"] == "Nested payload clip"
+    assert clips[0]["duration"] == pytest.approx(45.0)
+
+
+def test_ai_analyzer_falls_back_when_text_has_json(monkeypatch):
+    monkeypatch.setattr(
+        ai_analyzer_module,
+        "OpenAI",
+        lambda **_kwargs: _FakeOpenAIClient(
+            response_text=json.dumps(
+                {
+                    "clips": [
+                        {
+                            "rank": 1,
+                            "start_time": 0.0,
+                            "end_time": 45.0,
+                            "duration": 45.0,
+                            "clip_title": "Recovered from text",
+                            "summary": "Recovered summary",
+                            "confidence_score": 0.81,
+                            "tags": [],
+                        }
+                    ]
+                }
+            )
+        ),
+    )
+    analyzer = ai_analyzer_module.AIAnalyzer()
+
+    clips = analyzer.find_best_clips(
+        transcript=_base_transcript(),
+        num_clips=1,
+        min_duration=30,
+        max_duration=90,
+    )
+
+    assert len(clips) == 1
+    assert clips[0]["title"] == "Recovered from text"
+
+
+def test_ai_analyzer_accepts_json_block_payload(monkeypatch):
+    monkeypatch.setattr(
+        ai_analyzer_module,
+        "OpenAI",
+        lambda **_kwargs: _FakeOpenAIClient(
+            response_text=json.dumps(
+                {
+                    "result": {
+                        "clips": [
+                            {
+                                "rank": 1,
+                                "start_time": 10.0,
+                                "end_time": 55.0,
+                                "duration": 45.0,
+                                "clip_title": "JSON block clip",
+                                "summary": "JSON block summary",
+                                "confidence_score": 0.83,
+                                "tags": ["json"],
+                            }
+                        ]
+                    }
+                }
+            )
+        ),
+    )
+    analyzer = ai_analyzer_module.AIAnalyzer()
+
+    clips = analyzer.find_best_clips(
+        transcript=_base_transcript(),
+        num_clips=1,
+        min_duration=30,
+        max_duration=90,
+    )
+
+    assert len(clips) == 1
+    assert clips[0]["title"] == "JSON block clip"
+
+
+def test_ai_analyzer_retries_with_fallback_model_when_primary_missing(monkeypatch):
+    failing_model = "invalid-model"
+    fallback_model = "fallback-model"
+    fake_client = _FakeOpenAIFallbackClient(
+        failing_model=failing_model,
+        fallback_model=fallback_model,
+    )
+
+    monkeypatch.setattr(
+        ai_analyzer_module,
+        "OpenAI",
+        lambda **_kwargs: fake_client,
+    )
+    monkeypatch.setattr(ai_analyzer_module, "DEFAULT_ANALYZER_MODEL", failing_model)
+    monkeypatch.setenv("OPENAI_ANALYZER_FALLBACK_MODELS", fallback_model)
+    ai_analyzer_module.AIAnalyzer._model_resolution_cache.clear()
+
+    analyzer = ai_analyzer_module.AIAnalyzer()
+    clips = analyzer.find_best_clips(
+        transcript=_base_transcript(),
+        num_clips=1,
+        min_duration=40,
+        max_duration=90,
+    )
+
+    assert len(clips) == 1
+    assert fake_client.calls == [failing_model, fallback_model]
+
+
+def test_ai_analyzer_raises_clean_error_for_refusal(monkeypatch):
+    monkeypatch.setattr(
+        ai_analyzer_module,
+        "OpenAI",
+        lambda **_kwargs: _FakeOpenAIClient(refusal="I cannot comply."),
+    )
+    analyzer = ai_analyzer_module.AIAnalyzer()
+
+    with pytest.raises(RuntimeError, match="OpenAI analyzer refusal"):
+        analyzer.find_best_clips(
+            transcript=_base_transcript(),
+            num_clips=1,
+            min_duration=30,
+            max_duration=90,
+        )
+
+
+def test_ai_analyzer_circuit_breaker_opens_after_repeated_failures(monkeypatch):
+    monkeypatch.setattr(
+        ai_analyzer_module,
+        "OpenAI",
+        lambda **_kwargs: _FakeOpenAIFailingClient(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(ai_analyzer_module, "_CIRCUIT_BREAKER_THRESHOLD", 2)
+    monkeypatch.setattr(ai_analyzer_module, "_CIRCUIT_BREAKER_COOLDOWN", 60.0)
+
+    analyzer = ai_analyzer_module.AIAnalyzer()
+
+    with pytest.raises(RuntimeError, match="boom"):
+        analyzer.find_best_clips(
+            transcript=_base_transcript(),
+            num_clips=1,
+            min_duration=30,
+            max_duration=90,
+        )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        analyzer.find_best_clips(
+            transcript=_base_transcript(),
+            num_clips=1,
+            min_duration=30,
+            max_duration=90,
+        )
+
+    with pytest.raises(RuntimeError, match="circuit breaker open"):
+        analyzer.find_best_clips(
+            transcript=_base_transcript(),
+            num_clips=1,
+            min_duration=30,
+            max_duration=90,
+        )
+
+
+def test_validate_env_accepts_openai_api_key_only(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    config_module.validate_env()
+
+
+def test_validate_env_accepts_legacy_anthropic_api_key_only(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-key")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "legacy-key")
+
+    config_module.validate_env()
+
+
+def test_validate_env_requires_analyzer_api_key(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-key")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    with pytest.raises(SystemExit):
+        config_module.validate_env()

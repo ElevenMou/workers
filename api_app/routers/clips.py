@@ -2,7 +2,7 @@
 
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 
 from api_app.auth import get_user_rate_key
 from api_app.access_rules import (
@@ -179,7 +179,7 @@ def clip_layout_options() -> ClipLayoutOptionsResponse:
 @limiter.limit("15/minute", key_func=get_user_rate_key)
 def generate_clip(
     request: Request,
-    payload: GenerateClipRequest,
+    payload: GenerateClipRequest = Body(...),
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> GenerateClipResponse:
     """Enqueue generation for an existing suggested clip."""
@@ -389,7 +389,7 @@ def generate_clip(
 @limiter.limit("5/minute", key_func=get_user_rate_key)
 def custom_clip(
     request: Request,
-    payload: CustomClipRequest,
+    payload: CustomClipRequest = Body(...),
     current_user: AuthenticatedUser = Depends(get_current_user),
 ) -> GenerateClipResponse:
     """Create a clip from a URL + start/end time in one step (always credit-consuming)."""
