@@ -182,7 +182,7 @@ def recover_processing_rows_on_start():
 
     jobs_resp = (
         supabase.table("jobs")
-        .select("id,type,clip_id,video_id")
+        .select("id,type,clip_id,video_id,publication_id")
         .eq("status", "processing")
         .execute()
     )
@@ -200,7 +200,30 @@ def recover_processing_rows_on_start():
     for row in rows:
         clip_id = row.get("clip_id")
         video_id = row.get("video_id")
+        publication_id = row.get("publication_id")
         job_type = row.get("type")
+
+        if job_type == "publish_clip" and publication_id:
+            try:
+                publication_resp = (
+                    supabase.table("clip_publications")
+                    .update(
+                        {
+                            "status": "failed",
+                            "failed_at": datetime.now(timezone.utc).isoformat(),
+                            "last_error": reason,
+                        }
+                    )
+                    .eq("id", publication_id)
+                    .execute()
+                )
+                assert_response_ok(
+                    publication_resp,
+                    f"Failed to mark publication {publication_id} failed",
+                )
+            except Exception as exc:
+                logger.warning("Failed to recover publication %s: %s", publication_id, exc)
+            continue
 
         if clip_id:
             try:
@@ -298,7 +321,7 @@ def recover_stale_processing_rows(
 
     rows = _paginated_query(
         supabase.table("jobs")
-        .select("id,type,clip_id,video_id,started_at,created_at")
+        .select("id,type,clip_id,video_id,publication_id,started_at,created_at")
         .eq("status", "processing")
         .lt("started_at", cutoff_iso),
         "Failed to query stale processing jobs by started_at",
@@ -307,7 +330,7 @@ def recover_stale_processing_rows(
     seen_ids = {row.get("id") for row in rows}
     created_rows = _paginated_query(
         supabase.table("jobs")
-        .select("id,type,clip_id,video_id,started_at,created_at")
+        .select("id,type,clip_id,video_id,publication_id,started_at,created_at")
         .eq("status", "processing")
         .is_("started_at", "null")
         .lt("created_at", cutoff_iso),
@@ -339,7 +362,34 @@ def recover_stale_processing_rows(
     for row in stale_rows:
         clip_id = row.get("clip_id")
         video_id = row.get("video_id")
+        publication_id = row.get("publication_id")
         job_type = str(row.get("type") or "")
+
+        if publication_id and job_type == "publish_clip":
+            try:
+                publication_resp = (
+                    supabase.table("clip_publications")
+                    .update(
+                        {
+                            "status": "failed",
+                            "failed_at": datetime.now(timezone.utc).isoformat(),
+                            "last_error": reason,
+                        }
+                    )
+                    .eq("id", publication_id)
+                    .execute()
+                )
+                assert_response_ok(
+                    publication_resp,
+                    f"Failed to mark publication {publication_id} failed",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed stale-recovery update for publication %s: %s",
+                    publication_id,
+                    exc,
+                )
+            continue
 
         if clip_id:
             try:

@@ -79,6 +79,7 @@ REDIS_CONNECTION_ALERT_THRESHOLD = _env_float(
 # Queue backpressure - reject enqueues above these depths.
 MAX_VIDEO_QUEUE_DEPTH = _env_int("MAX_VIDEO_QUEUE_DEPTH", 500, minimum=10)
 MAX_CLIP_QUEUE_DEPTH = _env_int("MAX_CLIP_QUEUE_DEPTH", 1000, minimum=10)
+MAX_SOCIAL_QUEUE_DEPTH = _env_int("MAX_SOCIAL_QUEUE_DEPTH", 250, minimum=10)
 
 # ---------------------------------------------------------------------------
 # Storage
@@ -92,8 +93,10 @@ MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", 500))
 # ---------------------------------------------------------------------------
 NUM_VIDEO_WORKERS = int(os.getenv("NUM_VIDEO_WORKERS", 2))
 NUM_CLIP_WORKERS = int(os.getenv("NUM_CLIP_WORKERS", 2))
+NUM_SOCIAL_WORKERS = int(os.getenv("NUM_SOCIAL_WORKERS", 1))
 VIDEO_JOB_TIMEOUT = int(os.getenv("VIDEO_JOB_TIMEOUT", 1800))  # 30 min
 CLIP_JOB_TIMEOUT = int(os.getenv("CLIP_JOB_TIMEOUT", 1800))  # 30 min
+SOCIAL_JOB_TIMEOUT = int(os.getenv("SOCIAL_JOB_TIMEOUT", 1800))  # 30 min
 RAW_VIDEO_CLEANUP_INTERVAL_SECONDS = int(
     os.getenv("RAW_VIDEO_CLEANUP_INTERVAL_SECONDS", 300)
 )
@@ -115,6 +118,16 @@ MAINTENANCE_LEADER_LOCK_TTL_SECONDS = _env_int(
 MAINTENANCE_LEADER_RENEW_SECONDS = _env_int(
     "MAINTENANCE_LEADER_RENEW_SECONDS",
     5,
+    minimum=1,
+)
+SOCIAL_PUBLICATION_DISPATCH_INTERVAL_SECONDS = _env_int(
+    "SOCIAL_PUBLICATION_DISPATCH_INTERVAL_SECONDS",
+    30,
+    minimum=5,
+)
+SOCIAL_PUBLICATION_CLAIM_BATCH_SIZE = _env_int(
+    "SOCIAL_PUBLICATION_CLAIM_BATCH_SIZE",
+    50,
     minimum=1,
 )
 SOURCE_VIDEO_LOCK_WAIT_SECONDS = _env_int(
@@ -249,6 +262,12 @@ FFMPEG_THREADS = _env_int("FFMPEG_THREADS", 2, minimum=1)
 RAW_VIDEO_STORAGE_BUCKET = (
     os.getenv("RAW_VIDEO_STORAGE_BUCKET", "raw-videos").strip() or "raw-videos"
 )
+YOUTUBE_SHORTS_MAX_DURATION_SECONDS = _env_int(
+    "YOUTUBE_SHORTS_MAX_DURATION_SECONDS",
+    180,
+    minimum=1,
+)
+SOCIAL_ACCOUNT_ENCRYPTION_KEY = os.getenv("SOCIAL_ACCOUNT_ENCRYPTION_KEY")
 
 
 # ---------------------------------------------------------------------------

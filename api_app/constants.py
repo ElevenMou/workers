@@ -4,6 +4,7 @@
 ANALYZE_TASK_PATH = "tasks.analyze_video.analyze_video_task"
 GENERATE_TASK_PATH = "tasks.generate_clip.generate_clip_task"
 CUSTOM_CLIP_TASK_PATH = "tasks.custom_clip.custom_clip_task"
+PUBLISH_TASK_PATH = "tasks.publishing.publish.publish_clip_task"
 
 CAPTION_FONT_CASES = ["as_typed", "uppercase", "lowercase"]
 CAPTION_POSITIONS = ["top", "middle", "bottom", "custom"]

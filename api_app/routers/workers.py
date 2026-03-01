@@ -5,7 +5,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, status
 from api_app.auth import AuthenticatedUser, require_admin_user
 from api_app.models import WorkerScaleRequest, WorkerScaleResponse
 from api_app.state import logger
-from config import NUM_CLIP_WORKERS, NUM_VIDEO_WORKERS
+from config import NUM_CLIP_WORKERS, NUM_SOCIAL_WORKERS, NUM_VIDEO_WORKERS
 from utils.redis_client import (
     get_redis_connection,
     get_worker_scale_target,
@@ -22,10 +22,11 @@ def get_worker_scale(
     """Return desired worker counts for the running worker supervisor."""
     try:
         conn = get_redis_connection()
-        video_workers, clip_workers = get_worker_scale_target(
+        video_workers, clip_workers, social_workers = get_worker_scale_target(
             connection=conn,
             default_video=NUM_VIDEO_WORKERS,
             default_clip=NUM_CLIP_WORKERS,
+            default_social=NUM_SOCIAL_WORKERS,
         )
     except Exception as exc:
         logger.error("Failed to read worker scale target: %s", exc)
@@ -37,6 +38,7 @@ def get_worker_scale(
     return WorkerScaleResponse(
         videoWorkers=video_workers,
         clipWorkers=clip_workers,
+        socialWorkers=social_workers,
     )
 
 
@@ -46,20 +48,26 @@ def set_worker_scale(
     _: AuthenticatedUser = Depends(require_admin_user),
 ) -> WorkerScaleResponse:
     """Set desired worker counts. Worker supervisor applies changes at runtime."""
-    if payload.videoWorkers is None and payload.clipWorkers is None:
+    if (
+        payload.videoWorkers is None
+        and payload.clipWorkers is None
+        and payload.socialWorkers is None
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Provide at least one of videoWorkers or clipWorkers",
+            detail="Provide at least one worker count",
         )
 
     try:
         conn = get_redis_connection()
-        video_workers, clip_workers = set_worker_scale_target(
+        video_workers, clip_workers, social_workers = set_worker_scale_target(
             connection=conn,
             video_workers=payload.videoWorkers,
             clip_workers=payload.clipWorkers,
+            social_workers=payload.socialWorkers,
             default_video=NUM_VIDEO_WORKERS,
             default_clip=NUM_CLIP_WORKERS,
+            default_social=NUM_SOCIAL_WORKERS,
         )
     except Exception as exc:
         logger.error("Failed to update worker scale target: %s", exc)
@@ -69,11 +77,13 @@ def set_worker_scale(
         ) from exc
 
     logger.info(
-        "Worker scale target updated: video=%d clip=%d",
+        "Worker scale target updated: video=%d clip=%d social=%d",
         video_workers,
         clip_workers,
+        social_workers,
     )
     return WorkerScaleResponse(
         videoWorkers=video_workers,
         clipWorkers=clip_workers,
+        socialWorkers=social_workers,
     )

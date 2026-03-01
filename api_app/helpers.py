@@ -51,8 +51,9 @@ def enqueue_or_fail(
     job_id: str,
     user_id: str,
     job_type: str,
-    video_id: str,
+    video_id: str | None = None,
     clip_id: str | None = None,
+    publication_id: str | None = None,
     on_queue_full_cleanup: Callable[[], None] | None = None,
 ):
     """Enqueue a background job and mark DB job failed if enqueue fails."""
@@ -105,12 +106,12 @@ def enqueue_or_fail(
         ) from exc
 
     logger.info(
-        "Job %s enqueued on %s queue (type=%s user=%s video=%s clip=%s)",
+        "Job %s enqueued on %s queue (type=%s user=%s video=%s clip=%s publication=%s)",
         job_id,
         queue_name,
         job_type,
         user_id,
         video_id,
         clip_id,
+        publication_id,
     )
-

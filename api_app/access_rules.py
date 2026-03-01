@@ -44,7 +44,7 @@ _DEFAULT_PLAN_LIMITS_BY_TIER: dict[str, dict[str, int | bool | None]] = {
         "max_active_jobs": 2,
         "max_templates": 3,
         "templates_editable": True,
-        "allow_social_publishing": False,
+        "allow_social_publishing": True,
         "max_teams": 0,
         "max_team_members": 0,
     },
@@ -255,7 +255,7 @@ def _read_plan_limits(
         ),
         "allow_social_publishing": _as_bool(
             row.get("allow_social_publishing"),
-            _as_bool(fallback.get("allow_social_publishing"), tier in {"pro", "enterprise"}),
+            _as_bool(fallback.get("allow_social_publishing"), tier in {"basic", "pro", "enterprise"}),
         ),
         "max_teams": _as_int(
             row.get("max_teams"),
@@ -513,7 +513,7 @@ def get_user_access_context(user_id: str, supabase_client=supabase) -> UserAcces
         templates_editable=_as_bool(plan_limits.get("templates_editable"), tier != "free"),
         allow_social_publishing=_as_bool(
             plan_limits.get("allow_social_publishing"),
-            tier in {"pro", "enterprise"},
+            tier in {"basic", "pro", "enterprise"},
         ),
         max_teams=_as_int(plan_limits.get("max_teams"), None),
         max_team_members=_as_int(plan_limits.get("max_team_members"), None),
@@ -616,6 +616,17 @@ def enforce_custom_clip_access(*, context: UserAccessContext):
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail="Custom clip generation is available on paid plans only.",
+    )
+
+
+def enforce_social_publishing_access(*, context: UserAccessContext):
+    """Block publishing flows for plans that disallow linked social delivery."""
+    if context.allow_social_publishing:
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Social publishing is available on paid plans only.",
     )
 
 

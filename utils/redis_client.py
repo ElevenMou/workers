@@ -6,12 +6,14 @@ from rq import Queue, Retry
 from config import (
     CLIP_JOB_TIMEOUT,
     MAX_CLIP_QUEUE_DEPTH,
+    MAX_SOCIAL_QUEUE_DEPTH,
     MAX_VIDEO_QUEUE_DEPTH,
     REDIS_DB,
     REDIS_HOST,
     REDIS_MAX_CONNECTIONS,
     REDIS_PASSWORD,
     REDIS_PORT,
+    SOCIAL_JOB_TIMEOUT,
     VIDEO_JOB_TIMEOUT,
 )
 
@@ -25,12 +27,15 @@ QUEUE_CONFIG: dict[str, dict] = {
     "video-processing": {"default_timeout": VIDEO_JOB_TIMEOUT},
     "clip-generation-priority": {"default_timeout": CLIP_JOB_TIMEOUT},
     "clip-generation": {"default_timeout": CLIP_JOB_TIMEOUT},
+    "social-publishing-priority": {"default_timeout": SOCIAL_JOB_TIMEOUT},
+    "social-publishing": {"default_timeout": SOCIAL_JOB_TIMEOUT},
 }
 
 # Queue group -> (priority queue, normal queue, max depth).
 _QUEUE_GROUPS: dict[str, tuple[str, str, int]] = {
     "video": ("video-processing-priority", "video-processing", MAX_VIDEO_QUEUE_DEPTH),
     "clip": ("clip-generation-priority", "clip-generation", MAX_CLIP_QUEUE_DEPTH),
+    "social": ("social-publishing-priority", "social-publishing", MAX_SOCIAL_QUEUE_DEPTH),
 }
 
 # Map each queue name back to its group key for quick lookup.
@@ -43,32 +48,40 @@ for _group_key, (_pq, _nq, _) in _QUEUE_GROUPS.items():
 WORKER_SCALE_KEY = "clipry:workers:desired"
 WORKER_SCALE_VIDEO_KEY = "clipry:workers:desired:video"
 WORKER_SCALE_CLIP_KEY = "clipry:workers:desired:clip"
+WORKER_SCALE_SOCIAL_KEY = "clipry:workers:desired:social"
 _WORKER_GROUP_KEY_BY_NAME = {
     "video": WORKER_SCALE_VIDEO_KEY,
     "clip": WORKER_SCALE_CLIP_KEY,
+    "social": WORKER_SCALE_SOCIAL_KEY,
 }
 
 QUEUE_REJECTS_TOTAL_KEY = "clipry:metrics:queue_rejects:total"
 QUEUE_REJECTS_VIDEO_KEY = "clipry:metrics:queue_rejects:video"
 QUEUE_REJECTS_CLIP_KEY = "clipry:metrics:queue_rejects:clip"
+QUEUE_REJECTS_SOCIAL_KEY = "clipry:metrics:queue_rejects:social"
 _QUEUE_REJECT_KEY_BY_GROUP = {
     "video": QUEUE_REJECTS_VIDEO_KEY,
     "clip": QUEUE_REJECTS_CLIP_KEY,
+    "social": QUEUE_REJECTS_SOCIAL_KEY,
 }
 ADMISSION_VIDEO_KEY = "clipry:admission:video"
 ADMISSION_CLIP_KEY = "clipry:admission:clip"
+ADMISSION_SOCIAL_KEY = "clipry:admission:social"
 _ADMISSION_KEY_BY_GROUP = {
     "video": ADMISSION_VIDEO_KEY,
     "clip": ADMISSION_CLIP_KEY,
+    "social": ADMISSION_SOCIAL_KEY,
 }
 ADMISSION_RELEASED_PREFIX = "clipry:admission:released:"
 ADMISSION_JOB_GROUP_PREFIX = "clipry:admission:job-group:"
 ADMISSION_RELEASES_TOTAL_KEY = "clipry:metrics:admission_releases:total"
 ADMISSION_RELEASES_VIDEO_KEY = "clipry:metrics:admission_releases:video"
 ADMISSION_RELEASES_CLIP_KEY = "clipry:metrics:admission_releases:clip"
+ADMISSION_RELEASES_SOCIAL_KEY = "clipry:metrics:admission_releases:social"
 _ADMISSION_RELEASES_KEY_BY_GROUP = {
     "video": ADMISSION_RELEASES_VIDEO_KEY,
     "clip": ADMISSION_RELEASES_CLIP_KEY,
+    "social": ADMISSION_RELEASES_SOCIAL_KEY,
 }
 _ADMISSION_RELEASED_TTL_SECONDS = 60 * 60 * 24 * 7
 _ADMISSION_JOB_GROUP_TTL_SECONDS = 60 * 60 * 24 * 7
@@ -163,6 +176,7 @@ def get_queue_reject_counts(conn: redis.Redis | None = None) -> dict[str, int]:
         "total": _as_int(c.get(QUEUE_REJECTS_TOTAL_KEY)),
         "video": _as_int(c.get(QUEUE_REJECTS_VIDEO_KEY)),
         "clip": _as_int(c.get(QUEUE_REJECTS_CLIP_KEY)),
+        "social": _as_int(c.get(QUEUE_REJECTS_SOCIAL_KEY)),
     }
 
 
@@ -183,6 +197,8 @@ def admission_group_for_job_type(job_type: str | None) -> str | None:
         return "video"
     if normalized in {"generate_clip", "custom_clip"}:
         return "clip"
+    if normalized == "publish_clip":
+        return "social"
     return None
 
 
@@ -318,9 +334,11 @@ def get_admission_counts(conn: redis.Redis | None = None) -> dict[str, int]:
     return {
         "video": _as_int(c.get(ADMISSION_VIDEO_KEY)),
         "clip": _as_int(c.get(ADMISSION_CLIP_KEY)),
+        "social": _as_int(c.get(ADMISSION_SOCIAL_KEY)),
         "releases_total": _as_int(c.get(ADMISSION_RELEASES_TOTAL_KEY)),
         "releases_video": _as_int(c.get(ADMISSION_RELEASES_VIDEO_KEY)),
         "releases_clip": _as_int(c.get(ADMISSION_RELEASES_CLIP_KEY)),
+        "releases_social": _as_int(c.get(ADMISSION_RELEASES_SOCIAL_KEY)),
     }
 
 
@@ -440,7 +458,8 @@ def get_worker_scale_target(
     connection: redis.Redis | None = None,
     default_video: int = 0,
     default_clip: int = 0,
-) -> tuple[int, int]:
+    default_social: int = 0,
+) -> tuple[int, int, int]:
     """Read desired worker counts from Redis, falling back to defaults."""
     conn = connection or get_redis_connection()
     video_workers = get_group_worker_scale_target(
@@ -453,26 +472,34 @@ def get_worker_scale_target(
         connection=conn,
         default=default_clip,
     )
-    return video_workers, clip_workers
+    social_workers = get_group_worker_scale_target(
+        group="social",
+        connection=conn,
+        default=default_social,
+    )
+    return video_workers, clip_workers, social_workers
 
 
 def set_worker_scale_target(
     *,
     video_workers: int | None = None,
     clip_workers: int | None = None,
+    social_workers: int | None = None,
     connection: redis.Redis | None = None,
     default_video: int = 0,
     default_clip: int = 0,
-) -> tuple[int, int]:
+    default_social: int = 0,
+) -> tuple[int, int, int]:
     """Persist desired worker counts and return the normalized final values."""
-    if video_workers is None and clip_workers is None:
+    if video_workers is None and clip_workers is None and social_workers is None:
         raise ValueError("At least one worker count must be provided")
 
     conn = connection or get_redis_connection()
-    current_video, current_clip = get_worker_scale_target(
+    current_video, current_clip, current_social = get_worker_scale_target(
         connection=conn,
         default_video=default_video,
         default_clip=default_clip,
+        default_social=default_social,
     )
 
     final_video = (
@@ -495,8 +522,18 @@ def set_worker_scale_target(
         if clip_workers is not None
         else current_clip
     )
+    final_social = (
+        set_group_worker_scale_target(
+            group="social",
+            workers=social_workers,
+            connection=conn,
+            default=current_social,
+        )
+        if social_workers is not None
+        else current_social
+    )
 
-    return final_video, final_clip
+    return final_video, final_clip, final_social
 
 
 # ---------------------------------------------------------------------------
@@ -507,3 +544,5 @@ video_priority_queue = get_queue("video-processing-priority", redis_conn)
 video_queue = get_queue("video-processing", redis_conn)
 clip_priority_queue = get_queue("clip-generation-priority", redis_conn)
 clip_queue = get_queue("clip-generation", redis_conn)
+social_priority_queue = get_queue("social-publishing-priority", redis_conn)
+social_queue = get_queue("social-publishing", redis_conn)

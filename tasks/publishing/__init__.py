@@ -1,0 +1,1 @@
+"""Social publishing task package."""

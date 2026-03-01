@@ -68,3 +68,15 @@ class CustomClipJob(TypedDict):
     sourceMaxHeight: NotRequired[int | None]
     outputQualityOverride: NotRequired[str | None]
     qualityPolicyProfile: NotRequired[str]
+
+
+class PublishClipJob(TypedDict):
+    jobId: str
+    publicationId: str
+    clipId: str
+    userId: str
+    workspaceTeamId: NotRequired[str | None]
+    billingOwnerUserId: NotRequired[str | None]
+    workspaceRole: NotRequired[str]
+    subscriptionTier: NotRequired[str]
+    provider: NotRequired[str]

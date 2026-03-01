@@ -1,6 +1,7 @@
 """Pydantic request/response models for the workers API."""
 
-from typing import Optional
+from datetime import datetime
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -176,12 +177,61 @@ class CaptionOptionsResponse(BaseModel):
 class WorkerScaleRequest(BaseModel):
     videoWorkers: Optional[int] = Field(default=None, ge=0, le=64)
     clipWorkers: Optional[int] = Field(default=None, ge=0, le=64)
+    socialWorkers: Optional[int] = Field(default=None, ge=0, le=64)
 
 
 class WorkerScaleResponse(BaseModel):
     videoWorkers: int
     clipWorkers: int
+    socialWorkers: int
 
 
 class CaptionPresetsResponse(BaseModel):
     presets: list[dict]
+
+
+class CreateClipPublicationsRequest(BaseModel):
+    clipId: str = Field(..., description="Completed clip id to publish")
+    socialAccountIds: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=12,
+        description="One or more linked social-account ids in the active workspace.",
+    )
+    caption: str = Field(..., min_length=1, max_length=2200)
+    youtubeTitle: Optional[str] = Field(default=None, max_length=100)
+    mode: Literal["now", "schedule"]
+    scheduledAt: Optional[datetime] = Field(
+        default=None,
+        description="Client local scheduled datetime with offset when mode=schedule.",
+    )
+    timeZone: str = Field(..., min_length=1, max_length=128)
+    clientRequestId: str = Field(..., min_length=1, max_length=255)
+
+
+class ClipPublicationResponse(BaseModel):
+    id: str
+    batchId: str
+    clipId: str
+    socialAccountId: str
+    provider: str
+    status: str
+    scheduledFor: str
+    scheduledTimezone: str
+    remotePostId: Optional[str] = None
+    remotePostUrl: Optional[str] = None
+    lastError: Optional[str] = None
+    attemptCount: int = 0
+
+
+class CreateClipPublicationsResponse(BaseModel):
+    batchId: str
+    publications: list[ClipPublicationResponse]
+
+
+class CancelClipPublicationResponse(BaseModel):
+    publication: ClipPublicationResponse
+
+
+class RetryClipPublicationResponse(BaseModel):
+    publication: ClipPublicationResponse

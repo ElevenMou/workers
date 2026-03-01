@@ -21,10 +21,14 @@ VIDEO_PRIORITY_QUEUE = "video-processing-priority"
 VIDEO_QUEUE = "video-processing"
 CLIP_PRIORITY_QUEUE = "clip-generation-priority"
 CLIP_QUEUE = "clip-generation"
+SOCIAL_PRIORITY_QUEUE = "social-publishing-priority"
+SOCIAL_QUEUE = "social-publishing"
 VIDEO_QUEUE_ORDER = [VIDEO_PRIORITY_QUEUE, VIDEO_QUEUE]
 CLIP_QUEUE_ORDER = [CLIP_PRIORITY_QUEUE, CLIP_QUEUE]
+SOCIAL_QUEUE_ORDER = [SOCIAL_PRIORITY_QUEUE, SOCIAL_QUEUE]
 VIDEO_PREFIX = "video-worker"
 CLIP_PREFIX = "clip-worker"
+SOCIAL_PREFIX = "social-worker"
 MAINTENANCE_LEADER_KEY = "clipry:maintenance:leader"
 
 
@@ -149,9 +153,13 @@ def _run_maintenance_loop(
     processing_job_stale_seconds: int,
     leader_lock_ttl_seconds: int,
     leader_renew_seconds: int,
+    social_publication_dispatch_interval_seconds: int,
+    social_publication_claim_batch_size: int,
 ) -> int:
     from tasks.clips.cleanup import cleanup_expired_clip_assets
     from tasks.videos.cleanup import cleanup_expired_raw_videos
+    from utils.redis_client import QueueFullError, enqueue_job
+    from utils.supabase_client import assert_response_ok, supabase
 
     lock = _MaintenanceLeaderLock(
         startup_conn,
@@ -171,6 +179,7 @@ def _run_maintenance_loop(
     last_admission_reconciliation = 0.0
     admission_reconcile_interval = 300.0  # 5 minutes
     last_failed_job_cleanup = 0.0
+    last_social_publication_dispatch = 0.0
     failed_job_cleanup_interval = 86400.0  # daily
     last_lock_renewal = 0.0
     renew_every = max(1, int(leader_renew_seconds))
@@ -239,6 +248,137 @@ def _run_maintenance_loop(
                     last_clip_asset_cleanup_run = now
 
             if (
+                social_publication_dispatch_interval_seconds > 0
+                and now - last_social_publication_dispatch >= social_publication_dispatch_interval_seconds
+            ):
+                try:
+                    claimed_resp = supabase.rpc(
+                        "claim_due_clip_publications",
+                        {"p_limit": int(social_publication_claim_batch_size)},
+                    ).execute()
+                    assert_response_ok(
+                        claimed_resp,
+                        "Failed to claim due social publications",
+                    )
+                    claimed_rows = list(claimed_resp.data or [])
+                    for publication in claimed_rows:
+                        batch_resp = (
+                            supabase.table("clip_publish_batches")
+                            .select("id, user_id, team_id, billing_owner_user_id")
+                            .eq("id", publication["batch_id"])
+                            .single()
+                            .execute()
+                        )
+                        assert_response_ok(
+                            batch_resp,
+                            f"Failed to load publish batch {publication['batch_id']}",
+                        )
+                        batch = batch_resp.data
+
+                        sub_resp = (
+                            supabase.table("subscriptions")
+                            .select("tier, status, interval")
+                            .eq("user_id", batch["billing_owner_user_id"])
+                            .limit(1)
+                            .execute()
+                        )
+                        assert_response_ok(
+                            sub_resp,
+                            f"Failed to load subscription for {batch['billing_owner_user_id']}",
+                        )
+                        subscription_rows = sub_resp.data or []
+                        sub_row = subscription_rows[0] if subscription_rows else {}
+                        interval = str(sub_row.get("interval") or "month")
+                        tier = str(sub_row.get("tier") or "free")
+
+                        plan_resp = (
+                            supabase.table("pricing_tiers")
+                            .select("priority_processing")
+                            .eq("tier", tier)
+                            .eq("interval", interval)
+                            .eq("active", True)
+                            .limit(1)
+                            .execute()
+                        )
+                        assert_response_ok(
+                            plan_resp,
+                            f"Failed to load pricing tier for {batch['billing_owner_user_id']}",
+                        )
+                        plan_rows = plan_resp.data or []
+                        priority_processing = bool(
+                            plan_rows[0].get("priority_processing") if plan_rows else False
+                        )
+
+                        queue_name = (
+                            SOCIAL_PRIORITY_QUEUE if priority_processing else SOCIAL_QUEUE
+                        )
+                        job_id = str(uuid.uuid4())
+                        job_data = {
+                            "jobId": job_id,
+                            "publicationId": publication["id"],
+                            "clipId": publication["clip_id"],
+                            "userId": batch["user_id"],
+                            "workspaceTeamId": batch.get("team_id"),
+                            "billingOwnerUserId": batch["billing_owner_user_id"],
+                            "provider": publication["provider"],
+                            "subscriptionTier": tier,
+                        }
+                        job_resp = (
+                            supabase.table("jobs")
+                            .insert(
+                                {
+                                    "id": job_id,
+                                    "user_id": batch["user_id"],
+                                    "team_id": batch.get("team_id"),
+                                    "billing_owner_user_id": batch["billing_owner_user_id"],
+                                    "clip_id": publication["clip_id"],
+                                    "publication_id": publication["id"],
+                                    "type": "publish_clip",
+                                    "status": "queued",
+                                    "input_data": job_data,
+                                }
+                            )
+                            .execute()
+                        )
+                        assert_response_ok(job_resp, f"Failed to insert publish job {job_id}")
+                        try:
+                            enqueue_job(queue_name, "tasks.publishing.publish.publish_clip_task", job_data, job_id=job_id)
+                        except QueueFullError as exc:
+                            logger.warning(
+                                "Social queue full while dispatching publication %s: %s",
+                                publication["id"],
+                                exc,
+                            )
+                            supabase.table("jobs").delete().eq("id", job_id).execute()
+                            supabase.table("clip_publications").update(
+                                {
+                                    "status": "scheduled",
+                                    "queued_at": None,
+                                    "last_error": str(exc),
+                                }
+                            ).eq("id", publication["id"]).execute()
+                        except Exception as exc:
+                            logger.warning(
+                                "Social publication dispatch failed for %s: %s",
+                                publication["id"],
+                                exc,
+                            )
+                            supabase.table("jobs").update(
+                                {"status": "failed", "error_message": str(exc)}
+                            ).eq("id", job_id).execute()
+                            supabase.table("clip_publications").update(
+                                {
+                                    "status": "scheduled",
+                                    "queued_at": None,
+                                    "last_error": str(exc),
+                                }
+                            ).eq("id", publication["id"]).execute()
+                except Exception as exc:
+                    logger.warning("Scheduled social publication tick failed: %s", exc)
+                finally:
+                    last_social_publication_dispatch = now
+
+            if (
                 processing_job_stale_seconds > 0
                 and now - last_processing_recovery_run >= processing_recovery_interval_seconds
             ):
@@ -295,9 +435,12 @@ def run_supervisor() -> int:
         MAINTENANCE_LEADER_LOCK_TTL_SECONDS,
         MAINTENANCE_LEADER_RENEW_SECONDS,
         NUM_CLIP_WORKERS,
+        NUM_SOCIAL_WORKERS,
         NUM_VIDEO_WORKERS,
         PROCESSING_JOB_STALE_SECONDS,
         RAW_VIDEO_CLEANUP_INTERVAL_SECONDS,
+        SOCIAL_PUBLICATION_CLAIM_BATCH_SIZE,
+        SOCIAL_PUBLICATION_DISPATCH_INTERVAL_SECONDS,
         SUPERVISOR_ROLE,
         WORKER_INSTANCE_ID,
         validate_env,
@@ -326,6 +469,8 @@ def run_supervisor() -> int:
         VIDEO_QUEUE,
         CLIP_PRIORITY_QUEUE,
         CLIP_QUEUE,
+        SOCIAL_PRIORITY_QUEUE,
+        SOCIAL_QUEUE,
     ]
     startup_conn = get_redis_connection()
 
@@ -338,14 +483,17 @@ def run_supervisor() -> int:
             processing_job_stale_seconds=PROCESSING_JOB_STALE_SECONDS,
             leader_lock_ttl_seconds=MAINTENANCE_LEADER_LOCK_TTL_SECONDS,
             leader_renew_seconds=MAINTENANCE_LEADER_RENEW_SECONDS,
+            social_publication_dispatch_interval_seconds=SOCIAL_PUBLICATION_DISPATCH_INTERVAL_SECONDS,
+            social_publication_claim_batch_size=SOCIAL_PUBLICATION_CLAIM_BATCH_SIZE,
         )
 
     try:
         reconciled = reconcile_admission_counts(startup_conn)
         logger.info(
-            "Reconciled admission counters at startup: video=%d clip=%d",
+            "Reconciled admission counters at startup: video=%d clip=%d social=%d",
             int(reconciled.get("video", 0)),
             int(reconciled.get("clip", 0)),
+            int(reconciled.get("social", 0)),
         )
     except Exception as exc:
         logger.warning("Admission-counter reconciliation failed at startup: %s", exc)
@@ -355,14 +503,22 @@ def run_supervisor() -> int:
     if worker_mode == "video":
         effective_num_video = NUM_VIDEO_WORKERS
         effective_num_clip = 0
+        effective_num_social = 0
         logger.info("WORKER_MODE=video - only video workers will be managed")
     elif worker_mode == "clip":
         effective_num_video = 0
         effective_num_clip = NUM_CLIP_WORKERS
+        effective_num_social = 0
         logger.info("WORKER_MODE=clip - only clip workers will be managed")
+    elif worker_mode == "social":
+        effective_num_video = 0
+        effective_num_clip = 0
+        effective_num_social = NUM_SOCIAL_WORKERS
+        logger.info("WORKER_MODE=social - only social workers will be managed")
     else:
         effective_num_video = NUM_VIDEO_WORKERS
         effective_num_clip = NUM_CLIP_WORKERS
+        effective_num_social = NUM_SOCIAL_WORKERS
 
     worker_specs: dict[str, list[str]] = {}
     processes: dict[str, multiprocessing.Process] = {}
@@ -376,6 +532,7 @@ def run_supervisor() -> int:
                 default=effective_num_video,
             )
             desired_clip_workers = 0
+            desired_social_workers = 0
         elif worker_mode == "clip":
             desired_video_workers = 0
             desired_clip_workers = set_group_worker_scale_target(
@@ -384,18 +541,31 @@ def run_supervisor() -> int:
                 connection=startup_conn,
                 default=effective_num_clip,
             )
+            desired_social_workers = 0
+        elif worker_mode == "social":
+            desired_video_workers = 0
+            desired_clip_workers = 0
+            desired_social_workers = set_group_worker_scale_target(
+                group="social",
+                workers=effective_num_social,
+                connection=startup_conn,
+                default=effective_num_social,
+            )
         else:
-            desired_video_workers, desired_clip_workers = set_worker_scale_target(
+            desired_video_workers, desired_clip_workers, desired_social_workers = set_worker_scale_target(
                 connection=startup_conn,
                 video_workers=effective_num_video,
                 clip_workers=effective_num_clip,
+                social_workers=effective_num_social,
                 default_video=effective_num_video,
                 default_clip=effective_num_clip,
+                default_social=effective_num_social,
             )
         logger.info(
-            "Reset worker scale target on startup to defaults: video=%d clip=%d",
+            "Reset worker scale target on startup to defaults: video=%d clip=%d social=%d",
             desired_video_workers,
             desired_clip_workers,
+            desired_social_workers,
         )
     else:
         if worker_mode == "video":
@@ -405,6 +575,7 @@ def run_supervisor() -> int:
                 default=effective_num_video,
             )
             desired_clip_workers = 0
+            desired_social_workers = 0
         elif worker_mode == "clip":
             desired_video_workers = 0
             desired_clip_workers = get_group_worker_scale_target(
@@ -412,23 +583,40 @@ def run_supervisor() -> int:
                 connection=startup_conn,
                 default=effective_num_clip,
             )
+            desired_social_workers = 0
+        elif worker_mode == "social":
+            desired_video_workers = 0
+            desired_clip_workers = 0
+            desired_social_workers = get_group_worker_scale_target(
+                group="social",
+                connection=startup_conn,
+                default=effective_num_social,
+            )
         else:
-            desired_video_workers, desired_clip_workers = get_worker_scale_target(
+            desired_video_workers, desired_clip_workers, desired_social_workers = get_worker_scale_target(
                 connection=startup_conn,
                 default_video=effective_num_video,
                 default_clip=effective_num_clip,
+                default_social=effective_num_social,
             )
 
     # Enforce WORKER_MODE limits even when reading from Redis.
     if worker_mode == "video":
         desired_clip_workers = 0
+        desired_social_workers = 0
     elif worker_mode == "clip":
         desired_video_workers = 0
+        desired_social_workers = 0
+    elif worker_mode == "social":
+        desired_video_workers = 0
+        desired_clip_workers = 0
 
     for i in range(desired_video_workers):
         worker_specs[f"{VIDEO_PREFIX}-{instance_id}-{i}"] = list(VIDEO_QUEUE_ORDER)
     for i in range(desired_clip_workers):
         worker_specs[f"{CLIP_PREFIX}-{instance_id}-{i}"] = list(CLIP_QUEUE_ORDER)
+    for i in range(desired_social_workers):
+        worker_specs[f"{SOCIAL_PREFIX}-{instance_id}-{i}"] = list(SOCIAL_QUEUE_ORDER)
 
     cleanup_named_workers(startup_conn, set(worker_specs.keys()))
     logger.info(
@@ -449,16 +637,23 @@ def run_supervisor() -> int:
         p = spawn_worker(worker_specs[name], name)
         processes[name] = p
         logger.info("Spawned %s  (pid %d)", name, p.pid)
+    for i in range(desired_social_workers):
+        name = f"{SOCIAL_PREFIX}-{instance_id}-{i}"
+        p = spawn_worker(worker_specs[name], name)
+        processes[name] = p
+        logger.info("Spawned %s  (pid %d)", name, p.pid)
 
     current_video_workers = desired_video_workers
     current_clip_workers = desired_clip_workers
+    current_social_workers = desired_social_workers
 
-    total = current_video_workers + current_clip_workers
+    total = current_video_workers + current_clip_workers + current_social_workers
     logger.info(
-        "Worker pool ready - instance=%s %d video, %d clip  (%d total)",
+        "Worker pool ready - instance=%s %d video, %d clip, %d social (%d total)",
         instance_id,
         current_video_workers,
         current_clip_workers,
+        current_social_workers,
         total,
     )
 
@@ -472,6 +667,7 @@ def run_supervisor() -> int:
                         default=current_video_workers,
                     )
                     target_clip_workers = 0
+                    target_social_workers = 0
                 elif worker_mode == "clip":
                     target_video_workers = 0
                     target_clip_workers = get_group_worker_scale_target(
@@ -479,27 +675,41 @@ def run_supervisor() -> int:
                         connection=startup_conn,
                         default=current_clip_workers,
                     )
+                    target_social_workers = 0
+                elif worker_mode == "social":
+                    target_video_workers = 0
+                    target_clip_workers = 0
+                    target_social_workers = get_group_worker_scale_target(
+                        group="social",
+                        connection=startup_conn,
+                        default=current_social_workers,
+                    )
                 else:
-                    target_video_workers, target_clip_workers = get_worker_scale_target(
+                    target_video_workers, target_clip_workers, target_social_workers = get_worker_scale_target(
                         connection=startup_conn,
                         default_video=current_video_workers,
                         default_clip=current_clip_workers,
+                        default_social=current_social_workers,
                     )
             except Exception as exc:
                 logger.warning("Failed to read scale target from Redis: %s", exc)
                 target_video_workers = current_video_workers
                 target_clip_workers = current_clip_workers
+                target_social_workers = current_social_workers
 
             if (
                 target_video_workers != current_video_workers
                 or target_clip_workers != current_clip_workers
+                or target_social_workers != current_social_workers
             ):
                 logger.info(
-                    "Applying scale target - video: %d -> %d, clip: %d -> %d",
+                    "Applying scale target - video: %d -> %d, clip: %d -> %d, social: %d -> %d",
                     current_video_workers,
                     target_video_workers,
                     current_clip_workers,
                     target_clip_workers,
+                    current_social_workers,
+                    target_social_workers,
                 )
                 current_video_workers = resize_group(
                     conn=startup_conn,
@@ -518,6 +728,15 @@ def run_supervisor() -> int:
                     queue_names=list(CLIP_QUEUE_ORDER),
                     current_count=current_clip_workers,
                     target_count=target_clip_workers,
+                )
+                current_social_workers = resize_group(
+                    conn=startup_conn,
+                    worker_specs=worker_specs,
+                    processes=processes,
+                    prefix=f"{SOCIAL_PREFIX}-{instance_id}",
+                    queue_names=list(SOCIAL_QUEUE_ORDER),
+                    current_count=current_social_workers,
+                    target_count=target_social_workers,
                 )
 
             for name, p in list(processes.items()):

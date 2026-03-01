@@ -171,6 +171,53 @@ services:
     mem_limit: ${CLIP_WORKERS_MEM_LIMIT:-16g}
     cpus: ${CLIP_WORKERS_CPU_LIMIT:-8}
 
+  # ---------- Social Workers (lightweight: HTTP uploads to platform APIs) ----------
+  social-workers:
+    build: .
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - REDIS_HOST=redis
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+      - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-40}
+      - TEMP_DIR=${TEMP_DIR:-/tmp/video_clipper}
+      - CAPTION_FONTS_DIR=${CAPTION_FONTS_DIR:-/app/assets/fonts}
+      - WHISPER_MODEL=${WHISPER_MODEL:-base}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - SUPERVISOR_ROLE=worker
+      - WORKER_INSTANCE_ID=${WORKER_INSTANCE_ID:-}
+      - WORKER_MODE=social
+      - NUM_VIDEO_WORKERS=0
+      - NUM_CLIP_WORKERS=0
+      - NUM_SOCIAL_WORKERS=${NUM_SOCIAL_WORKERS:-2}
+      - RESET_WORKER_SCALE_ON_START=${RESET_WORKER_SCALE_ON_START:-true}
+      - SOCIAL_JOB_TIMEOUT=${SOCIAL_JOB_TIMEOUT:-1800}
+      - SOCIAL_ACCOUNT_ENCRYPTION_KEY=${SOCIAL_ACCOUNT_ENCRYPTION_KEY}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - TIKTOK_CLIENT_KEY=${TIKTOK_CLIENT_KEY}
+      - TIKTOK_CLIENT_SECRET=${TIKTOK_CLIENT_SECRET}
+      - META_APP_ID=${META_APP_ID}
+      - META_APP_SECRET=${META_APP_SECRET}
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+    volumes:
+      - video_data:/tmp/video_clipper
+    depends_on:
+      redis:
+        condition: service_healthy
+    mem_limit: ${SOCIAL_WORKERS_MEM_LIMIT:-2g}
+    cpus: ${SOCIAL_WORKERS_CPU_LIMIT:-2}
+
   # ---------- Maintenance Supervisor (single logical leader via Redis lock) ----------
   maintenance-supervisor:
     build: .

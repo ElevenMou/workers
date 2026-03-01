@@ -240,16 +240,18 @@ def health_metrics(
         except Exception:
             queues[queue_name] = -1
 
-    workers = {"video_workers": -1, "clip_workers": -1}
+    workers = {"video_workers": -1, "clip_workers": -1, "social_workers": -1}
     try:
-        video_workers, clip_workers = get_worker_scale_target(
+        video_workers, clip_workers, social_workers = get_worker_scale_target(
             connection=conn,
             default_video=0,
             default_clip=0,
+            default_social=0,
         )
         workers = {
             "video_workers": int(video_workers),
             "clip_workers": int(clip_workers),
+            "social_workers": int(social_workers),
         }
     except Exception:
         pass
