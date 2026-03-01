@@ -150,7 +150,7 @@ services:
       redis:
         condition: service_healthy
     mem_limit: ${VIDEO_WORKERS_MEM_LIMIT:-16g}
-    cpus: ${VIDEO_WORKERS_CPU_LIMIT:-8}
+    cpus: ${VIDEO_WORKERS_CPU_LIMIT:-4}
 
   # ---------- Clip Workers (CPU + IO heavy: FFmpeg) ----------
   clip-workers:
@@ -204,7 +204,7 @@ services:
       redis:
         condition: service_healthy
     mem_limit: ${CLIP_WORKERS_MEM_LIMIT:-16g}
-    cpus: ${CLIP_WORKERS_CPU_LIMIT:-8}
+    cpus: ${CLIP_WORKERS_CPU_LIMIT:-4}
 
   # ---------- Social Workers (lightweight: HTTP uploads to platform APIs) ----------
   social-workers:
