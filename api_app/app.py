@@ -20,7 +20,9 @@ from api_app.routers.publishing import router as publishing_router
 from api_app.routers.videos import router as videos_router
 from api_app.routers.workers import router as workers_router
 from config import validate_env
-from utils.logging_config import correlation_id_var, generate_correlation_id
+from utils.logging_config import correlation_id_var, generate_correlation_id, setup_logging
+
+setup_logging(component="api")
 
 
 # ---------------------------------------------------------------------------
@@ -100,14 +102,22 @@ cors_allowed_origins = [
     if origin.strip()
 ]
 
-# SECURITY: In production CORS_ALLOWED_ORIGINS must be set to the exact
-# frontend URL. The localhost fallback is only for development.
 cors_origin_regex = os.getenv("CORS_ALLOWED_ORIGIN_REGEX")
 if not cors_allowed_origins and not cors_origin_regex:
-    cors_allowed_origins = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
+    _is_production = os.getenv("ENVIRONMENT", "").strip().lower() in {"production", "prod"}
+    if _is_production:
+        import logging as _cors_log
+        _cors_log.getLogger(__name__).error(
+            "CORS_ALLOWED_ORIGINS is not set in production. "
+            "Requests from browser origins will be rejected. "
+            "Set CORS_ALLOWED_ORIGINS to your frontend URL(s)."
+        )
+        cors_allowed_origins = []
+    else:
+        cors_allowed_origins = [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ]
 
 app.add_middleware(
     CORSMiddleware,

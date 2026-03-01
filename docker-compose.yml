@@ -1,11 +1,13 @@
 services:
   # ---------- Redis ----------
+  # SECURITY: Set REDIS_PASSWORD in your .env file before deploying.
+  # The default "changeme" is for local development only.
   redis:
     image: redis:7-alpine
     command:
       - redis-server
       - "--requirepass"
-      - "${REDIS_PASSWORD:-changeme}"
+      - "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"
       - "--maxmemory"
       - "${REDIS_MAXMEMORY:-1500mb}"
       - "--maxmemory-policy"
@@ -22,7 +24,7 @@ services:
       - redis_data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "--no-auth-warning", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "--no-auth-warning", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -41,7 +43,7 @@ services:
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis
       - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
       - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-40}
       - REDIS_CONNECTION_ALERT_THRESHOLD=${REDIS_CONNECTION_ALERT_THRESHOLD:-0.8}
       - TEMP_DIR=${TEMP_DIR:-/tmp/video_clipper}
@@ -84,7 +86,7 @@ services:
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis
       - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
       - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-80}
       - TEMP_DIR=${TEMP_DIR:-/tmp/video_clipper}
       - CAPTION_FONTS_DIR=${CAPTION_FONTS_DIR:-/app/assets/fonts}
@@ -138,7 +140,7 @@ services:
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis
       - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
       - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-80}
       - TEMP_DIR=${TEMP_DIR:-/tmp/video_clipper}
       - CAPTION_FONTS_DIR=${CAPTION_FONTS_DIR:-/app/assets/fonts}
@@ -192,7 +194,7 @@ services:
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis
       - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
       - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-40}
       - TEMP_DIR=${TEMP_DIR:-/tmp/video_clipper}
       - CAPTION_FONTS_DIR=${CAPTION_FONTS_DIR:-/app/assets/fonts}
@@ -239,7 +241,7 @@ services:
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis
       - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-changeme}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
       - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-40}
       - TEMP_DIR=${TEMP_DIR:-/tmp/video_clipper}
       - CAPTION_FONTS_DIR=${CAPTION_FONTS_DIR:-/app/assets/fonts}

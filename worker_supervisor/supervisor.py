@@ -411,9 +411,10 @@ def _run_maintenance_loop(
                     from utils.redis_client import reconcile_admission_counts
                     reconciled = reconcile_admission_counts(startup_conn)
                     logger.debug(
-                        "Periodic admission reconciliation: video=%s clip=%s",
-                        reconciled.get("video-processing", 0),
-                        reconciled.get("clip-generation", 0),
+                        "Periodic admission reconciliation: video=%s clip=%s social=%s",
+                        reconciled.get("video", 0),
+                        reconciled.get("clip", 0),
+                        reconciled.get("social", 0),
                     )
                 except Exception as exc:
                     logger.warning("Periodic admission reconciliation failed: %s", exc)

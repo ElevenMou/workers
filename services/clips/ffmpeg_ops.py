@@ -17,6 +17,7 @@ from services.clips.models import QualityPreset
 
 logger = logging.getLogger(__name__)
 _FFMPEG_THREADS = max(1, int(FFMPEG_THREADS))
+_FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "1200"))
 
 _VALID_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -37,6 +38,43 @@ def safe_remove(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+def _run_ffmpeg_with_timeout(
+    stream,
+    *,
+    capture_stderr: bool = False,
+    quiet: bool = False,
+    timeout: int | None = None,
+) -> tuple[bytes | None, bytes | None]:
+    """Run an ffmpeg stream with a subprocess timeout.
+
+    Falls back to ``_FFMPEG_TIMEOUT_SECONDS`` when *timeout* is ``None``.
+    Kills the process tree on timeout to prevent orphaned FFmpeg processes.
+    """
+    effective_timeout = timeout if timeout is not None else _FFMPEG_TIMEOUT_SECONDS
+    import subprocess
+    import signal
+
+    cmd = stream.compile()
+    stderr_pipe = subprocess.PIPE if (capture_stderr or quiet) else None
+    stdout_pipe = subprocess.PIPE if quiet else None
+    process = subprocess.Popen(
+        cmd, stdout=stdout_pipe, stderr=stderr_pipe
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=effective_timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+        raise RuntimeError(
+            f"FFmpeg process timed out after {effective_timeout}s. "
+            "The subprocess was killed to prevent resource leaks."
+        )
+    if process.returncode != 0:
+        err_msg = stderr.decode("utf-8", errors="replace") if stderr else ""
+        raise ffmpeg.Error("ffmpeg", stdout, stderr)
+    return stdout, stderr
 
 
 def _ffmpeg_thread_args() -> dict[str, int]:
@@ -258,7 +296,7 @@ def extract_segment(
     )
 
     try:
-        (
+        stream = (
             ffmpeg.input(input_path, ss=safe_start, t=duration)
             .output(
                 output_path,
@@ -276,8 +314,8 @@ def extract_segment(
                 movflags="+faststart",
             )
             .overwrite_output()
-            .run(capture_stderr=True)
         )
+        _run_ffmpeg_with_timeout(stream, capture_stderr=True)
     except ffmpeg.Error as e:
         stderr_output = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
         logger.error(
@@ -568,7 +606,7 @@ def add_overlays(
         stream = ffmpeg.filter([stream, overlay_input], "overlay", overlay_x, overlay_y)
 
     try:
-        (
+        overlay_stream = (
             ffmpeg.output(
                 stream,
                 audio.audio,
@@ -586,8 +624,8 @@ def add_overlays(
                 movflags="+faststart",
             )
             .overwrite_output()
-            .run(capture_stderr=True)
         )
+        _run_ffmpeg_with_timeout(overlay_stream, capture_stderr=True)
     except ffmpeg.Error as e:
         stderr_output = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
         logger.error("FFmpeg overlay failed:\n%s", stderr_output)
@@ -797,7 +835,7 @@ def compose_clip(
     )
 
     try:
-        (
+        compose_stream = (
             ffmpeg.output(
                 stream,
                 audio_stream,
@@ -815,8 +853,8 @@ def compose_clip(
                 movflags="+faststart",
             )
             .overwrite_output()
-            .run(capture_stderr=True)
         )
+        _run_ffmpeg_with_timeout(compose_stream, capture_stderr=True)
     except ffmpeg.Error as e:
         stderr_output = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
         logger.error("FFmpeg compose failed:\n%s", stderr_output)
@@ -1003,7 +1041,7 @@ def concat_intro_outro(
         concat_node = ffmpeg.concat(*concat_inputs, v=1, a=1).node
         concat_video = concat_node[0]
         concat_audio = concat_node[1]
-        (
+        concat_stream = (
             ffmpeg.output(
                 concat_video,
                 concat_audio,
@@ -1021,8 +1059,8 @@ def concat_intro_outro(
                 movflags="+faststart",
             )
             .overwrite_output()
-            .run(capture_stderr=True)
         )
+        _run_ffmpeg_with_timeout(concat_stream, capture_stderr=True)
     except ffmpeg.Error as e:
         stderr_output = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
         logger.error("FFmpeg concat failed:\n%s", stderr_output)

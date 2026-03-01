@@ -3,7 +3,7 @@ rq==1.15.1
 python-dotenv==1.0.0
 supabase==2.3.0
 httpx==0.24.1
-yt-dlp==2026.02.04
+yt-dlp==2026.02.21
 ffmpeg-python==0.2.0
 openai==2.24.0
 youtube-transcript-api==1.2.4

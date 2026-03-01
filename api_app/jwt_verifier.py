@@ -21,6 +21,12 @@ _JWKS_CACHE_TTL_SECONDS = max(
 )
 _SUPABASE_JWT_ISSUER = os.getenv("SUPABASE_JWT_ISSUER") or f"{SUPABASE_URL}/auth/v1"
 _SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
+if not _SUPABASE_JWT_SECRET:
+    import logging as _jwt_log
+    _jwt_log.getLogger(__name__).warning(
+        "SUPABASE_JWT_SECRET is not set. HS256 token verification will fail "
+        "and all auth will fall back to remote JWKS verification, adding latency."
+    )
 _JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
 
 _cache_lock = threading.Lock()
