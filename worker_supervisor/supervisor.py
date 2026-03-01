@@ -3,10 +3,20 @@
 import multiprocessing
 import os
 import re
+import signal
 import socket
 import sys
 import time
 import uuid
+
+_shutdown_requested = False
+
+
+def _sigterm_handler(signum: int, frame: object) -> None:
+    """Translate SIGTERM into the same shutdown path as KeyboardInterrupt."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    raise KeyboardInterrupt
 
 from worker_supervisor.runtime import (
     cleanup_named_workers,
@@ -184,6 +194,8 @@ def _run_maintenance_loop(
     last_lock_renewal = 0.0
     renew_every = max(1, int(leader_renew_seconds))
     has_logged_standby = False
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     logger.info(
         "Supervisor role=maintenance started (leader_key=%s ttl=%ss renew=%ss)",
@@ -455,6 +467,10 @@ def run_supervisor() -> int:
     )
 
     validate_env()
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    logger.info("SIGTERM handler registered for graceful Docker shutdown")
+
     supervisor_role = str(SUPERVISOR_ROLE or "worker").strip().lower() or "worker"
     if supervisor_role not in {"worker", "maintenance"}:
         logger.error(

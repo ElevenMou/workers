@@ -2,10 +2,9 @@
 
 import logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(name)-28s %(levelname)-7s %(message)s",
-)
+from utils.logging_config import setup_logging
+
+setup_logging(component="api")
 logger = logging.getLogger("clipry.api")
 
 _WHISPER_READY: bool | None = None
@@ -18,7 +17,6 @@ def whisper_ready() -> bool:
         return _WHISPER_READY
 
     try:
-        # Lazy import to avoid loading Whisper unless this check is needed.
         from services.transcriber import Transcriber
 
         Transcriber()

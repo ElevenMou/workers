@@ -54,6 +54,8 @@ services:
       - WORKER_SCALE_ADMIN_USER_IDS=${WORKER_SCALE_ADMIN_USER_IDS:-}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - CORS_ALLOWED_ORIGIN_REGEX=${CORS_ALLOWED_ORIGIN_REGEX:-}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+      - SENTRY_DSN=${SENTRY_DSN:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -111,6 +113,8 @@ services:
       - FFMPEG_THREADS=${FFMPEG_THREADS:-2}
       - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
       - MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+      - SENTRY_DSN=${SENTRY_DSN:-}
     volumes:
       - video_data:/tmp/video_clipper
     depends_on:
@@ -163,6 +167,8 @@ services:
       - FFMPEG_THREADS=${FFMPEG_THREADS:-2}
       - OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
       - MKL_NUM_THREADS=${MKL_NUM_THREADS:-1}
+      - LOG_FORMAT=${LOG_FORMAT:-json}
+      - SENTRY_DSN=${SENTRY_DSN:-}
     volumes:
       - video_data:/tmp/video_clipper
     depends_on:

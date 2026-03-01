@@ -2,8 +2,7 @@
 
 import logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(name)-28s [%(process)d] %(levelname)-7s %(message)s",
-)
+from utils.logging_config import setup_logging
+
+setup_logging(component="worker")
 logger = logging.getLogger("clipry.worker")

@@ -20,6 +20,7 @@ from api_app.routers.publishing import router as publishing_router
 from api_app.routers.videos import router as videos_router
 from api_app.routers.workers import router as workers_router
 from config import validate_env
+from utils.logging_config import correlation_id_var, generate_correlation_id
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,20 @@ class RequestTimeoutMiddleware(BaseHTTPMiddleware):
             )
 
 
+class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    """Propagates or generates a correlation ID for every request."""
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        cid = request.headers.get("x-correlation-id") or generate_correlation_id()
+        token = correlation_id_var.set(cid)
+        try:
+            response = await call_next(request)
+            response.headers["x-correlation-id"] = cid
+            return response
+        finally:
+            correlation_id_var.reset(token)
+
+
 app = FastAPI(title="Clipry Workers API", version="1.0.0")
 app.state.limiter = limiter
 
@@ -104,6 +119,7 @@ app.add_middleware(
 )
 app.add_middleware(RequestSizeLimitMiddleware)
 app.add_middleware(RequestTimeoutMiddleware)
+app.add_middleware(CorrelationIdMiddleware)
 validate_env()
 
 app.include_router(health_router)

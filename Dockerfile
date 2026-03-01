@@ -46,6 +46,9 @@ USER appuser
 # Expose the API port
 EXPOSE 8001
 
+# Ensure Docker sends SIGTERM for graceful shutdown
+STOPSIGNAL SIGTERM
+
 # Default: run the RQ worker pool
 # (overridden to uvicorn for the api service in docker-compose)
 CMD ["python", "main.py"]
