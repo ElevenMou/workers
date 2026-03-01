@@ -95,6 +95,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    volumes:
+      - ./cookies.txt:/cookies.txt:ro
     mem_limit: ${API_MEM_LIMIT:-2g}
     cpus: ${API_CPU_LIMIT:-2}
 
@@ -109,6 +111,7 @@ services:
       retries: 3
       start_period: 60s
     environment:
+      - YTDLP_COOKIES_FILE=/cookies.txt
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis
@@ -146,6 +149,7 @@ services:
       - SENTRY_DSN=${SENTRY_DSN:-}
     volumes:
       - video_data:/tmp/video_clipper
+      - ./cookies.txt:/cookies.txt:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -163,6 +167,7 @@ services:
       retries: 3
       start_period: 60s
     environment:
+      - YTDLP_COOKIES_FILE=/cookies.txt
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis
@@ -200,6 +205,7 @@ services:
       - SENTRY_DSN=${SENTRY_DSN:-}
     volumes:
       - video_data:/tmp/video_clipper
+      - ./cookies.txt:/cookies.txt:ro
     depends_on:
       redis:
         condition: service_healthy
