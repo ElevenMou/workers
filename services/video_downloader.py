@@ -15,6 +15,7 @@ from config import (
     MAX_VIDEO_SIZE_MB,
     TEMP_DIR,
     YTDLP_COOKIES_FILE,
+    YTDLP_COOKIES_SOURCE_FILE,
     YTDLP_DOWNLOAD_RETRIES,
     YTDLP_EXTRACTOR_RETRIES,
     YTDLP_FRAGMENT_RETRIES,
@@ -64,6 +65,27 @@ _YOUTUBE_DOMAINS: set[str] = {
     "m.youtube.com",
     "youtu.be",
 }
+_YOUTUBE_BOT_CHECK_MESSAGES = (
+    "sign in to confirm you're not a bot",
+    "sign in to confirm you’re not a bot",
+)
+
+
+class VideoProbeError(RuntimeError):
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.failure_reason = reason
+
+
+def classify_yt_dlp_error(exc: Exception) -> str:
+    message = str(exc).strip().lower()
+    if "read-only file system" in message and "cookie" in message:
+        return "cookiefile_unwritable"
+    if any(token in message for token in _YOUTUBE_BOT_CHECK_MESSAGES):
+        return "youtube_bot_check"
+    if "sign in" in message and "cookie" in message:
+        return "youtube_auth_required"
+    return "extractor_failure"
 
 
 def _validate_url(url: str) -> None:
@@ -112,6 +134,118 @@ class VideoDownloader:
         self.temp_dir = work_dir or TEMP_DIR
         os.makedirs(self.temp_dir, exist_ok=True)
 
+    def _default_runtime_cookiefile(self) -> str:
+        return os.path.join(self.temp_dir, "yt-dlp", "cookies.txt")
+
+    @staticmethod
+    def _is_readable_cookie_path(path: str | None) -> bool:
+        if not path:
+            return False
+        return os.path.isfile(path) and os.access(path, os.R_OK)
+
+    @staticmethod
+    def _is_writable_cookie_path(path: str | None) -> bool:
+        if not path:
+            return False
+        return os.path.isfile(path) and os.access(path, os.W_OK)
+
+    @staticmethod
+    def _prepare_runtime_cookie_target(path: str | None) -> str | None:
+        if not path:
+            return None
+        target_dir = os.path.dirname(path) or "."
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            if not os.path.exists(path):
+                with open(path, "w", encoding="utf-8"):
+                    pass
+        except OSError as exc:
+            logger.warning(
+                "yt-dlp cookie runtime path unavailable (%s): %s",
+                path,
+                exc,
+            )
+            return None
+
+        if (
+            not VideoDownloader._is_readable_cookie_path(path)
+            or not VideoDownloader._is_writable_cookie_path(path)
+        ):
+            logger.warning(
+                "yt-dlp cookiefile_unwritable: runtime cookie path is not read/write accessible: %s",
+                path,
+            )
+            return None
+        return path
+
+    def _resolve_cookiefile(self) -> str | None:
+        runtime_cookie_path = YTDLP_COOKIES_FILE
+        source_cookie_path = YTDLP_COOKIES_SOURCE_FILE
+
+        if (
+            runtime_cookie_path
+            and not source_cookie_path
+            and self._is_readable_cookie_path(runtime_cookie_path)
+            and not self._is_writable_cookie_path(runtime_cookie_path)
+        ):
+            source_cookie_path = runtime_cookie_path
+            runtime_cookie_path = self._default_runtime_cookiefile()
+            logger.warning(
+                "yt-dlp cookiefile_unwritable: configured cookie path %s is read-only; using writable copy %s",
+                source_cookie_path,
+                runtime_cookie_path,
+            )
+
+        if source_cookie_path:
+            if not self._is_readable_cookie_path(source_cookie_path):
+                logger.warning(
+                    "yt-dlp cookie source is not readable: %s; continuing without cookies",
+                    source_cookie_path,
+                )
+                return None
+
+            runtime_target = self._prepare_runtime_cookie_target(
+                runtime_cookie_path or self._default_runtime_cookiefile()
+            )
+            if runtime_target is None:
+                logger.warning(
+                    "yt-dlp cookiefile_unwritable: could not prepare writable runtime cookie path; continuing without cookies",
+                )
+                return None
+
+            if os.path.abspath(source_cookie_path) == os.path.abspath(runtime_target):
+                return runtime_target
+
+            try:
+                shutil.copyfile(source_cookie_path, runtime_target)
+            except OSError as exc:
+                logger.warning(
+                    "yt-dlp cookie copy failed from %s to %s: %s; continuing without cookies",
+                    source_cookie_path,
+                    runtime_target,
+                    exc,
+                )
+                return None
+
+            return runtime_target
+
+        if runtime_cookie_path and self._is_readable_cookie_path(runtime_cookie_path):
+            if self._is_writable_cookie_path(runtime_cookie_path):
+                return runtime_cookie_path
+            logger.warning(
+                "yt-dlp cookiefile_unwritable: configured runtime cookie path is not writable: %s; continuing without cookies",
+                runtime_cookie_path,
+            )
+            return None
+
+        if runtime_cookie_path or source_cookie_path:
+            logger.warning(
+                "yt-dlp cookies unavailable: source=%s runtime=%s; continuing without cookies",
+                source_cookie_path,
+                runtime_cookie_path,
+            )
+        return None
+
     @staticmethod
     def _normalize_max_height(max_height: int | None) -> int | None:
         if max_height is None:
@@ -145,12 +279,11 @@ class VideoDownloader:
             "bv*+ba/b"
         )
 
-    @classmethod
-    def _base_ydl_opts(cls, *, max_height: int | None = 1080) -> dict:
+    def _base_ydl_opts(self, *, max_height: int | None = 1080) -> dict:
         opts: dict = {
             # Prefer h264+AAC for fast downstream processing.
             # Height cap is controlled by tier-aware quality policy.
-            "format": cls._format_selector_for_max_height(max_height),
+            "format": self._format_selector_for_max_height(max_height),
             "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
             "merge_output_format": "mp4",
             "noplaylist": True,
@@ -169,8 +302,9 @@ class VideoDownloader:
             "fragment_retries": YTDLP_FRAGMENT_RETRIES,
             "extractor_retries": YTDLP_EXTRACTOR_RETRIES,
         }
-        if YTDLP_COOKIES_FILE and os.path.isfile(YTDLP_COOKIES_FILE):
-            opts["cookiefile"] = YTDLP_COOKIES_FILE
+        cookiefile = self._resolve_cookiefile()
+        if cookiefile:
+            opts["cookiefile"] = cookiefile
         return opts
 
     @staticmethod
@@ -450,8 +584,13 @@ class VideoDownloader:
             }
         )
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as exc:
+            reason = classify_yt_dlp_error(exc)
+            logger.warning("yt-dlp probe failed (%s) for %s: %s", reason, url, exc)
+            raise VideoProbeError(reason, str(exc)) from exc
 
         duration_seconds = int(info.get("duration") or 0)
         subtitles = info.get("subtitles") or {}

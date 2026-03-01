@@ -47,11 +47,8 @@ COPY . .
 # Create a non-root user for security
 RUN useradd -m -r appuser
 
-# Ensure the default temp directory exists and is writable by appuser
-RUN mkdir -p /tmp/video_clipper && chown appuser:appuser /tmp/video_clipper
-
-# yt-dlp needs read+write on cookies.txt (it updates cookies in-place)
-RUN test -f /cookies.txt && chown appuser:appuser /cookies.txt || true
+# Ensure the temp directory and yt-dlp runtime cookie path are writable by appuser
+RUN mkdir -p /tmp/video_clipper/yt-dlp && chown -R appuser:appuser /tmp/video_clipper
 
 # Switch to non-root user
 USER appuser

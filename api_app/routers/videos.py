@@ -102,7 +102,13 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
     try:
         probe = downloader.probe_url(url_str)
     except Exception as exc:
-        logger.warning("URL validation failed for %s: %s", url_str, exc)
+        failure_reason = getattr(exc, "failure_reason", "probe_failed")
+        logger.warning(
+            "URL validation failed (%s) for %s: %s",
+            failure_reason,
+            url_str,
+            exc,
+        )
         return {
             "valid_url": False,
             "analysis_credits": 0,

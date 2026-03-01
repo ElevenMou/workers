@@ -83,6 +83,8 @@ services:
       - WORKER_SCALE_ADMIN_USER_IDS=${WORKER_SCALE_ADMIN_USER_IDS:-}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - CORS_ALLOWED_ORIGIN_REGEX=${CORS_ALLOWED_ORIGIN_REGEX:-}
+      - YTDLP_COOKIES_SOURCE_FILE=/run/secrets/youtube-cookies.txt
+      - YTDLP_COOKIES_FILE=/tmp/video_clipper/yt-dlp/cookies.txt
       - LOG_FORMAT=${LOG_FORMAT:-json}
       - SENTRY_DSN=${SENTRY_DSN:-}
     depends_on:
@@ -96,7 +98,12 @@ services:
       retries: 3
       start_period: 10s
     volumes:
-      - ./cookies.txt:/cookies.txt:ro
+      - type: bind
+        source: ${YTDLP_COOKIES_SECRET_PATH:-./secrets/youtube-cookies.txt}
+        target: /run/secrets/youtube-cookies.txt
+        read_only: true
+        bind:
+          create_host_path: false
     mem_limit: ${API_MEM_LIMIT:-2g}
     cpus: ${API_CPU_LIMIT:-2}
 
@@ -111,7 +118,8 @@ services:
       retries: 3
       start_period: 60s
     environment:
-      - YTDLP_COOKIES_FILE=/cookies.txt
+      - YTDLP_COOKIES_SOURCE_FILE=/run/secrets/youtube-cookies.txt
+      - YTDLP_COOKIES_FILE=/tmp/video_clipper/yt-dlp/cookies.txt
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis
@@ -149,7 +157,12 @@ services:
       - SENTRY_DSN=${SENTRY_DSN:-}
     volumes:
       - video_data:/tmp/video_clipper
-      - ./cookies.txt:/cookies.txt:ro
+      - type: bind
+        source: ${YTDLP_COOKIES_SECRET_PATH:-./secrets/youtube-cookies.txt}
+        target: /run/secrets/youtube-cookies.txt
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       redis:
         condition: service_healthy
@@ -167,7 +180,8 @@ services:
       retries: 3
       start_period: 60s
     environment:
-      - YTDLP_COOKIES_FILE=/cookies.txt
+      - YTDLP_COOKIES_SOURCE_FILE=/run/secrets/youtube-cookies.txt
+      - YTDLP_COOKIES_FILE=/tmp/video_clipper/yt-dlp/cookies.txt
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis
@@ -205,7 +219,12 @@ services:
       - SENTRY_DSN=${SENTRY_DSN:-}
     volumes:
       - video_data:/tmp/video_clipper
-      - ./cookies.txt:/cookies.txt:ro
+      - type: bind
+        source: ${YTDLP_COOKIES_SECRET_PATH:-./secrets/youtube-cookies.txt}
+        target: /run/secrets/youtube-cookies.txt
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       redis:
         condition: service_healthy

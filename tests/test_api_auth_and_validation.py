@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import api_app.access_rules as access_rules
 import api_app.routers.clips as clips_router
 import api_app.routers.videos as videos_router
 from api_app.auth import AuthenticatedUser, get_current_user
+from services.video_downloader import VideoProbeError
 
 
 @dataclass
@@ -453,6 +455,25 @@ def test_probe_credit_cost_checks_whisper_only_when_needed(monkeypatch):
 
     assert probe["valid_url"] is True
     assert whisper_checks["count"] == 1
+
+
+def test_probe_credit_cost_logs_youtube_bot_check_reason(monkeypatch, caplog):
+    def _fake_probe(self, _url: str):
+        raise VideoProbeError(
+            "youtube_bot_check",
+            "Sign in to confirm you're not a bot",
+        )
+
+    monkeypatch.setattr(videos_router.VideoDownloader, "probe_url", _fake_probe)
+
+    with caplog.at_level(logging.WARNING):
+        probe = videos_router._probe_credit_cost_for_url(
+            "https://www.youtube.com/watch?v=FWkVBjcVw18"
+        )
+
+    assert probe["valid_url"] is False
+    assert "youtube_bot_check" in caplog.text
+    assert "cookiefile_unwritable" not in caplog.text
 
 
 def test_credit_cost_endpoint_waives_smart_cleanup_surcharge_for_pro_tier(client, monkeypatch):

@@ -421,7 +421,7 @@ def test_resolve_source_video_times_out_when_lock_is_never_released(monkeypatch)
 
 
 def test_video_downloader_base_options_include_hardening_flags():
-    opts = VideoDownloader._base_ydl_opts()
+    opts = VideoDownloader()._base_ydl_opts()
     assert opts["format"] == VideoDownloader._format_selector_for_max_height(1080)
     assert "height<=720" not in opts["format"]
     assert opts["noplaylist"] is True
@@ -431,6 +431,93 @@ def test_video_downloader_base_options_include_hardening_flags():
     assert opts["retries"] == YTDLP_DOWNLOAD_RETRIES
     assert opts["fragment_retries"] == YTDLP_FRAGMENT_RETRIES
     assert opts["extractor_retries"] == YTDLP_EXTRACTOR_RETRIES
+
+
+def test_video_downloader_uses_writable_runtime_cookie_file(monkeypatch, tmp_path: Path):
+    runtime_cookie = tmp_path / "runtime-cookies.txt"
+    runtime_cookie.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+
+    monkeypatch.setattr(video_downloader_module, "YTDLP_COOKIES_SOURCE_FILE", None)
+    monkeypatch.setattr(video_downloader_module, "YTDLP_COOKIES_FILE", str(runtime_cookie))
+
+    downloader = VideoDownloader(work_dir=str(tmp_path / "work"))
+    opts = downloader._base_ydl_opts()
+
+    assert opts["cookiefile"] == str(runtime_cookie)
+
+
+def test_video_downloader_copies_read_only_cookie_source_to_runtime(monkeypatch, tmp_path: Path):
+    legacy_cookie = tmp_path / "legacy-cookies.txt"
+    legacy_cookie.write_text("# Netscape HTTP Cookie File\nlegacy\n", encoding="utf-8")
+
+    monkeypatch.setattr(video_downloader_module, "YTDLP_COOKIES_SOURCE_FILE", None)
+    monkeypatch.setattr(video_downloader_module, "YTDLP_COOKIES_FILE", str(legacy_cookie))
+    monkeypatch.setattr(
+        VideoDownloader,
+        "_is_writable_cookie_path",
+        staticmethod(lambda path: str(path) != str(legacy_cookie)),
+    )
+
+    downloader = VideoDownloader(work_dir=str(tmp_path / "work"))
+    opts = downloader._base_ydl_opts()
+    copied_cookie = Path(opts["cookiefile"])
+
+    assert copied_cookie != legacy_cookie
+    assert copied_cookie.read_text(encoding="utf-8") == legacy_cookie.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_video_downloader_omits_cookiefile_when_no_cookies_configured(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setattr(video_downloader_module, "YTDLP_COOKIES_SOURCE_FILE", None)
+    monkeypatch.setattr(video_downloader_module, "YTDLP_COOKIES_FILE", None)
+
+    downloader = VideoDownloader(work_dir=str(tmp_path))
+    opts = downloader._base_ydl_opts()
+
+    assert "cookiefile" not in opts
+
+
+def test_video_downloader_probe_uses_runtime_cookie_copy(monkeypatch, tmp_path: Path):
+    source_cookie = tmp_path / "source-cookies.txt"
+    source_cookie.write_text("# Netscape HTTP Cookie File\nsource\n", encoding="utf-8")
+    runtime_cookie = tmp_path / "runtime" / "cookies.txt"
+    seen: dict[str, object] = {}
+
+    class _FakeYDL:
+        def __init__(self, opts: dict):
+            seen["cookiefile"] = opts.get("cookiefile")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, _url: str, *, download: bool):
+            assert download is False
+            return {
+                "duration": 120,
+                "formats": [{"acodec": "mp4a.40.2"}],
+                "extractor_key": "youtube",
+                "id": "abc123",
+            }
+
+    monkeypatch.setattr(video_downloader_module, "YTDLP_COOKIES_SOURCE_FILE", str(source_cookie))
+    monkeypatch.setattr(video_downloader_module, "YTDLP_COOKIES_FILE", str(runtime_cookie))
+    monkeypatch.setattr(video_downloader_module.yt_dlp, "YoutubeDL", _FakeYDL)
+    monkeypatch.setattr(video_downloader_module, "_validate_url", lambda _url: None)
+
+    downloader = VideoDownloader(work_dir=str(tmp_path / "work"))
+    probe = downloader.probe_url("https://www.youtube.com/watch?v=abc123")
+
+    assert probe["can_download"] is True
+    assert Path(str(seen["cookiefile"])).read_text(encoding="utf-8") == source_cookie.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_video_downloader_fallback_selector_is_not_720_limited(

@@ -263,7 +263,10 @@ YTDLP_DOWNLOAD_RETRIES = _env_int("YTDLP_DOWNLOAD_RETRIES", 3, minimum=1)
 YTDLP_FRAGMENT_RETRIES = _env_int("YTDLP_FRAGMENT_RETRIES", 3, minimum=1)
 YTDLP_EXTRACTOR_RETRIES = _env_int("YTDLP_EXTRACTOR_RETRIES", 3, minimum=1)
 YTDLP_COOKIES_FILE: str | None = (
-    os.getenv("YTDLP_COOKIES_FILE", "/cookies.txt").strip() or None
+    os.getenv("YTDLP_COOKIES_FILE", "").strip() or None
+)
+YTDLP_COOKIES_SOURCE_FILE: str | None = (
+    os.getenv("YTDLP_COOKIES_SOURCE_FILE", "").strip() or None
 )
 FFMPEG_THREADS = _env_int("FFMPEG_THREADS", 2, minimum=1)
 RAW_VIDEO_STORAGE_BUCKET = (
