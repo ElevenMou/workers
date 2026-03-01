@@ -43,6 +43,7 @@ from tasks.videos.transcript import (
     transcript_has_word_timing,
     transcribe_clip_window_with_whisper,
 )
+from utils.sentry_context import configure_job_scope
 from utils.workdirs import create_work_dir
 from utils.supabase_client import (
     assert_response_ok,
@@ -199,6 +200,15 @@ def custom_clip_task(job_data: CustomClipJob):
         source_max_height = None
     output_quality_override = str(job_data.get("outputQualityOverride") or "").strip().lower() or None
     quality_policy_profile = str(job_data.get("qualityPolicyProfile") or "").strip() or None
+
+    configure_job_scope(
+        job_id=job_id,
+        job_type="custom_clip",
+        user_id=user_id,
+        video_id=video_id,
+        clip_id=clip_id,
+    )
+
     smart_cleanup_summary = {
         "enabled": smart_cleanup_enabled,
         "profile": "balanced",

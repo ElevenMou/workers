@@ -796,8 +796,13 @@ def run_supervisor() -> int:
         cleanup_named_workers(startup_conn, set(worker_specs.keys()))
         logger.info("All workers stopped.")
         return 0
-    except Exception:
+    except Exception as exc:
         logger.exception("Supervisor crashed unexpectedly")
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_exception(exc)
+        except ImportError:
+            pass
         return 1
 
 

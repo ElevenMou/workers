@@ -15,6 +15,7 @@ from tasks.clips.helpers.source_video import (
     upload_raw_video_to_storage,
 )
 from tasks.models.jobs import AnalyzeVideoJob
+from utils.sentry_context import configure_job_scope
 from utils.workdirs import create_work_dir
 from utils.supabase_client import (
     assert_response_ok,
@@ -417,6 +418,13 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
     source_external_id = str(job_data.get("sourceExternalId") or "").strip() or None
     source_has_captions = _as_optional_bool(job_data.get("sourceHasCaptions"))
     source_has_audio = _as_optional_bool(job_data.get("sourceHasAudio"))
+
+    configure_job_scope(
+        job_id=job_id,
+        job_type="analyze_video",
+        user_id=user_id,
+        video_id=video_id,
+    )
 
     work_dir: str | None = None
     downloader: VideoDownloader | None = None

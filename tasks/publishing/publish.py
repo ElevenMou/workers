@@ -25,6 +25,7 @@ from services.social.crypto import (
 from services.social.media import load_publication_media
 from tasks.clips.helpers.lifecycle import build_progress_result_data
 from tasks.models.jobs import PublishClipJob
+from utils.sentry_context import configure_job_scope
 from utils.supabase_client import assert_response_ok, supabase, update_job_status
 from utils.workdirs import create_work_dir
 
@@ -233,6 +234,14 @@ def publish_clip_task(job_data: PublishClipJob) -> None:
     job_id = str(job_data["jobId"])
     publication_id = str(job_data["publicationId"])
     work_dir = create_work_dir(f"publication_{publication_id}")
+
+    configure_job_scope(
+        job_id=job_id,
+        job_type="publish_clip",
+        user_id=job_data.get("userId"),
+        clip_id=job_data.get("clipId"),
+        extra={"publication_id": publication_id},
+    )
 
     try:
         update_job_status(

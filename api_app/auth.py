@@ -13,6 +13,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from api_app.jwt_verifier import extract_rate_limit_user_id, verify_supabase_jwt_locally
 from config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 
+try:
+    import sentry_sdk as _sentry_sdk
+except ImportError:  # pragma: no cover
+    _sentry_sdk = None  # type: ignore[assignment]
+
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -104,21 +109,27 @@ def get_current_user(
         claims = verify_supabase_jwt_locally(token)
         user_id = claims.get("sub") or claims.get("id")
         if user_id:
-            return AuthenticatedUser(
+            user = AuthenticatedUser(
                 id=str(user_id),
                 email=claims.get("email"),
                 claims=claims,
             )
+            if _sentry_sdk is not None:
+                _sentry_sdk.set_user({"id": user.id, "email": user.email or ""})
+            return user
     except Exception:
         pass  # Fall through to remote verification
 
     # Fallback: verify against Supabase Auth HTTP endpoint.
     payload = _fetch_user_from_token(token)
-    return AuthenticatedUser(
+    user = AuthenticatedUser(
         id=str(payload["id"]),
         email=payload.get("email"),
         claims=payload,
     )
+    if _sentry_sdk is not None:
+        _sentry_sdk.set_user({"id": user.id, "email": user.email or ""})
+    return user
 
 
 def require_admin_user(

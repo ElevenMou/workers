@@ -37,6 +37,7 @@ from tasks.clips.helpers.layout import (
 from tasks.clips.helpers.quality_controls import resolve_quality_controls
 from tasks.models.jobs import GenerateClipJob
 from tasks.models.layout import merge_layout_configs
+from utils.sentry_context import configure_job_scope
 from utils.workdirs import create_work_dir
 from utils.supabase_client import (
     assert_response_ok,
@@ -216,6 +217,14 @@ def generate_clip_task(job_data: GenerateClipJob):
         source_max_height = None
     output_quality_override = str(job_data.get("outputQualityOverride") or "").strip().lower() or None
     quality_policy_profile = str(job_data.get("qualityPolicyProfile") or "").strip() or None
+
+    configure_job_scope(
+        job_id=job_id,
+        job_type="generate_clip",
+        user_id=user_id,
+        clip_id=clip_id,
+    )
+
     smart_cleanup_summary = {
         "enabled": smart_cleanup_enabled,
         "profile": "balanced",
