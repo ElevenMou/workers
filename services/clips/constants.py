@@ -37,7 +37,7 @@ VIDEO_SCALE_MODE_ALIASES = {
 
 TITLE_BAR_V_PAD = 16
 TITLE_GAP = 12
-TITLE_LINE_HEIGHT_RATIO = 1.1
+TITLE_LINE_HEIGHT_RATIO = 1
 
 QUALITY_PRESETS: dict[str, QualityPreset] = {
     "low": {"crf": 23, "preset": "fast"},
@@ -57,6 +57,7 @@ def intermediate_quality_preset(base: QualityPreset) -> QualityPreset:
     # Keep intermediates visibly cleaner than the final CRF target.
     intermediate_crf = max(10, min(28, base_crf - 8))
     return {"crf": intermediate_crf, "preset": str(base.get("preset", "medium"))}
+
 
 CHAR_WIDTH_RATIO = 0.52
 

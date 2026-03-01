@@ -20,15 +20,22 @@ _FFMPEG_THREADS = max(1, int(FFMPEG_THREADS))
 _FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "1200"))
 
 _VALID_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+_VALID_COLOR_WITH_OPACITY = re.compile(
+    r"^(?:#[0-9a-fA-F]{6}|[a-zA-Z]+)@[0-9.]+$"
+)
 
 
 def _sanitize_color(value: str, fallback: str = "#000000") -> str:
-    """Validate that a color value is a safe hex color string.
+    """Validate that a color value is safe for FFmpeg filters.
 
-    Prevents FFmpeg filter injection via user-controlled color parameters.
+    Accepts ``#RRGGBB`` and ``color@opacity`` (e.g. ``black@0.5``) which
+    FFmpeg supports natively.  Prevents filter injection via user-controlled
+    color parameters.
     """
-    if isinstance(value, str) and _VALID_HEX_COLOR.match(value):
-        return value
+    if isinstance(value, str):
+        token = value.strip()
+        if _VALID_HEX_COLOR.match(token) or _VALID_COLOR_WITH_OPACITY.match(token):
+            return token
     logger.warning("Invalid color value %r, using fallback %s", value, fallback)
     return fallback
 
@@ -191,13 +198,23 @@ def _build_title_ass(
         return None
 
     font_name = title_font_family or "Montserrat-Bold"
+    bold_flag = 0 if "bold" in font_name.lower() else -1
     primary = _hex_to_ass_color(title_font_color, "&H00FFFFFF")
     outline = _hex_to_ass_color(title_stroke_color, "&H00000000")
     line_height = int(title_font_size * TITLE_LINE_HEIGHT_RATIO)
-    align_tag = r"\an8" if title_align == "center" else r"\an7"
+
+    # Middle alignment matches CSS ``top-1/2 -translate-y-1/2`` centering.
+    align_tag = r"\an5" if title_align == "center" else r"\an4"
+
     area_x = max(0, int(title_area_x))
     area_w = max(2, min(canvas_w - area_x, int(title_area_w)))
     x = area_x + (area_w // 2) if title_align == "center" else area_x + max(0, int(title_padding_x))
+
+    # title_text_y is the vertical center of the title bar.
+    # Distribute lines evenly around that center.
+    num_lines = len(title_lines)
+    total_block_h = (num_lines - 1) * line_height
+    first_line_y = title_text_y - total_block_h // 2
 
     lines: list[str] = [
         "[Script Info]",
@@ -214,8 +231,8 @@ def _build_title_ass(
         (
             "Style: Title,"
             f"{font_name},{title_font_size},{primary},{primary},"
-            f"{outline},&H80000000,-1,0,0,0,100,100,0,0,1,"
-            f"{max(0, int(title_stroke_width))},0,7,0,0,0,1"
+            f"{outline},&HFF000000,{bold_flag},0,0,0,100,100,0,0,1,"
+            f"{max(0, int(title_stroke_width))},0,5,0,0,0,1"
         ),
         "",
         "[Events]",
@@ -225,7 +242,7 @@ def _build_title_ass(
     start = _ass_time(0.0)
     end = _ass_time(max(0.1, duration_seconds))
     for idx, line in enumerate(title_lines):
-        y = max(0, int(title_text_y + (idx * line_height)))
+        y = max(0, int(first_line_y + idx * line_height))
         tag = rf"{{{align_tag}\pos({x},{y})}}"
         lines.append(f"Dialogue: 0,{start},{end},Title,,0,0,0,,{tag}{_ass_escape(line)}")
 

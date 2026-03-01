@@ -187,7 +187,7 @@ def compute_layout(
         title_bar_w = canvas_w
         title_bar_y = max(0, _as_int(title_position_y, 0))
 
-    title_text_y = title_bar_y + TITLE_BAR_V_PAD
+    title_text_y = title_bar_y + title_bar_h // 2
 
     logger.info(
         "Layout (%s/%s): video %dx%d at (%d,%d)  title bar x=%d y=%d w=%d h=%d  pad_x=%d  lines=%d",
