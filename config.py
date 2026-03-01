@@ -258,6 +258,7 @@ YTDLP_SOCKET_TIMEOUT_SECONDS = _env_int(
 YTDLP_DOWNLOAD_RETRIES = _env_int("YTDLP_DOWNLOAD_RETRIES", 3, minimum=1)
 YTDLP_FRAGMENT_RETRIES = _env_int("YTDLP_FRAGMENT_RETRIES", 3, minimum=1)
 YTDLP_EXTRACTOR_RETRIES = _env_int("YTDLP_EXTRACTOR_RETRIES", 3, minimum=1)
+YTDLP_COOKIES_FILE: str | None = os.getenv("YTDLP_COOKIES_FILE", "/app/cookies.txt").strip() or None
 FFMPEG_THREADS = _env_int("FFMPEG_THREADS", 2, minimum=1)
 RAW_VIDEO_STORAGE_BUCKET = (
     os.getenv("RAW_VIDEO_STORAGE_BUCKET", "raw-videos").strip() or "raw-videos"

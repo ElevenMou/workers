@@ -14,6 +14,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from config import (
     MAX_VIDEO_SIZE_MB,
     TEMP_DIR,
+    YTDLP_COOKIES_FILE,
     YTDLP_DOWNLOAD_RETRIES,
     YTDLP_EXTRACTOR_RETRIES,
     YTDLP_FRAGMENT_RETRIES,
@@ -146,7 +147,7 @@ class VideoDownloader:
 
     @classmethod
     def _base_ydl_opts(cls, *, max_height: int | None = 1080) -> dict:
-        return {
+        opts: dict = {
             # Prefer h264+AAC for fast downstream processing.
             # Height cap is controlled by tier-aware quality policy.
             "format": cls._format_selector_for_max_height(max_height),
@@ -168,6 +169,9 @@ class VideoDownloader:
             "fragment_retries": YTDLP_FRAGMENT_RETRIES,
             "extractor_retries": YTDLP_EXTRACTOR_RETRIES,
         }
+        if YTDLP_COOKIES_FILE and os.path.isfile(YTDLP_COOKIES_FILE):
+            opts["cookiefile"] = YTDLP_COOKIES_FILE
+        return opts
 
     @staticmethod
     def _selected_format_summary(info: dict) -> list[dict[str, object]]:
