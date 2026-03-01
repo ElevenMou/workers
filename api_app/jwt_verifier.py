@@ -93,12 +93,18 @@ def _verify_jwks_token(token: str, algorithm: str, kid: str) -> dict[str, Any]:
     )
 
 
+_ALLOWED_ALGORITHMS = frozenset({"HS256", "RS256", "ES256"})
+
+
 def verify_supabase_jwt_locally(token: str) -> dict[str, Any]:
     """Verify token signature locally and return decoded claims."""
     if jwt is None:
         raise RuntimeError("PyJWT is not installed")
     header = jwt.get_unverified_header(token)
     algorithm = str(header.get("alg") or "RS256")
+
+    if algorithm not in _ALLOWED_ALGORITHMS:
+        raise RuntimeError(f"Unsupported JWT algorithm: {algorithm}")
 
     if algorithm.startswith("HS"):
         return _verify_hs256(token, algorithm)
