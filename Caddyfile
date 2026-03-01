@@ -1,0 +1,27 @@
+# Clipry Workers API — Caddy reverse proxy with automatic TLS.
+#
+# CADDY_DOMAIN must be set to your API domain (e.g. api.clipscut.pro).
+# When running locally, use ":8080" as the domain to disable TLS.
+
+{$CADDY_DOMAIN:localhost:8080} {
+	reverse_proxy api:8001 {
+		lb_policy round_robin
+
+		health_uri /ready
+		health_interval 10s
+		health_timeout 5s
+	}
+
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
