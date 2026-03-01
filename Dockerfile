@@ -50,6 +50,9 @@ RUN useradd -m -r appuser
 # Ensure the default temp directory exists and is writable by appuser
 RUN mkdir -p /tmp/video_clipper && chown appuser:appuser /tmp/video_clipper
 
+# yt-dlp needs read+write on cookies.txt (it updates cookies in-place)
+RUN test -f /app/cookies.txt && chown appuser:appuser /cookies.txt || true
+
 # Switch to non-root user
 USER appuser
 
