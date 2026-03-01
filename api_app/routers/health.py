@@ -285,6 +285,8 @@ def health_metrics(
     except Exception:
         pass
 
+    from utils.dead_letter_queue import get_dlq_count
+
     return {
         "queues": queues,
         "queue_age_seconds": queue_age_seconds,
@@ -293,6 +295,9 @@ def health_metrics(
         "stale_recovery": _stale_recovery_counts(conn),
         "source_lock_wait_seconds": _source_lock_wait_stats(),
         "billing_dedupe": _billing_dedupe_counts(conn),
+        "dead_letter_queue": {
+            "total_events": get_dlq_count(conn),
+        },
         "workers": workers,
         "jobs": _job_duration_stats(),
         "redis": redis_info,

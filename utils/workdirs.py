@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 
 from config import TEMP_DIR
+
+_SAFE_FOLDER_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+
+def _validate_folder_name(folder_name: str) -> None:
+    """Reject folder names that could escape the base directory."""
+    if not folder_name or not _SAFE_FOLDER_RE.match(folder_name):
+        raise ValueError(
+            f"Invalid work dir folder name: {folder_name!r}. "
+            "Only alphanumeric characters, hyphens, and underscores are allowed."
+        )
 
 
 def create_work_dir(folder_name: str) -> str:
@@ -15,6 +27,8 @@ def create_work_dir(folder_name: str) -> str:
     Docker volume ownership mismatch), transparently fall back to the process
     temp directory.
     """
+    _validate_folder_name(folder_name)
+
     preferred_base = (TEMP_DIR or "").strip() or "/tmp/video_clipper"
     temp_base = tempfile.gettempdir()
     home_base = os.path.expanduser("~")
@@ -40,6 +54,11 @@ def create_work_dir(folder_name: str) -> str:
         try:
             os.makedirs(base_dir, exist_ok=True)
             work_dir = os.path.join(base_dir, folder_name)
+            resolved = os.path.abspath(work_dir)
+            if not resolved.startswith(os.path.abspath(base_dir) + os.sep):
+                raise ValueError(
+                    f"Resolved work dir {resolved!r} escapes base {base_dir!r}"
+                )
             os.makedirs(work_dir, exist_ok=True)
             return work_dir
         except PermissionError:

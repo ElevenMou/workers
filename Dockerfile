@@ -1,37 +1,47 @@
 # ---------------------------------------------------------------------------
-# Clipry Workers - API + RQ worker pool
+# Clipry Workers - API + RQ worker pool (multi-stage build)
 # ---------------------------------------------------------------------------
+
+# === Stage 1: Build dependencies ===
+FROM python:3.11-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# CPU-only PyTorch first (avoids pulling CUDA wheels)
+RUN pip install --no-cache-dir --prefix=/install \
+    torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# === Stage 2: Runtime image ===
 FROM python:3.11-slim AS base
 
-# Prevent Python from buffering stdout/stderr (important for Docker logs)
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     OMP_NUM_THREADS=1 \
     MKL_NUM_THREADS=1
 
-# System dependencies:
-#   ffmpeg  - video processing (ffmpeg-python, yt-dlp)
-#   git     - pip install openai-whisper from GitHub
-#   nodejs  - yt-dlp JS runtime for YouTube extraction hardening
+# Runtime-only system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ffmpeg \
-    git \
     nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# -- Install Python deps in two stages for smaller image -------------------
-# 1) CPU-only PyTorch first (avoids pulling CUDA wheels)
-RUN pip install --no-cache-dir \
-    torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+# Copy installed Python packages from builder
+COPY --from=builder /install /usr/local
 
-# 2) Everything else from requirements.txt
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# -- Copy application code -------------------------------------------------
+# Copy application code
 COPY . .
 
 # Create a non-root user for security
@@ -50,5 +60,5 @@ EXPOSE 8001
 STOPSIGNAL SIGTERM
 
 # Default: run the RQ worker pool
-# (overridden to uvicorn for the api service in docker-compose)
+# (overridden to gunicorn for the api service in docker-compose)
 CMD ["python", "main.py"]

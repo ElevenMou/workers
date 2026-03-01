@@ -41,6 +41,11 @@ CLIP_PREFIX = "clip-worker"
 SOCIAL_PREFIX = "social-worker"
 MAINTENANCE_LEADER_KEY = "clipry:maintenance:leader"
 
+_CRASH_WINDOW_SECONDS = 120
+_CRASH_THRESHOLD = 3
+_BASE_CRASH_BACKOFF_SECONDS = 5
+_MAX_CRASH_BACKOFF_SECONDS = 60
+
 
 def _sanitize_instance_id(raw: str) -> str:
     token = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(raw or "").strip())
@@ -120,9 +125,14 @@ def _cleanup_failed_job_registries(
     queue_names: list[str],
     max_age_seconds: int = 86400 * 7,  # 7 days
 ) -> int:
-    """Remove failed jobs older than max_age_seconds from all queue registries."""
+    """Remove failed jobs older than max_age_seconds from all queue registries.
+
+    Before deletion, permanently failed jobs are recorded in the dead letter
+    queue for later inspection and alerting.
+    """
     from rq import Queue
     from rq.job import Job
+    from utils.dead_letter_queue import record_dead_letter
 
     cleaned = 0
     for queue_name in queue_names:
@@ -136,11 +146,19 @@ def _cleanup_failed_job_registries(
                     if job.ended_at:
                         age = time.time() - job.ended_at.timestamp()
                         if age > max_age_seconds:
+                            record_dead_letter(
+                                conn,
+                                job_id=job_id,
+                                queue_name=queue_name,
+                                task_path=job.func_name or "unknown",
+                                error_message=str(job.exc_info or "Unknown error"),
+                                job_data=job.args[0] if job.args else None,
+                                attempt_count=job.retries_left if hasattr(job, "retries_left") else 0,
+                            )
                             registry.remove(job)
                             job.delete()
                             cleaned += 1
                 except Exception:
-                    # Job data may be gone; remove the registry entry
                     try:
                         registry.remove(job_id)
                         cleaned += 1
@@ -150,7 +168,7 @@ def _cleanup_failed_job_registries(
             logger.warning("Failed to clean failed registry for %s: %s", queue_name, exc)
 
     if cleaned:
-        logger.info("Cleaned %d stale entries from failed job registries", cleaned)
+        logger.info("Cleaned %d stale entries from failed job registries (recorded to DLQ)", cleaned)
     return cleaned
 
 
@@ -663,6 +681,7 @@ def run_supervisor() -> int:
     current_video_workers = desired_video_workers
     current_clip_workers = desired_clip_workers
     current_social_workers = desired_social_workers
+    crash_timestamps: dict[str, list[float]] = {}
 
     total = current_video_workers + current_clip_workers + current_social_workers
     logger.info(
@@ -759,11 +778,34 @@ def run_supervisor() -> int:
             for name, p in list(processes.items()):
                 if not p.is_alive():
                     exit_code = p.exitcode
-                    logger.warning(
-                        "Worker %s exited unexpectedly (exit code %s). Restarting.",
-                        name,
-                        exit_code,
-                    )
+                    now_mono = time.monotonic()
+                    crash_ts = crash_timestamps.get(name, [])
+                    crash_ts = [t for t in crash_ts if now_mono - t < _CRASH_WINDOW_SECONDS]
+                    crash_ts.append(now_mono)
+                    crash_timestamps[name] = crash_ts
+
+                    if len(crash_ts) >= _CRASH_THRESHOLD:
+                        backoff = min(
+                            _MAX_CRASH_BACKOFF_SECONDS,
+                            _BASE_CRASH_BACKOFF_SECONDS * (2 ** (len(crash_ts) - _CRASH_THRESHOLD)),
+                        )
+                        logger.warning(
+                            "Worker %s crashed %d times in %ds (exit code %s). "
+                            "Backing off %.0fs before restart.",
+                            name,
+                            len(crash_ts),
+                            _CRASH_WINDOW_SECONDS,
+                            exit_code,
+                            backoff,
+                        )
+                        time.sleep(backoff)
+                    else:
+                        logger.warning(
+                            "Worker %s exited unexpectedly (exit code %s). Restarting.",
+                            name,
+                            exit_code,
+                        )
+
                     cleanup_named_workers(startup_conn, {name})
                     replacement = spawn_worker(worker_specs[name], name)
                     processes[name] = replacement

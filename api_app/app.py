@@ -138,3 +138,11 @@ app.include_router(captions_router)
 app.include_router(videos_router)
 app.include_router(clips_router)
 app.include_router(publishing_router)
+
+# Versioned routes (v1 prefix) — mirrors root for forward-compatibility.
+app.include_router(health_router, prefix="/v1")
+app.include_router(workers_router, prefix="/v1")
+app.include_router(captions_router, prefix="/v1")
+app.include_router(videos_router, prefix="/v1")
+app.include_router(clips_router, prefix="/v1")
+app.include_router(publishing_router, prefix="/v1")

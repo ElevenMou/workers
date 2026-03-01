@@ -1,6 +1,7 @@
-﻿import ipaddress
+import ipaddress
 import logging
 import os
+import shutil
 import socket
 import time
 from glob import glob
@@ -18,6 +19,8 @@ from config import (
     YTDLP_FRAGMENT_RETRIES,
     YTDLP_SOCKET_TIMEOUT_SECONDS,
 )
+
+_MIN_FREE_DISK_MB = int(os.getenv("MIN_FREE_DISK_MB", str(MAX_VIDEO_SIZE_MB * 2 + 500)))
 
 _yt_transcript_api = YouTubeTranscriptApi()
 
@@ -282,9 +285,25 @@ class VideoDownloader:
                 elapsed,
             )
 
+    @staticmethod
+    def _check_disk_space(target_dir: str) -> None:
+        try:
+            usage = shutil.disk_usage(target_dir)
+            free_mb = usage.free / (1024 * 1024)
+            if free_mb < _MIN_FREE_DISK_MB:
+                raise OSError(
+                    f"Insufficient disk space: {free_mb:.0f} MB free, "
+                    f"need at least {_MIN_FREE_DISK_MB} MB"
+                )
+        except OSError:
+            raise
+        except Exception as exc:
+            logger.warning("Could not check disk space for %s: %s", target_dir, exc)
+
     def download(self, url: str, video_id: str, *, max_height: int | None = 1080) -> dict:
         """Download video and return metadata."""
         _validate_url(url)
+        self._check_disk_space(self.temp_dir)
         output_path = os.path.join(self.temp_dir, f"{video_id}.mp4")
         normalized_max_height = self._normalize_max_height(max_height)
         primary_selector = self._format_selector_for_max_height(normalized_max_height)
