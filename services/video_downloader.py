@@ -313,6 +313,10 @@ class VideoDownloader:
             opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
                 "base_url": [YTDLP_POT_PROVIDER_URL],
             }
+            logger.info(
+                "yt-dlp PO token provider configured: %s",
+                YTDLP_POT_PROVIDER_URL,
+            )
         return opts
 
     @staticmethod
