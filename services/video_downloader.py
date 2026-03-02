@@ -289,16 +289,8 @@ class VideoDownloader:
             "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
             "merge_output_format": "mp4",
             "noplaylist": True,
-            # Enable JS runtimes for YouTube challenge solving hardening.
-            "js_runtimes": {"node": {}, "deno": {}},
-            # Set a desktop UA to reduce throttling/403
-            "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                )
-            },
+            # Let yt-dlp use its built-in default User-Agent (keeps Chrome
+            # version current and avoids stale-UA bot detection).
             "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
             "retries": YTDLP_DOWNLOAD_RETRIES,
             "fragment_retries": YTDLP_FRAGMENT_RETRIES,
