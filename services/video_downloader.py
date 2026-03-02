@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import ffmpeg as ffmpeg_lib
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import GenericProxyConfig
 
 from config import (
     MAX_VIDEO_SIZE_MB,
@@ -19,7 +20,6 @@ from config import (
     YTDLP_DOWNLOAD_RETRIES,
     YTDLP_EXTRACTOR_RETRIES,
     YTDLP_FRAGMENT_RETRIES,
-    YTDLP_POT_PROVIDER_URL,
     YTDLP_PROXY,
     YTDLP_PROXY_LIST,
     YTDLP_SOCKET_TIMEOUT_SECONDS,
@@ -27,7 +27,24 @@ from config import (
 
 _MIN_FREE_DISK_MB = int(os.getenv("MIN_FREE_DISK_MB", str(MAX_VIDEO_SIZE_MB * 2 + 500)))
 
-_yt_transcript_api = YouTubeTranscriptApi()
+
+def _build_yt_transcript_api() -> YouTubeTranscriptApi:
+    """Build YouTubeTranscriptApi with proxy if configured."""
+    proxy_url = YTDLP_PROXY
+    if not proxy_url:
+        proxies = YTDLP_PROXY_LIST
+        proxy_url = proxies[0] if proxies else None
+    if proxy_url:
+        return YouTubeTranscriptApi(
+            proxy_config=GenericProxyConfig(
+                http_url=proxy_url,
+                https_url=proxy_url,
+            )
+        )
+    return YouTubeTranscriptApi()
+
+
+_yt_transcript_api = _build_yt_transcript_api()
 
 logger = logging.getLogger(__name__)
 
@@ -314,14 +331,6 @@ class VideoDownloader:
         proxies = _build_proxy_list()
         if proxies:
             opts["proxy"] = proxies[0]
-        if YTDLP_POT_PROVIDER_URL:
-            opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
-                "base_url": [YTDLP_POT_PROVIDER_URL],
-            }
-            logger.info(
-                "yt-dlp PO token provider configured: %s",
-                YTDLP_POT_PROVIDER_URL,
-            )
         return opts
 
     @staticmethod
@@ -410,11 +419,7 @@ class VideoDownloader:
             }
         )
         if ydl_overrides:
-            # Deep-merge extractor_args so overrides don't clobber PO token config.
-            override_ea = ydl_overrides.get("extractor_args")
-            ydl_opts.update({k: v for k, v in ydl_overrides.items() if k != "extractor_args"})
-            if isinstance(override_ea, dict):
-                ydl_opts.setdefault("extractor_args", {}).update(override_ea)
+            ydl_opts.update(ydl_overrides)
         started_at = time.monotonic()
         video_hint = os.path.splitext(os.path.basename(output_path))[0]
         logger.info(

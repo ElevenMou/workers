@@ -21,24 +21,6 @@ services:
     mem_limit: ${CADDY_MEM_LIMIT:-256m}
     cpus: ${CADDY_CPU_LIMIT:-0.5}
 
-  # ---------- PO Token Provider (YouTube bot-check bypass) ----------
-  # Generates Proof-of-Origin tokens for yt-dlp to bypass YouTube bot checks.
-  # Disable by leaving YTDLP_POT_PROVIDER_URL unset in .env.
-  pot-provider:
-    image: brainicism/bgutil-ytdlp-pot-provider:latest
-    init: true
-    expose:
-      - "4416"
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:4416/ping', r => { r.statusCode === 200 ? process.exit(0) : process.exit(1) }).on('error', () => process.exit(1))\""]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-    mem_limit: ${POT_PROVIDER_MEM_LIMIT:-512m}
-    cpus: ${POT_PROVIDER_CPU_LIMIT:-0.5}
-
   # ---------- Redis ----------
   # SECURITY: Set REDIS_PASSWORD in your .env file before deploying.
   # The default "changeme" is for local development only.
@@ -105,7 +87,7 @@ services:
       - YTDLP_COOKIES_FILE=/tmp/video_clipper/yt-dlp/cookies.txt
       - YTDLP_PROXY=${YTDLP_PROXY:-}
       - YTDLP_PROXY_LIST=${YTDLP_PROXY_LIST:-}
-      - YTDLP_POT_PROVIDER_URL=${YTDLP_POT_PROVIDER_URL:-}
+
       - LOG_FORMAT=${LOG_FORMAT:-json}
       - SENTRY_DSN=${SENTRY_DSN:-}
     depends_on:
@@ -143,7 +125,7 @@ services:
       - YTDLP_COOKIES_FILE=/tmp/video_clipper/yt-dlp/cookies.txt
       - YTDLP_PROXY=${YTDLP_PROXY:-}
       - YTDLP_PROXY_LIST=${YTDLP_PROXY_LIST:-}
-      - YTDLP_POT_PROVIDER_URL=${YTDLP_POT_PROVIDER_URL:-}
+
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis
@@ -208,7 +190,7 @@ services:
       - YTDLP_COOKIES_FILE=/tmp/video_clipper/yt-dlp/cookies.txt
       - YTDLP_PROXY=${YTDLP_PROXY:-}
       - YTDLP_PROXY_LIST=${YTDLP_PROXY_LIST:-}
-      - YTDLP_POT_PROVIDER_URL=${YTDLP_POT_PROVIDER_URL:-}
+
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis

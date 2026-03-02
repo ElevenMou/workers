@@ -277,9 +277,6 @@ YTDLP_PROXY_LIST: list[str] = [
     for p in os.getenv("YTDLP_PROXY_LIST", "").split(",")
     if p.strip()
 ]
-YTDLP_POT_PROVIDER_URL: str | None = (
-    os.getenv("YTDLP_POT_PROVIDER_URL", "").strip() or None
-)
 FFMPEG_THREADS = _env_int("FFMPEG_THREADS", 2, minimum=1)
 RAW_VIDEO_STORAGE_BUCKET = (
     os.getenv("RAW_VIDEO_STORAGE_BUCKET", "raw-videos").strip() or "raw-videos"
