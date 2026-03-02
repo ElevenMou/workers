@@ -583,13 +583,28 @@ class VideoDownloader:
         """
         _validate_url(url)
         ydl_opts = self._base_ydl_opts(max_height=1080)
+        # Probing doesn't need cookies — stale/IP-mismatched cookies can
+        # trigger YouTube bot checks *before* PO tokens come into play.
+        ydl_opts.pop("cookiefile", None)
         ydl_opts.update(
             {
-                "quiet": True,
-                "no_warnings": True,
+                "quiet": False,
+                "no_warnings": False,
                 "skip_download": True,
                 "noplaylist": True,
+                "verbose": True,
             }
+        )
+        # Enable PO token tracing for YouTube URLs to aid debugging.
+        if self._is_youtube_url(url):
+            ydl_opts.setdefault("extractor_args", {}).setdefault(
+                "youtube", {}
+            )["pot_trace"] = ["true"]
+        logger.info(
+            "yt-dlp probe opts: extractor_args=%s, proxy=%s, cookiefile=%s",
+            ydl_opts.get("extractor_args"),
+            bool(ydl_opts.get("proxy")),
+            ydl_opts.get("cookiefile"),
         )
 
         try:
