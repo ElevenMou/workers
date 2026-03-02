@@ -21,6 +21,7 @@ from config import (
     YTDLP_FRAGMENT_RETRIES,
     YTDLP_POT_PROVIDER_URL,
     YTDLP_PROXY,
+    YTDLP_PROXY_LIST,
     YTDLP_SOCKET_TIMEOUT_SECONDS,
 )
 
@@ -68,9 +69,20 @@ _YOUTUBE_DOMAINS: set[str] = {
     "youtu.be",
 }
 _YOUTUBE_BOT_CHECK_MESSAGES = (
-    "sign in to confirm you're not a bot",
+    "sign in to confirm you’re not a bot",
     "sign in to confirm you’re not a bot",
 )
+
+
+def _build_proxy_list() -> list[str]:
+    """Build an ordered list of proxies to try (primary first, then pool)."""
+    proxies: list[str] = []
+    if YTDLP_PROXY:
+        proxies.append(YTDLP_PROXY)
+    for p in YTDLP_PROXY_LIST:
+        if p not in proxies:
+            proxies.append(p)
+    return proxies
 
 
 class VideoProbeError(RuntimeError):
@@ -299,8 +311,9 @@ class VideoDownloader:
         cookiefile = self._resolve_cookiefile()
         if cookiefile:
             opts["cookiefile"] = cookiefile
-        if YTDLP_PROXY:
-            opts["proxy"] = YTDLP_PROXY
+        proxies = _build_proxy_list()
+        if proxies:
+            opts["proxy"] = proxies[0]
         if YTDLP_POT_PROVIDER_URL:
             opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
                 "base_url": [YTDLP_POT_PROVIDER_URL],
@@ -405,31 +418,51 @@ class VideoDownloader:
         started_at = time.monotonic()
         video_hint = os.path.splitext(os.path.basename(output_path))[0]
         logger.info(
-            "yt-dlp download start (%s): video=%s timeout=%ss retries=%s/%s/%s",
+            "yt-dlp download start (%s): video=%s timeout=%ss retries=%s/%s/%s proxy=%s",
             attempt_label,
             video_hint,
             ydl_opts.get("socket_timeout"),
             ydl_opts.get("retries"),
             ydl_opts.get("fragment_retries"),
             ydl_opts.get("extractor_retries"),
+            bool(ydl_opts.get("proxy")),
         )
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                logger.info(
-                    "yt-dlp selected formats (%s): %s",
-                    attempt_label,
-                    self._format_summary_text(self._selected_format_summary(info)),
+        proxies = _build_proxy_list()
+        last_exc: Exception | None = None
+        # Try with current proxy, then rotate on bot-check failures.
+        attempts = [ydl_opts.get("proxy")] + [
+            p for p in proxies if p != ydl_opts.get("proxy")
+        ]
+        for attempt_idx, proxy in enumerate(attempts):
+            if proxy:
+                ydl_opts["proxy"] = proxy
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    logger.info(
+                        "yt-dlp selected formats (%s): %s",
+                        attempt_label,
+                        self._format_summary_text(self._selected_format_summary(info)),
+                    )
+                    return info
+            except yt_dlp.utils.DownloadError as exc:
+                reason = classify_yt_dlp_error(exc)
+                if reason != "youtube_bot_check" or attempt_idx >= len(attempts) - 1:
+                    raise
+                logger.warning(
+                    "yt-dlp bot check on proxy %d/%d (%s); rotating",
+                    attempt_idx + 1, len(attempts), attempt_label,
                 )
-                return info
-        finally:
-            elapsed = time.monotonic() - started_at
-            logger.info(
-                "yt-dlp download finished (%s): video=%s elapsed=%.2fs",
-                attempt_label,
-                video_hint,
-                elapsed,
-            )
+                last_exc = exc
+            finally:
+                elapsed = time.monotonic() - started_at
+                logger.info(
+                    "yt-dlp download finished (%s): video=%s elapsed=%.2fs",
+                    attempt_label,
+                    video_hint,
+                    elapsed,
+                )
+        raise last_exc
 
     @staticmethod
     def _check_disk_space(target_dir: str) -> None:
@@ -573,6 +606,49 @@ class VideoDownloader:
             "external_id": info.get("id"),
         }
 
+    def _extract_with_proxy_rotation(self, url: str, ydl_opts: dict) -> dict:
+        """Try extract_info, rotating through proxies on bot-check failures."""
+        proxies = _build_proxy_list()
+        last_exc: Exception | None = None
+
+        # First attempt uses whatever proxy _base_ydl_opts already set.
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        except Exception as exc:
+            reason = classify_yt_dlp_error(exc)
+            if reason != "youtube_bot_check" or not proxies:
+                logger.warning("yt-dlp probe failed (%s) for %s: %s", reason, url, exc)
+                raise VideoProbeError(reason, str(exc)) from exc
+            logger.warning(
+                "yt-dlp bot check with proxy %s; rotating through %d proxies",
+                ydl_opts.get("proxy", "none"),
+                len(proxies),
+            )
+            last_exc = exc
+
+        # Rotate through remaining proxies (skip index 0 — already tried).
+        for i, proxy in enumerate(proxies[1:], start=2):
+            ydl_opts["proxy"] = proxy
+            try:
+                logger.info("yt-dlp retry with proxy %d/%d", i, len(proxies))
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(url, download=False)
+            except Exception as exc:
+                reason = classify_yt_dlp_error(exc)
+                if reason != "youtube_bot_check":
+                    logger.warning("yt-dlp probe failed (%s) for %s: %s", reason, url, exc)
+                    raise VideoProbeError(reason, str(exc)) from exc
+                logger.warning("yt-dlp bot check with proxy %d/%d", i, len(proxies))
+                last_exc = exc
+
+        reason = classify_yt_dlp_error(last_exc)
+        logger.warning(
+            "yt-dlp probe failed after all %d proxies for %s: %s",
+            len(proxies), url, last_exc,
+        )
+        raise VideoProbeError(reason, str(last_exc)) from last_exc
+
     def probe_url(self, url: str) -> dict:
         """Validate URL with yt-dlp and return probe metadata.
 
@@ -588,32 +664,14 @@ class VideoDownloader:
         ydl_opts.pop("cookiefile", None)
         ydl_opts.update(
             {
-                "quiet": False,
-                "no_warnings": False,
+                "quiet": True,
+                "no_warnings": True,
                 "skip_download": True,
                 "noplaylist": True,
-                "verbose": True,
             }
         )
-        # Enable PO token tracing for YouTube URLs to aid debugging.
-        if self._is_youtube_url(url):
-            ydl_opts.setdefault("extractor_args", {}).setdefault(
-                "youtube", {}
-            )["pot_trace"] = ["true"]
-        logger.info(
-            "yt-dlp probe opts: extractor_args=%s, proxy=%s, cookiefile=%s",
-            ydl_opts.get("extractor_args"),
-            bool(ydl_opts.get("proxy")),
-            ydl_opts.get("cookiefile"),
-        )
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-        except Exception as exc:
-            reason = classify_yt_dlp_error(exc)
-            logger.warning("yt-dlp probe failed (%s) for %s: %s", reason, url, exc)
-            raise VideoProbeError(reason, str(exc)) from exc
+        info = self._extract_with_proxy_rotation(url, ydl_opts)
 
         duration_seconds = int(info.get("duration") or 0)
         subtitles = info.get("subtitles") or {}

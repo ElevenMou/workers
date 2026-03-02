@@ -269,6 +269,14 @@ YTDLP_COOKIES_SOURCE_FILE: str | None = (
     os.getenv("YTDLP_COOKIES_SOURCE_FILE", "").strip() or None
 )
 YTDLP_PROXY: str | None = os.getenv("YTDLP_PROXY", "").strip() or None
+# Comma-separated list of proxy URLs for rotation/fallback.
+# Falls back through the list when a proxy fails.  YTDLP_PROXY (single) is
+# tried first if set; then each entry in YTDLP_PROXY_LIST in order.
+YTDLP_PROXY_LIST: list[str] = [
+    p.strip()
+    for p in os.getenv("YTDLP_PROXY_LIST", "").split(",")
+    if p.strip()
+]
 YTDLP_POT_PROVIDER_URL: str | None = (
     os.getenv("YTDLP_POT_PROVIDER_URL", "").strip() or None
 )
