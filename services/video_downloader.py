@@ -19,6 +19,8 @@ from config import (
     YTDLP_DOWNLOAD_RETRIES,
     YTDLP_EXTRACTOR_RETRIES,
     YTDLP_FRAGMENT_RETRIES,
+    YTDLP_POT_PROVIDER_URL,
+    YTDLP_PROXY,
     YTDLP_SOCKET_TIMEOUT_SECONDS,
 )
 
@@ -305,6 +307,12 @@ class VideoDownloader:
         cookiefile = self._resolve_cookiefile()
         if cookiefile:
             opts["cookiefile"] = cookiefile
+        if YTDLP_PROXY:
+            opts["proxy"] = YTDLP_PROXY
+        if YTDLP_POT_PROVIDER_URL:
+            opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
+                "base_url": [YTDLP_POT_PROVIDER_URL],
+            }
         return opts
 
     @staticmethod
@@ -393,7 +401,11 @@ class VideoDownloader:
             }
         )
         if ydl_overrides:
-            ydl_opts.update(ydl_overrides)
+            # Deep-merge extractor_args so overrides don't clobber PO token config.
+            override_ea = ydl_overrides.get("extractor_args")
+            ydl_opts.update({k: v for k, v in ydl_overrides.items() if k != "extractor_args"})
+            if isinstance(override_ea, dict):
+                ydl_opts.setdefault("extractor_args", {}).update(override_ea)
         started_at = time.monotonic()
         video_hint = os.path.splitext(os.path.basename(output_path))[0]
         logger.info(

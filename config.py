@@ -268,6 +268,10 @@ YTDLP_COOKIES_FILE: str | None = (
 YTDLP_COOKIES_SOURCE_FILE: str | None = (
     os.getenv("YTDLP_COOKIES_SOURCE_FILE", "").strip() or None
 )
+YTDLP_PROXY: str | None = os.getenv("YTDLP_PROXY", "").strip() or None
+YTDLP_POT_PROVIDER_URL: str | None = (
+    os.getenv("YTDLP_POT_PROVIDER_URL", "").strip() or None
+)
 FFMPEG_THREADS = _env_int("FFMPEG_THREADS", 2, minimum=1)
 RAW_VIDEO_STORAGE_BUCKET = (
     os.getenv("RAW_VIDEO_STORAGE_BUCKET", "raw-videos").strip() or "raw-videos"
