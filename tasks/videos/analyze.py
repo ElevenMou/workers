@@ -36,15 +36,15 @@ from utils.supabase_client import (
 logger = logging.getLogger(__name__)
 
 _MIN_CLIP_SECONDS = 10
-_BOUNDARY_ALIGNMENT_TOLERANCE_SECONDS = 0.35
+_BOUNDARY_ALIGNMENT_TOLERANCE_SECONDS = 0.75
 _DEFAULT_LEGACY_CLIP_LENGTH_SECONDS = 90
 try:
     _LOW_AI_SCORE_THRESHOLD = max(
         0.0,
-        min(1.0, float(os.getenv("ANALYZER_MIN_AI_SCORE", "0.45"))),
+        min(1.0, float(os.getenv("ANALYZER_MIN_AI_SCORE", "0.35"))),
     )
 except (TypeError, ValueError):
-    _LOW_AI_SCORE_THRESHOLD = 0.45
+    _LOW_AI_SCORE_THRESHOLD = 0.35
 
 _INTRO_OUTRO_PATTERNS = (
     re.compile(r"\b(welcome\s+back|welcome\s+to\s+my\s+channel)\b", re.IGNORECASE),
@@ -62,16 +62,16 @@ _NON_VIRAL_PATTERNS = (
         r"\b(don'?t\s+forget\s+to|be\s+sure\s+to)\s+(like|subscribe|follow|comment|share)\b",
         re.IGNORECASE,
     ),
-    re.compile(r"\b(subscribe|follow\s+me|follow\s+for\s+more|share\s+this)\b", re.IGNORECASE),
+    re.compile(r"\b(please\s+subscribe|go\s+subscribe|follow\s+me\s+on|follow\s+for\s+more|share\s+this\s+video)\b", re.IGNORECASE),
     re.compile(r"\b(link\s+in\s+(bio|description)|check\s+the\s+description)\b", re.IGNORECASE),
-    re.compile(r"\b(this\s+video\s+is\s+sponsored\s+by|sponsor(ed|ship)?)\b", re.IGNORECASE),
+    re.compile(r"\b(this\s+video\s+is\s+sponsored\s+by|sponsored\s+by|sponsorship\s+from)\b", re.IGNORECASE),
     re.compile(r"\b(use\s+code\s+\w+|promo\s+code|affiliate\s+link)\b", re.IGNORECASE),
     re.compile(
         r"\b(quick\s+disclaimer|not\s+financial\s+advice|for\s+educational\s+purposes)\b",
         re.IGNORECASE,
     ),
     re.compile(r"\b(let\s+me\s+know\s+in\s+the\s+comments)\b", re.IGNORECASE),
-    re.compile(r"\b(apologies?\s+for|technical\s+difficult(y|ies)|audio\s+issue)\b", re.IGNORECASE),
+    re.compile(r"\b(apologies?\s+for\s+(the|any)|technical\s+difficult(y|ies)|audio\s+issue)\b", re.IGNORECASE),
 )
 
 
@@ -451,6 +451,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         "skipped_duration_out_of_range": 0,
         "skipped_low_score": 0,
         "skipped_non_viral_content": 0,
+        "skipped_overlap": 0,
         "skipped_duplicate": 0,
     }
 
@@ -791,6 +792,9 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             min_duration=min_clip_seconds,
             max_duration=max_clip_seconds,
             extra_prompt=extra_prompt,
+            video_title=source_info.get("title"),
+            video_platform=source_info.get("platform"),
+            video_duration=float(duration_seconds),
         )
         _update_analysis_job_progress(
             job_id,
@@ -823,6 +827,8 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 if _as_float(segment.get("end")) is not None
             }
         )
+
+        accepted_ranges: list[tuple[float, float]] = []
 
         clip_validation_stats["returned_by_ai"] = len(clips)
         existing_resp = (
@@ -896,23 +902,27 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 start=start,
                 end=end,
             )
-            clip_text = " ".join(
-                part
-                for part in [
-                    clip_transcript_text,
-                    str(clip.get("title") or "").strip(),
-                    str(clip.get("hook") or "").strip(),
-                    str(clip.get("text") or "").strip(),
-                ]
-                if part
-            )
             if _looks_low_viral_potential(
-                text=clip_text,
+                text=clip_transcript_text,
                 start=start,
                 end=end,
                 video_duration_seconds=float(duration_seconds),
             ):
                 clip_validation_stats["skipped_non_viral_content"] += 1
+                continue
+
+            has_heavy_overlap = False
+            for acc_start, acc_end in accepted_ranges:
+                overlap_start_val = max(start, acc_start)
+                overlap_end_val = min(end, acc_end)
+                if overlap_end_val > overlap_start_val:
+                    overlap_len = overlap_end_val - overlap_start_val
+                    shorter_dur = min(duration, acc_end - acc_start)
+                    if shorter_dur > 0 and overlap_len / shorter_dur > 0.50:
+                        has_heavy_overlap = True
+                        break
+            if has_heavy_overlap:
+                clip_validation_stats["skipped_overlap"] += 1
                 continue
 
             clip_key = (
@@ -954,6 +964,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 f"Failed to insert clip suggestion for {video_id} ({start}-{end})",
             )
             existing_keys.add(clip_key)
+            accepted_ranges.append((start, end))
             inserted_count += 1
             clip_validation_stats["accepted"] += 1
 

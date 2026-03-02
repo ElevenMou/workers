@@ -103,24 +103,53 @@ def _resolve_api_key() -> str:
 
 
 _STATIC_SYSTEM_PROMPT = """\
-You are a short-form clip editor. Your job is to identify the best segments from a video transcript for TikTok/Reels/Shorts.
+You are an expert short-form clip editor. Your job is to identify the best segments from a video transcript for TikTok/Reels/Shorts.
 
 TRANSCRIPT FORMAT: Each line is "start|end|text" where start and end are seconds.
 
-TIMESTAMPS (strict): Use ONLY timestamps present in the transcript. No inventing or rounding. Clips = consecutive entries only. start_time = first entry start; end_time = last entry end. duration = end_time - start_time. Never exceed transcript bounds. Boundaries must match transcript entry boundaries exactly.
+TIMESTAMPS (strict):
+- Use ONLY timestamps present in the transcript. No inventing or rounding.
+- Clips = consecutive transcript entries only.
+- start_time = first entry's start; end_time = last entry's end.
+- duration = end_time - start_time. Never exceed transcript bounds.
+- Boundaries must align with transcript entry boundaries exactly.
 
-EDITORIAL (viral-first): Prioritize clips with strong standalone value: surprising insight, clear transformation, high emotion, conflict, actionable steps, or memorable one-liners. Strong hook in first 3-5s. Self-contained. Never cut a sentence or idea mid-way.
+CONTENT ANALYSIS: Before selecting clips, identify the content type (story/narrative, educational/how-to, debate/opinion, humor/entertainment, interview/conversation) and apply type-appropriate criteria:
+- Story/narrative: look for complete story arcs with setup and payoff within the clip.
+- Educational/how-to: look for self-contained tips, surprising facts, or clear step-by-step value.
+- Debate/opinion: look for bold claims, strong counter-arguments, or "mic drop" moments.
+- Humor/entertainment: look for complete jokes, reactions, or memorable moments with punchlines.
+- Interview/conversation: look for revealing answers, unexpected admissions, or powerful exchanges.
+
+EDITORIAL (viral-first): Prioritize clips with strong standalone value:
+- Surprising insight or counterintuitive claim
+- Clear transformation or before/after contrast
+- High emotion (joy, outrage, awe, empathy)
+- Conflict, tension, or stakes
+- Actionable steps or concrete advice
+- Memorable one-liners or quotable phrases
+The first 3-5 seconds MUST hook the viewer — identify the exact sentence or phrase that would stop someone from scrolling. The clip must be self-contained: never cut a sentence, idea, or story arc mid-way.
 
 STRICT EXCLUSIONS: Reject segments that are:
-- intros, greetings, scene-setting, "in this video/episode" setup, housekeeping
-- outros, wrap-ups, "thanks for watching", "see you next time"
-- engagement CTAs ("like/subscribe/follow/comment/share", "link in bio/description")
-- sponsor/affiliate/promotional reads, discount-code plugs, admin announcements
-- low-information filler, repetition, apologies, or technical notes
+- Intros, greetings, scene-setting, "in this video/episode" setup, housekeeping
+- Outros, wrap-ups, "thanks for watching", "see you next time"
+- Engagement CTAs ("like/subscribe/follow/comment/share", "link in bio/description")
+- Sponsor/affiliate/promotional reads, discount-code plugs, admin announcements
+- Low-information filler, repetition, apologies, or technical notes
 
-POSITIONAL BIAS: Avoid likely intro/outro zones in the first/last ~8% of the timeline unless the content is immediately high-value.
+POSITIONAL BIAS: The first and last 8% of the timeline are likely intro/outro zones. Only select from these zones if the content itself is immediately high-value (not setup or wind-down).
 
-Return a JSON object with a top-level "clips" array that matches the requested response format. Verify that duration = end_time - start_time for each clip."""
+OVERLAP RULE: Clips must not overlap by more than 10% of the shorter clip's duration. Spread selections across the full timeline to give variety.
+
+SCORING RUBRIC — assign confidence_score using these criteria:
+- 0.90-1.00: Standalone viral hit — instantly compelling hook, emotional payoff, highly shareable even without context. Would perform well posted on its own.
+- 0.70-0.89: Strong clip — good hook, mostly self-contained, clear value. Engaging for the target audience.
+- 0.50-0.69: Decent content but weaker hook, or requires some outside context to fully land.
+- Below 0.50: Low engagement potential — incomplete ideas, weak opening, or filler-adjacent. Avoid returning clips below 0.50.
+
+REASONING: For each clip, you MUST provide a "reasoning" field: 1-2 sentences explaining WHY this specific segment has viral potential. Reference the hook, emotional arc, or value proposition. Think carefully before assigning the score.
+
+Return a JSON object with a top-level "clips" array matching the requested response format. Verify duration = end_time - start_time for each clip."""
 
 
 class ClipCandidate(BaseModel):
@@ -132,7 +161,10 @@ class ClipCandidate(BaseModel):
     duration: float | None = None
     clip_title: str | None = None
     hook: str | None = None
+    hook_text: str | None = None
     summary: str | None = None
+    reasoning: str | None = None
+    content_category: str | None = None
     confidence_score: float | None = None
     tags: list[str] | None = None
 
@@ -181,15 +213,53 @@ class AIAnalyzer:
 
     @staticmethod
     def _truncate_snippets(snippets: List[Dict], max_chars: int) -> List[Dict]:
-        """Keep snippets from the start until total JSON size ~ max_chars to limit API cost."""
+        """Proportionally sample snippets when total size exceeds *max_chars*.
+
+        Instead of keeping only the head (which loses the entire second half of
+        long videos), we keep ~40% from the start, ~30% from the middle, and
+        ~30% from the end so the model sees content across the full timeline.
+        Gaps between sections are indicated by a sentinel snippet.
+        """
         if max_chars <= 0:
             return snippets
-        total = 0
-        out = []
-        for s in snippets:
-            total += len(json.dumps(s)) + 2
-            if total > max_chars:
+
+        total = sum(len(json.dumps(s)) + 2 for s in snippets)
+        if total <= max_chars:
+            return snippets
+
+        n = len(snippets)
+        head_count = max(1, int(n * 0.40))
+        mid_count = max(1, int(n * 0.30))
+        tail_count = max(1, int(n * 0.30))
+
+        head = snippets[:head_count]
+        mid_start = max(head_count, (n - mid_count) // 2)
+        mid_end = mid_start + mid_count
+        mid = snippets[mid_start:mid_end]
+        tail = snippets[max(mid_end, n - tail_count):]
+
+        gap_marker = {"text": "[...transcript trimmed...]", "start": 0.0, "duration": 0.0}
+
+        combined: List[Dict] = []
+        combined.extend(head)
+        if head and mid and mid[0] is not head[-1]:
+            combined.append(gap_marker)
+            combined.extend(mid)
+        if mid and tail and tail[0] is not mid[-1]:
+            combined.append(gap_marker)
+            combined.extend(tail)
+        elif not mid:
+            if head and tail and tail[0] is not head[-1]:
+                combined.append(gap_marker)
+                combined.extend(tail)
+
+        budget = max_chars
+        out: List[Dict] = []
+        for s in combined:
+            cost = len(json.dumps(s)) + 2
+            if budget - cost < 0 and out:
                 break
+            budget -= cost
             out.append(s)
         return out
 
@@ -368,42 +438,80 @@ class AIAnalyzer:
             return parsed.dict()
         return parsed
 
+    _TRANSIENT_RETRY_COUNT = 3
+    _TRANSIENT_RETRY_BASE_DELAY = 2.0
+
+    @staticmethod
+    def _is_transient_error(exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        if status_code in {429, 500, 502, 503, 529}:
+            return True
+        exc_name = type(exc).__name__.lower()
+        if "timeout" in exc_name or "connection" in exc_name:
+            return True
+        text = str(exc).lower()
+        if any(kw in text for kw in ("rate limit", "rate_limit", "timeout", "overloaded")):
+            return True
+        return False
+
     def _create_with_model_fallback(self, *, max_tokens: int, system_prompt: str, user_message: str):
         last_error: Exception | None = None
         for index, candidate_model in enumerate(self.model_candidates):
-            try:
-                completion = self.client.beta.chat.completions.parse(
-                    model=candidate_model,
-                    max_completion_tokens=max_tokens,
-                    temperature=0,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message},
-                    ],
-                    response_format=ClipAnalysisResponse,
-                )
-                if candidate_model != self.configured_model:
-                    logger.warning(
-                        "Configured OpenAI model '%s' unavailable; using fallback '%s'.",
-                        self.configured_model,
-                        candidate_model,
+            transient_attempts = 0
+            while True:
+                try:
+                    completion = self.client.beta.chat.completions.parse(
+                        model=candidate_model,
+                        max_completion_tokens=max_tokens,
+                        temperature=0,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_message},
+                        ],
+                        response_format=ClipAnalysisResponse,
                     )
-                    AIAnalyzer._model_resolution_cache[self.configured_model] = candidate_model
-                else:
-                    AIAnalyzer._model_resolution_cache.pop(self.configured_model, None)
-                self.model = candidate_model
-                return completion
-            except Exception as exc:
-                last_error = exc
-                is_model_not_found = self._is_model_not_found_error(exc)
-                has_next_candidate = index < len(self.model_candidates) - 1
-                if not is_model_not_found or not has_next_candidate:
-                    raise
-                logger.warning(
-                    "OpenAI model '%s' not found; retrying with fallback '%s'.",
-                    candidate_model,
-                    self.model_candidates[index + 1],
-                )
+                    if candidate_model != self.configured_model:
+                        logger.warning(
+                            "Configured OpenAI model '%s' unavailable; using fallback '%s'.",
+                            self.configured_model,
+                            candidate_model,
+                        )
+                        AIAnalyzer._model_resolution_cache[self.configured_model] = candidate_model
+                    else:
+                        AIAnalyzer._model_resolution_cache.pop(self.configured_model, None)
+                    self.model = candidate_model
+                    return completion
+                except Exception as exc:
+                    last_error = exc
+
+                    if (
+                        self._is_transient_error(exc)
+                        and transient_attempts < self._TRANSIENT_RETRY_COUNT
+                    ):
+                        transient_attempts += 1
+                        delay = self._TRANSIENT_RETRY_BASE_DELAY * (2 ** (transient_attempts - 1))
+                        logger.warning(
+                            "Transient API error on model '%s' (attempt %d/%d): %s. "
+                            "Retrying in %.1fs ...",
+                            candidate_model,
+                            transient_attempts,
+                            self._TRANSIENT_RETRY_COUNT,
+                            exc,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
+
+                    is_model_not_found = self._is_model_not_found_error(exc)
+                    has_next_candidate = index < len(self.model_candidates) - 1
+                    if not is_model_not_found or not has_next_candidate:
+                        raise
+                    logger.warning(
+                        "OpenAI model '%s' not found; retrying with fallback '%s'.",
+                        candidate_model,
+                        self.model_candidates[index + 1],
+                    )
+                    break
 
         if last_error is not None:
             raise last_error
@@ -452,6 +560,9 @@ class AIAnalyzer:
             summary = title
 
         hook = str(clip.get("hook") or "").strip()
+        hook_text = str(clip.get("hook_text") or "").strip()
+        reasoning = str(clip.get("reasoning") or "").strip()
+        content_category = str(clip.get("content_category") or "").strip()
         tags = clip.get("tags")
         if isinstance(tags, str):
             tags = [part.strip() for part in tags.split(",") if part.strip()]
@@ -479,6 +590,9 @@ class AIAnalyzer:
             "text": summary,
             "title": title,
             "hook": hook,
+            "hook_text": hook_text,
+            "reasoning": reasoning,
+            "content_category": content_category,
             "score": score,
             "tags": tags,
             "rank": rank,
@@ -491,6 +605,9 @@ class AIAnalyzer:
         min_duration: int = 10,
         max_duration: int = 60,
         extra_prompt: str | None = None,
+        video_title: str | None = None,
+        video_platform: str | None = None,
+        video_duration: float | None = None,
     ) -> List[Dict]:
         """Analyze transcript using OpenAI to find best clips."""
 
@@ -527,6 +644,21 @@ class AIAnalyzer:
             f"Quality over quantity."
         )
 
+        video_context_parts: list[str] = []
+        title_text = (video_title or "").strip()
+        if title_text:
+            video_context_parts.append(f'Video: "{title_text}"')
+        platform_text = (video_platform or "").strip()
+        if platform_text:
+            video_context_parts.append(f"Platform: {platform_text}")
+        if video_duration and video_duration > 0:
+            video_context_parts.append(f"Full video duration: {video_duration / 60:.1f} min")
+        video_context_section = (
+            " | ".join(video_context_parts) + "\n"
+            if video_context_parts
+            else ""
+        )
+
         extra_prompt_text = (extra_prompt or "").strip()
         extra_section = (
             f"\nAdditional user guidance:\n{extra_prompt_text}\n"
@@ -535,13 +667,14 @@ class AIAnalyzer:
         )
 
         user_message = (
+            f"{video_context_section}"
             f"Transcript span: {transcript_start:.2f}s to {transcript_end:.2f}s "
             f"({transcript_duration:.2f}s total).\n\n"
             f"{transcript_text}"
             f"{extra_section}"
         )
 
-        max_tokens = min(4096, max(512, num_clips * 200 + 100))
+        max_tokens = min(8192, max(1024, num_clips * 400 + 200))
 
         if AIAnalyzer._consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD:
             if time.monotonic() < AIAnalyzer._circuit_open_until:
