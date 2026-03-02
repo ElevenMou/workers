@@ -108,7 +108,7 @@ def _clip_has_prior_generation(
     if clip_status in _SUCCESSFUL_GENERATE_JOB_STATUSES:
         return True
 
-    if clip.get("storage_path") or clip.get("thumbnail_path"):
+    if clip.get("storage_path"):
         return True
 
     prior_job_query = (
@@ -199,7 +199,7 @@ def generate_clip(
         supabase.table("clips")
         .select(
             "id, video_id, user_id, team_id, billing_owner_user_id, start_time, end_time, "
-            "status, storage_path, thumbnail_path, ai_score, transcript_excerpt"
+            "status, storage_path, ai_score, transcript_excerpt"
         )
         .eq("id", payload.clipId)
         .execute()

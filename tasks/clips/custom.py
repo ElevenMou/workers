@@ -772,7 +772,6 @@ def custom_clip_task(job_data: CustomClipJob):
         clip_update = {
             "status": "completed",
             "storage_path": storage_path,
-            "thumbnail_path": None,
             "file_size_bytes": uploaded_file_size or result["file_size"],
             "asset_expires_at": asset_expires_at_iso(clip_retention_days),
             "asset_expired_at": None,

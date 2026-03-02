@@ -399,7 +399,6 @@ def best_effort_cleanup_uploaded_artifacts(
                 .update(
                     {
                         "storage_path": None,
-                        "thumbnail_path": None,
                         "file_size_bytes": None,
                         "asset_expires_at": None,
                         "asset_expired_at": None,

@@ -10,26 +10,13 @@ from utils.supabase_client import assert_response_ok, supabase
 logger = logging.getLogger(__name__)
 
 
-def _unique_paths(storage_path: str | None, thumbnail_path: str | None) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for value in (storage_path, thumbnail_path):
-        if not value:
-            continue
-        if value in seen:
-            continue
-        seen.add(value)
-        ordered.append(value)
-    return ordered
-
-
 def cleanup_expired_clip_assets(batch_size: int = 100) -> dict[str, int]:
     """Delete expired generated clip files and clear DB pointers."""
     now_iso = datetime.now(timezone.utc).isoformat()
 
     response = (
         supabase.table("clips")
-        .select("id,storage_path,thumbnail_path,asset_expires_at,asset_expired_at")
+        .select("id,storage_path,asset_expires_at,asset_expired_at")
         .lte("asset_expires_at", now_iso)
         .limit(batch_size)
         .execute()
@@ -45,8 +32,7 @@ def cleanup_expired_clip_assets(batch_size: int = 100) -> dict[str, int]:
     for row in rows:
         clip_id = row.get("id")
         storage_path = row.get("storage_path")
-        thumbnail_path = row.get("thumbnail_path")
-        paths = _unique_paths(storage_path, thumbnail_path)
+        paths = [storage_path] if storage_path else []
 
         try:
             if paths:
@@ -67,7 +53,6 @@ def cleanup_expired_clip_assets(batch_size: int = 100) -> dict[str, int]:
                 .update(
                     {
                         "storage_path": None,
-                        "thumbnail_path": None,
                         "file_size_bytes": None,
                         "asset_expires_at": None,
                         "asset_expired_at": now_iso,
