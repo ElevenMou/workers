@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,10 @@ from services.social.base import (
 )
 
 _TIKTOK_BASE = "https://open.tiktokapis.com"
+_MIN_UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024
+_DEFAULT_UPLOAD_CHUNK_BYTES = 10 * 1024 * 1024
+_MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024
+_MAX_UPLOAD_CHUNKS = 1000
 
 
 def _tiktok_client_key() -> str:
@@ -120,6 +125,25 @@ def _query_creator_info(account: SocialAccountContext) -> dict:
     return payload.get("data") or {}
 
 
+def _select_privacy_level(privacy_options: list[str]) -> str:
+    normalized = [str(option).strip().upper() for option in privacy_options if str(option).strip()]
+    if not normalized:
+        return "SELF_ONLY"
+
+    # Prefer a visible post by default when the account allows it.
+    preference_order = [
+        "PUBLIC_TO_EVERYONE",
+        "MUTUAL_FOLLOW_FRIENDS",
+        "FOLLOWER_OF_CREATOR",
+        "SELF_ONLY",
+    ]
+    for candidate in preference_order:
+        if candidate in normalized:
+            return candidate
+
+    return normalized[0]
+
+
 def _fetch_publish_status(account: SocialAccountContext, publish_id: str) -> dict:
     payload = _authorized_post(
         "/v2/post/publish/status/fetch/",
@@ -136,16 +160,121 @@ def _fetch_publish_status(account: SocialAccountContext, publish_id: str) -> dic
     return payload.get("data") or {}
 
 
+def _resolve_public_post_ids(status_payload: dict) -> list[str]:
+    raw_ids = status_payload.get("publicaly_available_post_id")
+    if raw_ids in (None, ""):
+        raw_ids = status_payload.get("publicly_available_post_id")
+
+    if isinstance(raw_ids, list):
+        return [str(item).strip() for item in raw_ids if str(item).strip()]
+    if isinstance(raw_ids, str) and raw_ids.strip():
+        return [raw_ids.strip()]
+    return []
+
+
+def _plan_file_upload(file_size: int) -> tuple[int, int]:
+    if file_size <= 0:
+        raise SocialProviderError(
+            "TikTok upload requires a non-empty clip file.",
+            code="tiktok_empty_media_file",
+            recoverable=True,
+        )
+
+    if file_size <= _MAX_UPLOAD_CHUNK_BYTES:
+        return file_size, 1
+
+    chunk_size = _DEFAULT_UPLOAD_CHUNK_BYTES
+    total_chunk_count = file_size // chunk_size
+
+    if total_chunk_count > _MAX_UPLOAD_CHUNKS:
+        chunk_size = max(_MIN_UPLOAD_CHUNK_BYTES, math.ceil(file_size / _MAX_UPLOAD_CHUNKS))
+        if chunk_size > _MAX_UPLOAD_CHUNK_BYTES:
+            raise SocialProviderError(
+                "TikTok file upload exceeds API chunk limits.",
+                code="tiktok_file_too_large",
+                provider_payload={"file_size": file_size},
+            )
+        total_chunk_count = file_size // chunk_size
+
+    if total_chunk_count < 1:
+        total_chunk_count = 1
+
+    return chunk_size, total_chunk_count
+
+
+def _upload_file_chunks(
+    *,
+    upload_url: str,
+    media: PublicationMedia,
+    chunk_size: int,
+    total_chunk_count: int,
+    publish_id: str,
+) -> None:
+    try:
+        with open(media.local_path, "rb") as clip_file:
+            for chunk_index in range(total_chunk_count):
+                start = chunk_index * chunk_size
+                end = (
+                    start + chunk_size - 1
+                    if chunk_index < total_chunk_count - 1
+                    else media.file_size - 1
+                )
+                length = end - start + 1
+                payload = clip_file.read(length)
+
+                if len(payload) != length:
+                    raise SocialProviderError(
+                        "TikTok upload read fewer bytes than expected.",
+                        code="tiktok_upload_file_read_failed",
+                        recoverable=True,
+                        provider_payload={
+                            "publish_id": publish_id,
+                            "chunk_index": chunk_index,
+                            "expected_length": length,
+                            "actual_length": len(payload),
+                        },
+                    )
+
+                response = httpx.put(
+                    upload_url,
+                    headers={
+                        "Content-Type": media.content_type,
+                        "Content-Length": str(length),
+                        "Content-Range": f"bytes {start}-{end}/{media.file_size}",
+                    },
+                    content=payload,
+                    timeout=180.0,
+                )
+                if response.status_code not in {201, 206}:
+                    raise SocialProviderError(
+                        "TikTok rejected uploaded video data.",
+                        code="tiktok_upload_transfer_failed",
+                        provider_payload={
+                            "publish_id": publish_id,
+                            "chunk_index": chunk_index,
+                            "status_code": response.status_code,
+                            "response_body": response.text[:1000],
+                        },
+                    )
+    except OSError as exc:
+        raise SocialProviderError(
+            "TikTok upload could not read the generated clip file.",
+            code="tiktok_upload_file_open_failed",
+            recoverable=True,
+            provider_payload={"path": media.local_path},
+        ) from exc
+
+
 def publish_video(
     *,
     account: SocialAccountContext,
     publication: PublicationContext,
     media: PublicationMedia,
 ) -> PublicationResult:
-    if not media.signed_url:
+    if not media.local_path:
         raise SocialProviderError(
-            "TikTok direct post requires a signed clip URL.",
-            code="tiktok_missing_signed_url",
+            "TikTok direct post requires a local clip file.",
+            code="tiktok_missing_local_file",
             recoverable=True,
         )
 
@@ -167,7 +296,8 @@ def publish_video(
         )
 
     privacy_options = creator_info.get("privacy_level_options") or []
-    privacy_level = "SELF_ONLY" if "SELF_ONLY" in privacy_options else (privacy_options[0] if privacy_options else "SELF_ONLY")
+    privacy_level = _select_privacy_level(list(privacy_options))
+    chunk_size, total_chunk_count = _plan_file_upload(media.file_size)
 
     init_payload = _authorized_post(
         "/v2/post/publish/video/init/",
@@ -181,8 +311,10 @@ def publish_video(
                 "disable_stitch": False,
             },
             "source_info": {
-                "source": "PULL_FROM_URL",
-                "video_url": media.signed_url,
+                "source": "FILE_UPLOAD",
+                "video_size": media.file_size,
+                "chunk_size": chunk_size,
+                "total_chunk_count": total_chunk_count,
             },
         },
     )
@@ -195,6 +327,21 @@ def publish_video(
             code="tiktok_missing_publish_id",
             provider_payload=init_payload,
         )
+    upload_url = str(data.get("upload_url") or "").strip()
+    if not upload_url:
+        raise SocialProviderError(
+            "TikTok direct post initialization did not return an upload URL.",
+            code="tiktok_missing_upload_url",
+            provider_payload=init_payload,
+        )
+
+    _upload_file_chunks(
+        upload_url=upload_url,
+        media=media,
+        chunk_size=chunk_size,
+        total_chunk_count=total_chunk_count,
+        publish_id=str(publish_id),
+    )
 
     deadline = time.monotonic() + 180
     last_status_payload: dict = {}
@@ -203,7 +350,7 @@ def publish_video(
         last_status_payload = status_payload
         status = str(status_payload.get("status") or "").upper()
         if status == "PUBLISH_COMPLETE":
-            public_ids = status_payload.get("publicaly_available_post_id") or []
+            public_ids = _resolve_public_post_ids(status_payload)
             remote_post_id = str(public_ids[0]) if public_ids else str(publish_id)
             remote_post_url = None
             if public_ids and account.handle:

@@ -198,27 +198,43 @@ def _persist_social_account_token_update(account_id: str, result: PublicationRes
     assert_response_ok(response, f"Failed to update social account {account_id}")
 
 
+def _provider_error_payload(error: SocialProviderError | Exception) -> dict:
+    if not isinstance(error, SocialProviderError):
+        return {}
+
+    payload: dict = {
+        "result_payload": {"provider_error_code": error.code},
+    }
+    if error.provider_payload:
+        payload["provider_payload"] = error.provider_payload
+    return payload
+
+
 def _mark_publication_retrying(publication_id: str, error: SocialProviderError | Exception) -> None:
+    payload = {
+        "status": "queued",
+        "started_at": None,
+        "last_error": str(error),
+        "updated_at": _utc_now_iso(),
+    }
+    payload.update(_provider_error_payload(error))
     _best_effort_update_publication(
         publication_id,
-        {
-            "status": "queued",
-            "started_at": None,
-            "last_error": str(error),
-            "updated_at": _utc_now_iso(),
-        },
+        payload,
     )
 
 
 def _mark_publication_failed(publication_id: str, error: SocialProviderError | Exception) -> None:
+    payload = {
+        "status": "failed",
+        "failed_at": _utc_now_iso(),
+        "last_error": str(error),
+        "updated_at": _utc_now_iso(),
+    }
+    payload.update(_provider_error_payload(error))
     _best_effort_update_publication(
         publication_id,
-        {
-            "status": "failed",
-            "failed_at": _utc_now_iso(),
-            "last_error": str(error),
-            "updated_at": _utc_now_iso(),
-        },
+        payload,
     )
 
 
