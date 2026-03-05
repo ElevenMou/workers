@@ -520,6 +520,57 @@ def test_video_downloader_probe_uses_runtime_cookie_copy(monkeypatch, tmp_path: 
     )
 
 
+def test_video_downloader_resolve_output_path_prefers_video_sidecar_over_newer_audio(
+    monkeypatch,
+    tmp_path: Path,
+):
+    expected = tmp_path / "video-123.mp4"
+    split_video = tmp_path / "video-123.f137.mp4"
+    split_audio = tmp_path / "video-123.f140.m4a"
+    split_video.write_bytes(b"video")
+    split_audio.write_bytes(b"audio")
+    mtimes = {str(split_video): 1.0, str(split_audio): 2.0}
+
+    monkeypatch.setattr(
+        video_downloader_module.os.path,
+        "getmtime",
+        lambda path: mtimes[str(path)],
+    )
+    monkeypatch.setattr(
+        VideoDownloader,
+        "_has_video_stream",
+        staticmethod(lambda path: str(path) == str(split_video)),
+    )
+
+    resolved = VideoDownloader._resolve_output_path(str(expected))
+    assert resolved == str(split_video)
+
+
+def test_video_downloader_resolve_output_path_skips_audio_only_expected_file(
+    monkeypatch,
+    tmp_path: Path,
+):
+    expected = tmp_path / "video-123.mp4"
+    split_video = tmp_path / "video-123.f137.mp4"
+    expected.write_bytes(b"audio-only")
+    split_video.write_bytes(b"video")
+    mtimes = {str(expected): 2.0, str(split_video): 1.0}
+
+    monkeypatch.setattr(
+        video_downloader_module.os.path,
+        "getmtime",
+        lambda path: mtimes[str(path)],
+    )
+    monkeypatch.setattr(
+        VideoDownloader,
+        "_has_video_stream",
+        staticmethod(lambda path: str(path) == str(split_video)),
+    )
+
+    resolved = VideoDownloader._resolve_output_path(str(expected))
+    assert resolved == str(split_video)
+
+
 def test_video_downloader_fallback_selector_is_not_720_limited(
     monkeypatch,
     tmp_path: Path,

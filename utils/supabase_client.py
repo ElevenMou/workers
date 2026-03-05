@@ -207,6 +207,21 @@ def _error_detail(error: Any) -> str:
     return getattr(error, "message", None) or str(error)
 
 
+def _is_missing_column_error(error: Any, column: str) -> bool:
+    detail = _error_detail(error).lower()
+    column_name = str(column or "").strip().lower()
+    if not column_name:
+        return False
+    if column_name not in detail:
+        return False
+    return (
+        "does not exist" in detail
+        or "schema cache" in detail
+        or "could not find" in detail
+        or "not found" in detail
+    )
+
+
 def assert_response_ok(response: Any, context: str):
     """Raise RuntimeError when Supabase returns an error payload."""
     error = getattr(response, "error", None)
@@ -811,6 +826,7 @@ def update_job_status(
     progress: int,
     error: str = None,
     result_data: dict = None,
+    action: str | None = None,
 ):
     """Update job status and progress"""
     data = {"status": status, "progress": progress}
@@ -826,8 +842,16 @@ def update_job_status(
 
     if result_data:
         data["result_data"] = result_data
+    if action:
+        data["action"] = action
 
     resp = supabase.table("jobs").update(data).eq("id", job_id).execute()
+    if action:
+        resp_error = getattr(resp, "error", None)
+        if resp_error and _is_missing_column_error(resp_error, "action"):
+            fallback_data = dict(data)
+            fallback_data.pop("action", None)
+            resp = supabase.table("jobs").update(fallback_data).eq("id", job_id).execute()
     assert_response_ok(resp, f"Failed to update job status for {job_id}")
 
     if status in {"completed", "failed"}:

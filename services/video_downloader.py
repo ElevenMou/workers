@@ -375,23 +375,39 @@ class VideoDownloader:
         return "; ".join(tokens)
 
     @staticmethod
-    def _has_audio_stream(video_path: str) -> bool:
+    def _probe_stream_types(media_path: str) -> set[str]:
         try:
-            probe = ffmpeg_lib.probe(video_path)
+            probe = ffmpeg_lib.probe(media_path)
         except Exception as exc:
-            logger.warning("Failed to probe audio streams in %s: %s", video_path, exc)
-            return False
-        return any(s.get("codec_type") == "audio" for s in probe.get("streams", []))
+            logger.warning("Failed to probe media streams in %s: %s", media_path, exc)
+            return set()
+        return {
+            codec_type
+            for stream in probe.get("streams", [])
+            if (codec_type := str(stream.get("codec_type") or "").strip())
+        }
+
+    @staticmethod
+    def _has_audio_stream(video_path: str) -> bool:
+        return "audio" in VideoDownloader._probe_stream_types(video_path)
+
+    @staticmethod
+    def _has_video_stream(video_path: str) -> bool:
+        return "video" in VideoDownloader._probe_stream_types(video_path)
 
     @staticmethod
     def _resolve_output_path(expected_path: str) -> str:
-        if os.path.isfile(expected_path):
+        if os.path.isfile(expected_path) and VideoDownloader._has_video_stream(expected_path):
             return expected_path
 
         base, _ = os.path.splitext(expected_path)
         candidates = [p for p in glob(f"{base}.*") if os.path.isfile(p)]
         if not candidates:
             return expected_path
+
+        video_candidates = [path for path in candidates if VideoDownloader._has_video_stream(path)]
+        if video_candidates:
+            return max(video_candidates, key=os.path.getmtime)
         return max(candidates, key=os.path.getmtime)
 
     @staticmethod

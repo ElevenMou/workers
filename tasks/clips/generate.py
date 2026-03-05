@@ -120,20 +120,50 @@ def _best_effort_mark_superseded(*, job_id: str, clip_id: str):
         logger.warning("[%s] Failed to mark job superseded: %s", job_id, exc)
 
 
+def _is_missing_action_column_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "action" in text
+        and (
+            "does not exist" in text
+            or "schema cache" in text
+            or "could not find" in text
+            or "not found" in text
+        )
+    )
+
+
 def _best_effort_mark_failed(*, job_id: str, clip_id: str, error_msg: str):
     try:
-        update_job_status(job_id, "failed", 0, error_msg)
+        update_job_status(job_id, "failed", 0, error_msg, action="retry")
     except Exception as exc:
         logger.warning("[%s] Failed to update job failed status: %s", job_id, exc)
 
     try:
+        payload = {"status": "failed", "error_message": error_msg, "action": "retry"}
         fail_resp = (
             supabase.table("clips")
-            .update({"status": "failed", "error_message": error_msg})
+            .update(payload)
             .eq("id", clip_id)
             .execute()
         )
-        assert_response_ok(fail_resp, f"Failed to mark clip {clip_id} failed")
+        try:
+            assert_response_ok(fail_resp, f"Failed to mark clip {clip_id} failed")
+        except Exception as exc:
+            if not _is_missing_action_column_error(exc):
+                raise
+            fallback_payload = dict(payload)
+            fallback_payload.pop("action", None)
+            fallback_resp = (
+                supabase.table("clips")
+                .update(fallback_payload)
+                .eq("id", clip_id)
+                .execute()
+            )
+            assert_response_ok(
+                fallback_resp,
+                f"Failed to mark clip {clip_id} failed (fallback without action)",
+            )
     except Exception as exc:
         logger.warning("[%s] Failed to mark clip %s failed: %s", job_id, clip_id, exc)
 
@@ -820,17 +850,11 @@ def generate_clip_task(job_data: GenerateClipJob):
             logger=logger,
         )
         if _has_retries_remaining():
-            try:
-                update_job_status(
-                    job_id,
-                    "retrying",
-                    0,
-                    error_msg,
-                    result_data=build_progress_result_data(stage="retrying"),
-                )
-            except Exception as exc:
-                logger.warning("[%s] Failed to mark job retrying: %s", job_id, exc)
-            raise
+            logger.warning(
+                "[%s] Retries remain but auto-retry is disabled for clip generation failures; "
+                "marking failed with retry action.",
+                job_id,
+            )
 
         _best_effort_mark_failed(job_id=job_id, clip_id=clip_id, error_msg=error_msg)
 
