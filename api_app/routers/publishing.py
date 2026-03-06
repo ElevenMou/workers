@@ -77,7 +77,7 @@ def _social_queue_for_context(priority_processing: bool) -> str:
 def _load_workspace_clip(*, clip_id: str, user_id: str, workspace_team_id: str | None) -> dict:
     query = (
         supabase.table("clips")
-        .select("id, video_id, user_id, team_id, title, status, storage_path")
+        .select("id, video_id, user_id, team_id, title, duration_seconds, status, storage_path")
         .eq("id", clip_id)
     )
     if workspace_team_id:
@@ -139,6 +139,26 @@ def _resolve_publish_access(user_id: str):
         )
     enforce_social_publishing_access(context=context)
     return context
+
+
+def _validate_provider_specific_constraints(*, clip: dict, social_accounts: list[dict]) -> None:
+    facebook_selected = any(
+        str(row.get("provider") or "") == "facebook_page" for row in social_accounts
+    )
+    if not facebook_selected:
+        return
+
+    raw_duration = clip.get("duration_seconds")
+    try:
+        duration_seconds = float(raw_duration) if raw_duration is not None else None
+    except (TypeError, ValueError):
+        duration_seconds = None
+
+    if duration_seconds is not None and duration_seconds > 60.0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Facebook Reels requires clips that are 60 seconds or shorter.",
+        )
 
 
 def _load_existing_batch(
@@ -272,6 +292,7 @@ def create_clip_publications(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="YouTube publishing requires a title.",
         )
+    _validate_provider_specific_constraints(clip=clip, social_accounts=social_accounts)
 
     scheduled_for = _normalize_scheduled_for(payload)
     batch_id = str(uuid4())

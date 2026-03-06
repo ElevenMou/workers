@@ -78,7 +78,7 @@ def _load_publication_row(publication_id: str) -> dict:
 def _load_clip_row(clip_id: str) -> dict:
     response = (
         supabase.table("clips")
-        .select("id, video_id, title, status, storage_path")
+        .select("id, video_id, title, duration_seconds, status, storage_path")
         .eq("id", clip_id)
         .maybe_single()
         .execute()
@@ -137,7 +137,7 @@ def _build_social_account_context(account: dict) -> SocialAccountContext:
     )
 
 
-def _build_publication_context(publication: dict) -> PublicationContext:
+def _build_publication_context(publication: dict, clip: dict) -> PublicationContext:
     scheduled_for_raw = str(publication.get("scheduled_for") or _utc_now_iso()).replace("Z", "+00:00")
     scheduled_for = datetime.fromisoformat(scheduled_for_raw)
     if scheduled_for.tzinfo is None:
@@ -148,6 +148,7 @@ def _build_publication_context(publication: dict) -> PublicationContext:
     return PublicationContext(
         id=str(publication["id"]),
         clip_id=str(publication["clip_id"]),
+        clip_title=(str(clip["title"]) if clip.get("title") else None),
         caption=str(publication.get("caption_snapshot") or ""),
         youtube_title=(
             str(publication["youtube_title_snapshot"])
@@ -302,7 +303,7 @@ def publish_clip_task(job_data: PublishClipJob) -> None:
         )
 
         account_context = _build_social_account_context(social_account)
-        publication_context = _build_publication_context(publication)
+        publication_context = _build_publication_context(publication, clip)
         media = load_publication_media(str(clip["storage_path"]), work_dir=work_dir)
         _validate_media_for_provider(account_context.provider, media.duration_seconds)
 

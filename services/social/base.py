@@ -30,6 +30,7 @@ class SocialAccountContext:
 class PublicationContext:
     id: str
     clip_id: str
+    clip_title: str | None
     caption: str
     youtube_title: str | None
     scheduled_for: datetime
