@@ -100,9 +100,16 @@ def _authorized_post(path: str, *, token: str, json_body: dict) -> dict:
     payload = response.json()
     if response.status_code >= 400:
         error = payload.get("error") or {}
+        error_code = str(error.get("code") or "tiktok_api_error")
+        message = error.get("message") or "TikTok API request failed."
+        if error_code == "unaudited_client_can_only_post_to_private_accounts":
+            message = (
+                "TikTok blocked direct publish because this app is unaudited. "
+                "Use a private TikTok account for testing or complete TikTok Content Posting API audit."
+            )
         raise SocialProviderError(
-            error.get("message") or "TikTok API request failed.",
-            code=str(error.get("code") or "tiktok_api_error"),
+            message,
+            code=error_code,
             refresh_required=response.status_code == 401,
             provider_payload=payload,
         )
@@ -265,6 +272,36 @@ def _upload_file_chunks(
         ) from exc
 
 
+def _init_video_publish(
+    *,
+    account: SocialAccountContext,
+    caption: str,
+    privacy_level: str,
+    media: PublicationMedia,
+    chunk_size: int,
+    total_chunk_count: int,
+) -> dict:
+    return _authorized_post(
+        "/v2/post/publish/video/init/",
+        token=account.tokens.access_token,
+        json_body={
+            "post_info": {
+                "title": caption[:2200],
+                "privacy_level": privacy_level,
+                "disable_duet": False,
+                "disable_comment": False,
+                "disable_stitch": False,
+            },
+            "source_info": {
+                "source": "FILE_UPLOAD",
+                "video_size": media.file_size,
+                "chunk_size": chunk_size,
+                "total_chunk_count": total_chunk_count,
+            },
+        },
+    )
+
+
 def publish_video(
     *,
     account: SocialAccountContext,
@@ -299,25 +336,27 @@ def publish_video(
     privacy_level = _select_privacy_level(list(privacy_options))
     chunk_size, total_chunk_count = _plan_file_upload(media.file_size)
 
-    init_payload = _authorized_post(
-        "/v2/post/publish/video/init/",
-        token=account.tokens.access_token,
-        json_body={
-            "post_info": {
-                "title": (publication.caption or "")[:2200],
-                "privacy_level": privacy_level,
-                "disable_duet": False,
-                "disable_comment": False,
-                "disable_stitch": False,
-            },
-            "source_info": {
-                "source": "FILE_UPLOAD",
-                "video_size": media.file_size,
-                "chunk_size": chunk_size,
-                "total_chunk_count": total_chunk_count,
-            },
-        },
-    )
+    caption = publication.caption or ""
+    try:
+        init_payload = _init_video_publish(
+            account=account,
+            caption=caption,
+            privacy_level=privacy_level,
+            media=media,
+            chunk_size=chunk_size,
+            total_chunk_count=total_chunk_count,
+        )
+    except SocialProviderError as exc:
+        if exc.code != "unaudited_client_can_only_post_to_private_accounts" or privacy_level == "SELF_ONLY":
+            raise
+        init_payload = _init_video_publish(
+            account=account,
+            caption=caption,
+            privacy_level="SELF_ONLY",
+            media=media,
+            chunk_size=chunk_size,
+            total_chunk_count=total_chunk_count,
+        )
 
     data = init_payload.get("data") or {}
     publish_id = data.get("publish_id")
