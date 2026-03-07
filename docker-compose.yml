@@ -102,7 +102,7 @@ services:
       start_period: 10s
     volumes:
       - type: bind
-        source: ${YTDLP_COOKIES_SECRET_PATH:-./secrets/youtube-cookies.txt}
+        source: ${YTDLP_COOKIES_SECRET_PATH:-./secrets/youtube-cookies.local.txt}
         target: /run/secrets/youtube-cookies.txt
         read_only: true
         bind:
@@ -164,7 +164,7 @@ services:
     volumes:
       - video_data:/tmp/video_clipper
       - type: bind
-        source: ${YTDLP_COOKIES_SECRET_PATH:-./secrets/youtube-cookies.txt}
+        source: ${YTDLP_COOKIES_SECRET_PATH:-./secrets/youtube-cookies.local.txt}
         target: /run/secrets/youtube-cookies.txt
         read_only: true
         bind:
@@ -229,7 +229,7 @@ services:
     volumes:
       - video_data:/tmp/video_clipper
       - type: bind
-        source: ${YTDLP_COOKIES_SECRET_PATH:-./secrets/youtube-cookies.txt}
+        source: ${YTDLP_COOKIES_SECRET_PATH:-./secrets/youtube-cookies.local.txt}
         target: /run/secrets/youtube-cookies.txt
         read_only: true
         bind:

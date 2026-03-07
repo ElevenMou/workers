@@ -830,10 +830,31 @@ def custom_clip_task(job_data: CustomClipJob):
         )
         uploaded_storage_path = storage_path
 
-        # 8. Charge credits before finalizing completion state -----------------
+        # 8. Update clip record ------------------------------------------------
         update_clip_job_progress(
             job_id=job_id,
             progress=90,
+            stage="finalizing",
+            detail_key="finalizing_clip_record",
+        )
+        clip_update = {
+            "status": "completed",
+            "storage_path": storage_path,
+            "file_size_bytes": uploaded_file_size or result["file_size"],
+            "asset_expires_at": asset_expires_at_iso(clip_retention_days),
+            "asset_expired_at": None,
+        }
+        if layout_should_persist and layout_id:
+            clip_update["layout_id"] = layout_id
+        clip_update_resp = (
+            supabase.table("clips").update(clip_update).eq("id", clip_id).execute()
+        )
+        assert_response_ok(clip_update_resp, f"Failed to finalize clip {clip_id}")
+
+        # 9. Charge credits after finalizing completion state ------------------
+        update_clip_job_progress(
+            job_id=job_id,
+            progress=97,
             stage="charging_credits",
             detail_key="updating_usage_records",
         )
@@ -857,27 +878,6 @@ def custom_clip_task(job_data: CustomClipJob):
                 "generation_flow": "custom",
             },
         )
-
-        # 9. Update clip record ------------------------------------------------
-        update_clip_job_progress(
-            job_id=job_id,
-            progress=97,
-            stage="finalizing",
-            detail_key="finalizing_clip_record",
-        )
-        clip_update = {
-            "status": "completed",
-            "storage_path": storage_path,
-            "file_size_bytes": uploaded_file_size or result["file_size"],
-            "asset_expires_at": asset_expires_at_iso(clip_retention_days),
-            "asset_expired_at": None,
-        }
-        if layout_should_persist and layout_id:
-            clip_update["layout_id"] = layout_id
-        clip_update_resp = (
-            supabase.table("clips").update(clip_update).eq("id", clip_id).execute()
-        )
-        assert_response_ok(clip_update_resp, f"Failed to finalize clip {clip_id}")
 
         update_job_status(
             job_id,

@@ -9,6 +9,14 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _combined_migration_sql() -> str:
+    migration_dir = _repo_root() / "supabase" / "migrations"
+    return "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(migration_dir.glob("*.sql"))
+    )
+
+
 def test_startup_queue_purge_is_disabled_by_default(monkeypatch, caplog):
     monkeypatch.delenv("PURGE_QUEUED_JOBS_ON_START", raising=False)
     caplog.set_level("INFO")
@@ -18,13 +26,13 @@ def test_startup_queue_purge_is_disabled_by_default(monkeypatch, caplog):
 
 
 def test_charge_credits_sql_uses_atomic_balance_update():
-    sql = (_repo_root() / "SQL" / "transactions.sql").read_text(encoding="utf-8")
+    sql = _combined_migration_sql()
     assert "UPDATE credit_balances" in sql
     assert "AND balance >= p_amount" in sql
     assert "RETURNING balance INTO v_balance_after" in sql
 
 
-def test_clip_tasks_charge_before_marking_completed():
+def test_clip_tasks_finalize_before_charging_credits():
     generate_code = (
         _repo_root() / "workers" / "tasks" / "clips" / "generate.py"
     ).read_text(encoding="utf-8")
@@ -32,11 +40,11 @@ def test_clip_tasks_charge_before_marking_completed():
         _repo_root() / "workers" / "tasks" / "clips" / "custom.py"
     ).read_text(encoding="utf-8")
 
-    assert generate_code.index("charge_clip_generation_credits(") < generate_code.index(
-        "clip_update = {"
+    assert generate_code.index("clip_update = {") < generate_code.index(
+        "charge_clip_generation_credits("
     )
-    assert custom_code.index("charge_clip_generation_credits(") < custom_code.index(
-        "clip_update = {"
+    assert custom_code.index("clip_update = {") < custom_code.index(
+        "charge_clip_generation_credits("
     )
 
 

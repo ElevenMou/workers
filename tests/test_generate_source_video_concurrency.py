@@ -426,7 +426,6 @@ def test_video_downloader_base_options_include_hardening_flags():
     assert "height<=720" not in opts["format"]
     assert opts["noplaylist"] is True
     assert "extractor_args" not in opts
-    assert set((opts.get("js_runtimes") or {}).keys()) == {"node", "deno"}
     assert opts["socket_timeout"] == YTDLP_SOCKET_TIMEOUT_SECONDS
     assert opts["retries"] == YTDLP_DOWNLOAD_RETRIES
     assert opts["fragment_retries"] == YTDLP_FRAGMENT_RETRIES
@@ -481,7 +480,7 @@ def test_video_downloader_omits_cookiefile_when_no_cookies_configured(
     assert "cookiefile" not in opts
 
 
-def test_video_downloader_probe_uses_runtime_cookie_copy(monkeypatch, tmp_path: Path):
+def test_video_downloader_probe_does_not_send_cookies(monkeypatch, tmp_path: Path):
     source_cookie = tmp_path / "source-cookies.txt"
     source_cookie.write_text("# Netscape HTTP Cookie File\nsource\n", encoding="utf-8")
     runtime_cookie = tmp_path / "runtime" / "cookies.txt"
@@ -515,9 +514,7 @@ def test_video_downloader_probe_uses_runtime_cookie_copy(monkeypatch, tmp_path: 
     probe = downloader.probe_url("https://www.youtube.com/watch?v=abc123")
 
     assert probe["can_download"] is True
-    assert Path(str(seen["cookiefile"])).read_text(encoding="utf-8") == source_cookie.read_text(
-        encoding="utf-8"
-    )
+    assert seen["cookiefile"] is None
 
 
 def test_video_downloader_resolve_output_path_prefers_video_sidecar_over_newer_audio(

@@ -195,13 +195,15 @@ def test_worker_scale_legacy_hash_fallback_reads_values():
         "clip_workers": "5",
     }
 
-    video_workers, clip_workers = redis_client.get_worker_scale_target(
+    video_workers, clip_workers, social_workers = redis_client.get_worker_scale_target(
         connection=fake_conn,
         default_video=1,
         default_clip=1,
+        default_social=2,
     )
     assert video_workers == 3
     assert clip_workers == 5
+    assert social_workers == 2
 
 
 def test_set_group_worker_scale_target_does_not_mutate_other_group():
