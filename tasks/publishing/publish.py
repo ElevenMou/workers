@@ -110,6 +110,29 @@ def _load_social_account(account_id: str) -> dict:
     return response.data
 
 
+def _assert_social_account_ready_for_publish(account: dict) -> None:
+    status = str(account.get("status") or "active")
+    if status == "active":
+        return
+
+    if status == "disconnected":
+        raise SocialProviderError(
+            "The linked social account was disconnected. Reconnect the account before publishing.",
+            code="social_account_disconnected",
+        )
+
+    if status == "refresh_required":
+        raise SocialProviderError(
+            "The linked social account needs to be reconnected before publishing.",
+            code="social_account_refresh_required",
+        )
+
+    raise SocialProviderError(
+        "The linked social account is not available for publishing.",
+        code="social_account_unavailable",
+    )
+
+
 def _build_social_account_context(account: dict) -> SocialAccountContext:
     scopes = account.get("scopes") if isinstance(account.get("scopes"), list) else []
     provider_metadata = (
@@ -280,6 +303,7 @@ def publish_clip_task(job_data: PublishClipJob) -> None:
                 "The clip asset is no longer available for publishing.",
                 code="clip_unavailable",
             )
+        _assert_social_account_ready_for_publish(social_account)
 
         _best_effort_update_publication(
             publication_id,
