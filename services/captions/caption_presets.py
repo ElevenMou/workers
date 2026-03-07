@@ -133,6 +133,7 @@ class CaptionPreset:
             "max_lines": 2,
             "safe_margin_x": safe_margin_x,
             "safe_margin_y": safe_margin_y,
+            "font_case": "uppercase" if self.uppercase else "as_typed",
             "uppercase": self.uppercase,
             "punctuation_cleanup": True,
             "background_box": self.background_box,
@@ -995,6 +996,8 @@ def resolve_preset(
 
             if key_name in {"font_case"}:
                 case_mode = str(value or "").strip().lower()
+                if case_mode in {"uppercase", "lowercase", "as_typed"}:
+                    base["font_case"] = case_mode
                 if case_mode == "uppercase":
                     base["uppercase"] = True
                 elif case_mode in {"as_typed", "lowercase", "headline"}:
@@ -1059,6 +1062,7 @@ def resolve_caption_preset(preset: str | None) -> dict[str, Any]:
 
     font_name = str(cfg.get("font_name", CAPTION_TEMPLATE_DEFAULTS["fontFamily"]))
     is_uppercase = bool(cfg.get("uppercase", CAPTION_TEMPLATE_DEFAULTS["uppercase"]))
+    font_case = _normalize_font_case_token(cfg.get("font_case"), is_uppercase)
     max_words_per_line = int(cfg.get("max_words_per_line", 4))
 
     return {
@@ -1070,7 +1074,7 @@ def resolve_caption_preset(preset: str | None) -> dict[str, Any]:
         "fontSize": int(cfg.get("font_size", CAPTION_TEMPLATE_DEFAULTS["fontSize"])),
         "fontFamily": font_name,
         "fontWeight": _font_weight_from_name(font_name),
-        "fontCase": _font_case_from_uppercase(is_uppercase),
+        "fontCase": font_case,
         "fontColor": _ass_to_hex(font_color_ass),
         "highlightColor": _ass_to_hex(highlight_color_ass),
         "strokeColor": _ass_to_hex(outline_color_ass),
@@ -1124,6 +1128,7 @@ def list_caption_presets() -> list[dict[str, Any]]:
                     "highlight_color": style.get("highlight_color"),
                     "background_box": style.get("background_box"),
                     "background_padding": style.get("background_padding"),
+                    "font_case": style.get("font_case"),
                     "uppercase": style.get("uppercase"),
                     "safe_area": style.get("safe_area"),
                     "style": style.get("style"),
@@ -1161,7 +1166,10 @@ def _font_weight_from_name(font_name: str) -> str:
     return "normal"
 
 
-def _font_case_from_uppercase(uppercase: bool) -> str:
+def _normalize_font_case_token(value: Any, uppercase: bool) -> str:
+    token = str(value or "").strip().lower()
+    if token in {"uppercase", "lowercase", "as_typed"}:
+        return token
     return "uppercase" if uppercase else "as_typed"
 
 

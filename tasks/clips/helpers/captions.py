@@ -142,13 +142,16 @@ def _resolve_ass_font_name(
     return raw_family
 
 
-def _normalize_case_mode(cap_cfg: dict[str, Any], *, preset_defaults: dict[str, Any]) -> bool:
+def _normalize_case_mode(cap_cfg: dict[str, Any], *, preset_defaults: dict[str, Any]) -> str:
     case_mode = str(cap_cfg.get("fontCase") or "").strip().lower()
+    if case_mode in {"uppercase", "lowercase", "as_typed"}:
+        return case_mode
     if "uppercase" in cap_cfg:
-        return bool(cap_cfg.get("uppercase"))
-    if case_mode:
-        return case_mode == "uppercase"
-    return bool(preset_defaults.get("uppercase", False))
+        return "uppercase" if bool(cap_cfg.get("uppercase")) else "as_typed"
+    preset_case_mode = str(preset_defaults.get("font_case") or "").strip().lower()
+    if preset_case_mode in {"uppercase", "lowercase", "as_typed"}:
+        return preset_case_mode
+    return "uppercase" if bool(preset_defaults.get("uppercase", False)) else "as_typed"
 
 
 def _normalize_word_highlight(
@@ -182,10 +185,12 @@ def _overrides_from_layout(
         style_mode=style_mode,
         preset_defaults=preset_defaults,
     )
-    overrides["uppercase"] = _normalize_case_mode(
+    case_mode = _normalize_case_mode(
         cap_cfg,
         preset_defaults=preset_defaults,
     )
+    overrides["font_case"] = case_mode
+    overrides["uppercase"] = case_mode == "uppercase"
 
     max_chars = _pick_numeric(cap_cfg, "maxCharsPerCaption", "maxCharsPerLine")
     if max_chars is None:
@@ -223,7 +228,7 @@ def _overrides_from_layout(
     font_family = cap_cfg.get("fontFamily")
     if isinstance(font_family, str) and font_family.strip():
         font_weight = cap_cfg.get("fontWeight")
-        bold_hint = bool(overrides.get("uppercase", False))
+        bold_hint = str(overrides.get("font_case") or "as_typed") == "uppercase"
         bold_override = _weight_implies_bold(_normalize_font_weight_token(font_weight))
         if bold_override is not None:
             overrides["bold"] = bold_override

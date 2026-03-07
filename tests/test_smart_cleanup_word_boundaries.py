@@ -372,7 +372,7 @@ def test_generate_flow_reuses_existing_word_timing_for_smart_cleanup(monkeypatch
     assert transcript_calls["count"] == 0
 
 
-def test_custom_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_path: Path):
+def test_custom_flow_reuses_existing_word_timing_for_smart_cleanup(monkeypatch, tmp_path: Path):
     transcript_calls = {"count": 0}
 
     existing_transcript = _transcript_from_words([("existing", 5.0, 5.4), ("words", 5.5, 6.0)])
@@ -501,6 +501,143 @@ def test_custom_flow_forces_fresh_whisper_for_smart_cleanup(monkeypatch, tmp_pat
                 "endTime": 6.2,
                 "title": "Custom clip",
                 "smartCleanupEnabled": True,
+            }
+        )
+
+    assert transcript_calls["count"] == 0
+
+
+def test_custom_partial_whisper_fallback_returns_transcript(monkeypatch, tmp_path: Path):
+    transcript_calls = {"count": 0}
+
+    monkeypatch.setattr(
+        custom_task_module,
+        "supabase",
+        _FakeSupabase(
+            clip_payload={},
+            video_payload={"transcript": None},
+        ),
+    )
+    monkeypatch.setattr(custom_task_module, "assert_response_ok", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        custom_task_module,
+        "best_effort_cleanup_uploaded_artifacts",
+        lambda **_k: None,
+    )
+    monkeypatch.setattr(custom_task_module, "_best_effort_mark_failed", lambda **_k: None)
+    monkeypatch.setattr(custom_task_module, "update_job_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(lifecycle_helper, "update_job_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(custom_task_module, "update_video_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(custom_task_module, "has_sufficient_credits", lambda **_k: True)
+    monkeypatch.setattr(custom_task_module, "get_credit_balance", lambda *_a, **_k: 999)
+    monkeypatch.setattr(custom_task_module, "get_team_wallet_balance", lambda *_a, **_k: 999)
+    monkeypatch.setattr(
+        custom_task_module,
+        "resolve_effective_layout_id",
+        lambda **_k: SimpleNamespace(layout_id=None, should_persist_to_clip=False),
+    )
+    monkeypatch.setattr(
+        custom_task_module,
+        "load_layout_overrides",
+        lambda **_k: SimpleNamespace(
+            bg_style="blur",
+            bg_color="#000000",
+            blur_strength=20,
+            output_quality="medium",
+            layout_video={},
+            layout_title={},
+            layout_captions={},
+            layout_intro={},
+            layout_outro={},
+            layout_overlay={},
+            bg_image_storage_path=None,
+        ),
+    )
+    monkeypatch.setattr(
+        custom_task_module,
+        "merge_layout_configs",
+        lambda *_a, **_k: (
+            {"widthPct": 100, "positionY": "middle", "canvasAspectRatio": "9:16", "videoScaleMode": "fit"},
+            {
+                "show": False,
+                "fontSize": 42,
+                "fontColor": "#FFFFFF",
+                "fontFamily": "Montserrat",
+                "align": "center",
+                "strokeWidth": 0,
+                "strokeColor": "#000000",
+                "barEnabled": False,
+                "barColor": "#000000",
+                "paddingX": 16,
+                "positionY": "top",
+            },
+            {"show": False},
+            {"enabled": False, "type": "image", "storagePath": "", "durationSeconds": 3.0},
+            {"enabled": False, "type": "image", "storagePath": "", "durationSeconds": 3.0},
+            {"enabled": False, "storagePath": "", "widthPx": 200, "x": 0, "y": 0},
+        ),
+    )
+    monkeypatch.setattr(
+        custom_task_module,
+        "create_work_dir",
+        lambda name: str((tmp_path / name).mkdir(parents=True, exist_ok=True) or (tmp_path / name)),
+    )
+    monkeypatch.setattr(source_video_helper.os.path, "isfile", lambda *_a, **_k: True)
+    monkeypatch.setattr(source_video_helper, "probe_video_size", lambda *_a, **_k: (1080, 1920))
+
+    class _FakeDownloader:
+        def __init__(self, work_dir: str):
+            self.work_dir = work_dir
+
+        def download(self, _url: str, _video_id: str):
+            return {
+                "path": "C:/tmp/video.mp4",
+                "duration": 120,
+                "title": "Video",
+                "thumbnail": "",
+                "platform": "youtube",
+                "external_id": "abc123",
+            }
+
+        def get_youtube_transcript(self, _external_id: str):
+            return None
+
+        def extract_audio(self, _video_path: str):
+            return "C:/tmp/audio.mp3"
+
+    monkeypatch.setattr(custom_task_module, "VideoDownloader", _FakeDownloader)
+
+    def _fake_transcribe(**_kwargs):
+        transcript_calls["count"] += 1
+        return _transcript_from_words([("fallback", 5.0, 5.4), ("words", 5.5, 6.0)])
+
+    def _fake_resolve_source_transcript(*, whisper_fallback, **_kwargs):
+        transcript, is_full_transcript = whisper_fallback("en")
+        return SimpleNamespace(
+            transcript=transcript,
+            is_full_transcript=is_full_transcript,
+        )
+
+    monkeypatch.setattr(custom_task_module, "transcribe_clip_window_with_whisper", _fake_transcribe)
+    monkeypatch.setattr(custom_task_module, "resolve_source_transcript", _fake_resolve_source_transcript)
+    monkeypatch.setattr(
+        custom_task_module,
+        "maybe_download_layout_background_image",
+        lambda **_k: (_ for _ in ()).throw(_StopAfterCleanup("stop after transcript fallback")),
+    )
+
+    with pytest.raises(_StopAfterCleanup):
+        custom_task_module.custom_clip_task(
+            {
+                "jobId": "job-3",
+                "videoId": "video-1",
+                "clipId": "clip-3",
+                "userId": "user-1",
+                "url": "https://example.com/video",
+                "startTime": 5.0,
+                "endTime": 6.2,
+                "title": "Custom clip",
+                "smartCleanupEnabled": False,
             }
         )
 

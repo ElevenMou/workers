@@ -15,7 +15,7 @@ from services.clip_generator import ClipGenerator, compute_video_position
 from services.clips.constants import canvas_size_for_aspect_ratio
 from services.clips.quality_policy import resolve_effective_output_quality
 from services.video_downloader import VideoDownloader
-from tasks.clips.helpers.captions import build_caption_ass
+from tasks.clips.helpers.captions import build_caption_ass, resolve_caption_style_mode
 from tasks.clips.helpers.lifecycle import (
     asset_expires_at_iso,
     best_effort_cleanup_uploaded_artifacts,
@@ -41,7 +41,9 @@ from tasks.models.jobs import CustomClipJob
 from tasks.models.layout import merge_layout_configs
 from tasks.videos.source_transcript import resolve_source_transcript
 from tasks.videos.transcript import (
+    needs_whisper_retranscription,
     transcript_has_word_timing,
+    transcript_has_word_timing_in_window,
     transcribe_clip_window_with_whisper,
 )
 from utils.sentry_context import configure_job_scope
@@ -548,7 +550,7 @@ def custom_clip_task(job_data: CustomClipJob):
                 video_duration_seconds=duration_seconds,
                 language_hint=language_hint,
             )
-            return transcript_payload, False
+            return transcript, False
 
         transcript_resolution = resolve_source_transcript(
             existing_transcript=resolved_full_video_transcript,
@@ -567,16 +569,44 @@ def custom_clip_task(job_data: CustomClipJob):
         if transcript_resolution.is_full_transcript:
             resolved_full_video_transcript = transcript_resolution.transcript
 
-        if smart_cleanup_enabled:
+        caption_style = resolve_caption_style_mode(cap_cfg)
+        has_word_timing_for_window = transcript_has_word_timing_in_window(
+            transcript,
+            start_time=start_time,
+            end_time=end_time,
+            minimum_words=1,
+        )
+        should_retranscribe_for_captions = needs_whisper_retranscription(
+            transcript,
+            caption_style,
+        )
+        should_retranscribe_for_smart_cleanup = (
+            smart_cleanup_enabled and not has_word_timing_for_window
+        )
+        if smart_cleanup_enabled and has_word_timing_for_window:
+            logger.info(
+                "[%s] Smart Cleanup reusing existing transcript word timings for %.2f-%.2fs",
+                job_id,
+                start_time,
+                end_time,
+            )
+
+        if should_retranscribe_for_captions or should_retranscribe_for_smart_cleanup:
+            retranscribe_reason = (
+                "Smart Cleanup needs word timing in selected window"
+                if should_retranscribe_for_smart_cleanup
+                else f"caption style '{caption_style}' requires word timing"
+            )
             update_clip_job_progress(
                 job_id=job_id,
                 progress=45,
-                stage="transcribing_audio",
+                stage="retranscribing_with_whisper",
                 detail_key="improving_caption_timing",
             )
             logger.info(
-                "[%s] Re-transcribing with Whisper for Smart Cleanup (fresh word timing)",
+                "[%s] Re-transcribing clip segment with Whisper (%s)",
                 job_id,
+                retranscribe_reason,
             )
             transcript = transcribe_clip_window_with_whisper(
                 media_path=video_path,
@@ -587,10 +617,17 @@ def custom_clip_task(job_data: CustomClipJob):
                 video_duration_seconds=duration_seconds,
             )
             partial_transcript = True
-            if not transcript_has_word_timing(transcript):
-                raise RuntimeError(
-                    "Smart Cleanup requires Whisper word-level timings, but no usable words were returned."
-                )
+            update_clip_job_progress(
+                job_id=job_id,
+                progress=52,
+                stage="loading_layout",
+                detail_key="applying_template_settings",
+            )
+
+        if smart_cleanup_enabled and not transcript_has_word_timing(transcript):
+            raise RuntimeError(
+                "Smart Cleanup requires Whisper word-level timings, but no usable words were returned."
+            )
 
         update_clip_job_progress(
             job_id=job_id,

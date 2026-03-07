@@ -60,6 +60,21 @@ def _to_int(value: Any, default: int) -> int:
         return default
 
 
+def _resolve_text_case_mode(preset: CaptionPreset) -> str:
+    token = str(preset.get("font_case") or "").strip().lower()
+    if token in {"uppercase", "lowercase", "as_typed"}:
+        return token
+    return "uppercase" if bool(preset.get("uppercase", False)) else "as_typed"
+
+
+def _apply_text_case(text: str, case_mode: str) -> str:
+    if case_mode == "uppercase":
+        return text.upper()
+    if case_mode == "lowercase":
+        return text.lower()
+    return text
+
+
 def _clean_text(text: str, cleanup_punctuation: bool) -> str:
     cleaned = _WS_RE.sub(" ", text or "").strip()
     if cleanup_punctuation:
@@ -95,8 +110,8 @@ def _estimate_average_glyph_width_px(
     *,
     resolved_font_size: int,
 ) -> float:
-    uppercase = bool(preset.get("uppercase", False))
-    width_factor = 0.66 if uppercase else 0.56
+    case_mode = _resolve_text_case_mode(preset)
+    width_factor = 0.66 if case_mode == "uppercase" else 0.56
 
     font_name = str(preset.get("font_name", "")).strip().lower()
     if "space mono" in font_name or "spacemono" in font_name:
@@ -259,12 +274,10 @@ def _chunk_tokens(
     return pages
 
 
-def _line_text(words: Iterable[WordToken], *, uppercase: bool, cleanup_punctuation: bool) -> str:
+def _line_text(words: Iterable[WordToken], *, case_mode: str, cleanup_punctuation: bool) -> str:
     text = " ".join(word.word for word in words)
     text = _clean_text(text, cleanup_punctuation)
-    if uppercase:
-        text = text.upper()
-    return text
+    return _apply_text_case(text, case_mode)
 
 
 def _page_start_end(page: list[list[WordToken]], segment: SegmentToken) -> tuple[float, float]:
@@ -384,14 +397,14 @@ def _animation_tag(
 def _karaoke_text(
     page: list[list[WordToken]],
     *,
-    uppercase: bool,
+    case_mode: str,
     cleanup_punctuation: bool,
 ) -> str:
     lines: list[str] = []
     for line_words in page:
         fragments: list[str] = []
         for word in line_words:
-            token = _line_text([word], uppercase=uppercase, cleanup_punctuation=cleanup_punctuation)
+            token = _line_text([word], case_mode=case_mode, cleanup_punctuation=cleanup_punctuation)
             centis = max(1, int(round((word.end - word.start) * 100.0)))
             fragments.append(rf"{{\kf{centis}}}{_escape_ass_text(token)}")
         lines.append(" ".join(fragment for fragment in fragments if fragment))
@@ -401,12 +414,12 @@ def _karaoke_text(
 def _static_text(
     page: list[list[WordToken]],
     *,
-    uppercase: bool,
+    case_mode: str,
     cleanup_punctuation: bool,
 ) -> str:
     lines = [
         _escape_ass_text(
-            _line_text(line_words, uppercase=uppercase, cleanup_punctuation=cleanup_punctuation)
+            _line_text(line_words, case_mode=case_mode, cleanup_punctuation=cleanup_punctuation)
         )
         for line_words in page
     ]
@@ -419,7 +432,7 @@ def _build_word_by_word_events(
     segment: SegmentToken,
     preset: dict[str, Any],
     *,
-    uppercase: bool,
+    case_mode: str,
     cleanup_punctuation: bool,
     animation_tag: str,
     line_delay: float,
@@ -460,7 +473,7 @@ def _build_word_by_word_events(
                     continue
                 token = _line_text(
                     line_words[:take],
-                    uppercase=uppercase,
+                    case_mode=case_mode,
                     cleanup_punctuation=cleanup_punctuation,
                 )
                 escaped = _escape_ass_text(token)
@@ -493,7 +506,7 @@ def _build_events(
     estimated_max_chars = _estimate_max_chars_per_line_by_width(preset, play_res=play_res)
     max_chars = max(8, min(configured_max_chars, estimated_max_chars))
     max_lines = _to_int(preset.get("max_lines"), 2)
-    uppercase = bool(preset.get("uppercase", False))
+    case_mode = _resolve_text_case_mode(preset)
     cleanup_punctuation = bool(preset.get("punctuation_cleanup", True))
     animation_cfg = preset.get("animation") or {}
     animation_delay = (
@@ -523,7 +536,7 @@ def _build_events(
             # Each word appears individually with animation
             word_events = _build_word_by_word_events(
                 pages, segment, preset,
-                uppercase=uppercase,
+                case_mode=case_mode,
                 cleanup_punctuation=cleanup_punctuation,
                 animation_tag=animation_tag,
                 line_delay=line_delay,
@@ -541,7 +554,7 @@ def _build_events(
                 end += delay_seconds
                 if end <= start:
                     end = start + _MIN_EVENT_DURATION_SECONDS
-                text = _karaoke_text(page, uppercase=uppercase, cleanup_punctuation=cleanup_punctuation)
+                text = _karaoke_text(page, case_mode=case_mode, cleanup_punctuation=cleanup_punctuation)
                 if text:
                     events.append(DialogueEvent(start=start, end=end, text=text, animation_tag=animation_tag))
                     event_index += 1
@@ -555,7 +568,7 @@ def _build_events(
                 end += delay_seconds
                 if end <= start:
                     end = start + _MIN_EVENT_DURATION_SECONDS
-                text = _static_text(page, uppercase=uppercase, cleanup_punctuation=cleanup_punctuation)
+                text = _static_text(page, case_mode=case_mode, cleanup_punctuation=cleanup_punctuation)
                 if text:
                     events.append(DialogueEvent(start=start, end=end, text=text, animation_tag=animation_tag))
                     event_index += 1

@@ -97,6 +97,21 @@ def test_caption_override_maps_italic_and_underline():
     assert overrides["underline"] is True
 
 
+def test_caption_override_preserves_lowercase_font_case():
+    overrides = _overrides_from_layout(
+        {
+            "style": "grouped",
+            "fontCase": "lowercase",
+        },
+        canvas_w=1080,
+        canvas_h=1920,
+        preset_name="clean",
+    )
+
+    assert overrides["font_case"] == "lowercase"
+    assert overrides["uppercase"] is False
+
+
 def test_caption_override_fallbacks_for_legacy_and_words_mapping():
     from_chars_per_line = _overrides_from_layout(
         {
@@ -326,6 +341,39 @@ def test_italic_and_underline_propagate_to_ass_style():
 
     assert style[8] == "-1"
     assert style[9] == "-1"
+
+
+def test_lowercase_font_case_applies_to_ass_dialogue_text():
+    transcript = {
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 2.0,
+                "text": "MiXeD CaSe",
+                "words": [
+                    {"word": "MiXeD", "start": 0.0, "end": 0.9},
+                    {"word": "CaSe", "start": 0.9, "end": 2.0},
+                ],
+            }
+        ]
+    }
+
+    ass = generate_ass_content(
+        transcript,
+        "clean",
+        overrides={
+            "style": "grouped",
+            "font_case": "lowercase",
+            "uppercase": True,
+            "max_chars_per_line": 120,
+            "max_lines": 2,
+        },
+    )
+
+    dialogue_texts = [row[2] for row in _dialogue_rows(ass)]
+    assert dialogue_texts
+    assert any("mixed case" in text for text in dialogue_texts)
+    assert all("MIXED CASE" not in text for text in dialogue_texts)
 
 
 class _DefaultLayoutQuery:
