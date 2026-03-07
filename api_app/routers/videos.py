@@ -161,13 +161,14 @@ def _probe_credit_cost_for_url(url_str: str) -> dict:
     }
 
 
-def _max_clip_count_for_duration(duration_seconds: int) -> int:
-    """
-    Enforce AI analyze clip density:
-    maximum 1 requested clip per 3 minutes of source duration.
-    """
+def _max_clip_count_for_duration(
+    duration_seconds: int,
+    *,
+    selected_clip_max_seconds: int,
+) -> int:
     seconds = max(int(duration_seconds), 0)
-    return max(1, seconds // 180)
+    clip_max = max(_ANALYZE_CLIP_MIN_SECONDS, int(selected_clip_max_seconds))
+    return min(20, max(1, seconds // clip_max))
 
 
 def _raise_if_insufficient_credits(
@@ -336,13 +337,16 @@ async def analyze_video(
         )
     billed_analysis_credits = calculate_video_analysis_cost(int(ceil(processing_window_duration)))
 
-    max_clip_count = _max_clip_count_for_duration(int(processing_window_duration))
+    max_clip_count = _max_clip_count_for_duration(
+        int(processing_window_duration),
+        selected_clip_max_seconds=selected_clip_max,
+    )
     if payload.numClips > max_clip_count:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
                 f"Too many clips requested for this processing window. Maximum: {max_clip_count} "
-                "(1 clip every 3 minutes)."
+                f"(based on your selected {selected_clip_max}s max clip length)."
             ),
         )
 
@@ -426,6 +430,7 @@ async def analyze_video(
         "sourceThumbnailUrl": url_probe.get("thumbnail_url"),
         "sourcePlatform": url_probe.get("platform"),
         "sourceExternalId": url_probe.get("external_id"),
+        "sourceDetectedLanguage": url_probe.get("detected_language"),
         "sourceHasCaptions": url_probe.get("has_captions"),
         "sourceHasAudio": url_probe.get("has_audio"),
         "workspaceTeamId": access_context.workspace_team_id,

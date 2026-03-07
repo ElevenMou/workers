@@ -11,6 +11,15 @@ import ffmpeg as ffmpeg_lib
 from config import WHISPER_CLIP_MODEL
 from services.transcriber import Transcriber
 
+_ANALYSIS_SEGMENT_WORD_CHUNK_SIZE = 8
+
+
+def _as_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
 
 def shift_transcript_timestamps(
     transcript: dict[str, Any],
@@ -102,18 +111,194 @@ def needs_whisper_retranscription(
     """Return True when the clip needs Whisper for accurate word timing.
 
     Conditions:
-    1. The transcript source is "youtube" (no word-level timing).
-    2. The caption style requires word-level timing (word_by_word or karaoke).
+    1. The caption style requires word-level timing (word_by_word or karaoke).
+    2. The transcript is not already Whisper-backed and has no usable word timings.
     """
     if caption_style.strip().lower() not in _WORD_LEVEL_STYLES:
         return False
     if not isinstance(transcript, dict):
         return False
-    if transcript.get("source") != "youtube":
-        return False
     if transcript_has_word_timing(transcript):
         return False
-    return True
+    return str(transcript.get("source") or "").strip().lower() != "whisper"
+
+
+def _split_plain_segment_into_chunks(
+    *,
+    start: float,
+    end: float,
+    text: str,
+    chunk_size: int = _ANALYSIS_SEGMENT_WORD_CHUNK_SIZE,
+) -> list[dict[str, Any]]:
+    words = [word for word in str(text or "").split() if word]
+    if not words:
+        return []
+
+    if len(words) <= chunk_size:
+        return [{"start": start, "end": end, "text": " ".join(words)}]
+
+    duration = max(0.0, end - start)
+    if duration <= 0:
+        return []
+
+    time_per_word = duration / len(words)
+    chunks: list[dict[str, Any]] = []
+    for index in range(0, len(words), chunk_size):
+        chunk_words = words[index : index + chunk_size]
+        chunk_start = start + index * time_per_word
+        chunk_end = start + min(index + chunk_size, len(words)) * time_per_word
+        if chunk_end <= chunk_start:
+            continue
+        chunks.append(
+            {
+                "start": chunk_start,
+                "end": chunk_end,
+                "text": " ".join(chunk_words),
+            }
+        )
+    return chunks
+
+
+def normalize_transcript_for_analysis_window(
+    *,
+    transcript: dict[str, Any],
+    start_time: float,
+    end_time: float,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Clip, de-overlap, and normalize transcript segments for AI analysis."""
+    source_segments = transcript.get("segments") or []
+    stats = {
+        "segments_total": len(source_segments),
+        "segments_used": 0,
+        "segments_dropped_partial_without_words": 0,
+        "segments_dropped_invalid": 0,
+        "segments_clipped_with_words": 0,
+        "segments_split_plain_text": 0,
+    }
+
+    window_start = float(start_time)
+    window_end = float(end_time)
+    clipped_segments: list[dict[str, Any]] = []
+
+    for segment in source_segments:
+        seg_start = _as_float(segment.get("start"))
+        seg_end = _as_float(segment.get("end"))
+        text = str(segment.get("text") or "").strip()
+        if seg_start is None or seg_end is None or seg_end <= seg_start or not text:
+            stats["segments_dropped_invalid"] += 1
+            continue
+
+        if seg_end <= window_start or seg_start >= window_end:
+            continue
+
+        overlap_start = max(seg_start, window_start)
+        overlap_end = min(seg_end, window_end)
+        if overlap_end <= overlap_start:
+            continue
+
+        is_partial = overlap_start > seg_start or overlap_end < seg_end
+        words = segment.get("words")
+        if isinstance(words, list) and words:
+            clipped_words: list[dict[str, Any]] = []
+            for word in words:
+                token = str(word.get("word", word.get("text", "")) or "").strip()
+                word_start = _as_float(word.get("start"))
+                word_end = _as_float(word.get("end"))
+                if (
+                    not token
+                    or word_start is None
+                    or word_end is None
+                    or word_end <= word_start
+                    or word_end <= overlap_start
+                    or word_start >= overlap_end
+                ):
+                    continue
+
+                clipped_start = max(word_start, overlap_start)
+                clipped_end = min(word_end, overlap_end)
+                if clipped_end <= clipped_start:
+                    continue
+                clipped_words.append(
+                    {
+                        "word": token,
+                        "start": clipped_start,
+                        "end": clipped_end,
+                    }
+                )
+
+            if not clipped_words:
+                continue
+
+            clipped_words.sort(key=lambda item: (float(item["start"]), float(item["end"])))
+            clipped_segments.append(
+                {
+                    "start": float(clipped_words[0]["start"]),
+                    "end": float(clipped_words[-1]["end"]),
+                    "text": " ".join(str(word["word"]) for word in clipped_words).strip(),
+                    "words": clipped_words,
+                }
+            )
+            stats["segments_used"] += 1
+            stats["segments_clipped_with_words"] += 1
+            continue
+
+        if is_partial:
+            stats["segments_dropped_partial_without_words"] += 1
+            continue
+
+        clipped_segments.extend(
+            _split_plain_segment_into_chunks(
+                start=seg_start,
+                end=seg_end,
+                text=text,
+            )
+        )
+        stats["segments_used"] += 1
+        if len(text.split()) > _ANALYSIS_SEGMENT_WORD_CHUNK_SIZE:
+            stats["segments_split_plain_text"] += 1
+
+    clipped_segments.sort(key=lambda item: float(item["start"]))
+
+    normalized_segments: list[dict[str, Any]] = []
+    for segment in clipped_segments:
+        segment_start = _as_float(segment.get("start"))
+        segment_end = _as_float(segment.get("end"))
+        text = str(segment.get("text") or "").strip()
+        if segment_start is None or segment_end is None or segment_end <= segment_start or not text:
+            continue
+
+        if normalized_segments:
+            previous = normalized_segments[-1]
+            previous_end = float(previous["end"])
+            if previous_end > segment_start:
+                trimmed_end = max(float(previous["start"]), segment_start)
+                previous["end"] = trimmed_end
+                previous_words = previous.get("words")
+                if isinstance(previous_words, list) and previous_words:
+                    trimmed_words = []
+                    for word in previous_words:
+                        ws = max(float(word["start"]), float(previous["start"]))
+                        we = min(float(word["end"]), float(previous["end"]))
+                        if we <= ws:
+                            continue
+                        trimmed_words.append(
+                            {
+                                "word": word["word"],
+                                "start": ws,
+                                "end": we,
+                            }
+                        )
+                    previous["words"] = trimmed_words
+                    previous["text"] = " ".join(word["word"] for word in trimmed_words).strip()
+
+                if previous["end"] <= previous["start"] or not str(previous.get("text") or "").strip():
+                    normalized_segments.pop()
+
+        if segment_end <= segment_start or not text:
+            continue
+        normalized_segments.append(segment)
+
+    return normalized_segments, stats
 
 
 def transcribe_clip_window_with_whisper(
@@ -125,6 +310,7 @@ def transcribe_clip_window_with_whisper(
     end_time: float,
     video_duration_seconds: float,
     model_name: str | None = None,
+    language_hint: str | None = None,
 ) -> dict[str, Any]:
     """Transcribe only the clip window (+context) and return absolute timestamps."""
     context_pad = max(
@@ -144,7 +330,7 @@ def transcribe_clip_window_with_whisper(
 
     selected_model = str(model_name or WHISPER_CLIP_MODEL).strip() or WHISPER_CLIP_MODEL
     transcriber = Transcriber(model_name=selected_model)
-    transcript = transcriber.transcribe(clip_audio_path)
+    transcript = transcriber.transcribe(clip_audio_path, language_hint=language_hint)
     transcript = shift_transcript_timestamps(transcript, window_start)
     transcript["source"] = "whisper"
     return transcript

@@ -1,6 +1,9 @@
+import html
 import ipaddress
+import json
 import logging
 import os
+import re
 import shutil
 import socket
 import time
@@ -8,6 +11,7 @@ from glob import glob
 from urllib.parse import urlparse
 
 import ffmpeg as ffmpeg_lib
+import httpx
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import GenericProxyConfig
@@ -91,6 +95,18 @@ _YOUTUBE_BOT_CHECK_MESSAGES = (
 )
 
 
+_SUPPORTED_SUBTITLE_EXTENSIONS = ("json3", "vtt", "srt")
+_SUBTITLE_EXTENSION_PRIORITY = {
+    ext: index for index, ext in enumerate(_SUPPORTED_SUBTITLE_EXTENSIONS)
+}
+_TIMESTAMP_TAG_RE = re.compile(r"<[^>]+>")
+_SRT_BLOCK_SPLIT_RE = re.compile(r"\r?\n\r?\n+")
+_WEBVTT_TIMESTAMP_RE = re.compile(
+    r"(?P<start>\d{1,2}:\d{2}:\d{2}(?:[.,]\d{3})|\d{1,2}:\d{2}(?:[.,]\d{3}))\s*-->\s*"
+    r"(?P<end>\d{1,2}:\d{2}:\d{2}(?:[.,]\d{3})|\d{1,2}:\d{2}(?:[.,]\d{3}))"
+)
+
+
 def _build_proxy_list() -> list[str]:
     """Build an ordered list of proxies to try (primary first, then pool)."""
     proxies: list[str] = []
@@ -100,6 +116,166 @@ def _build_proxy_list() -> list[str]:
         if p not in proxies:
             proxies.append(p)
     return proxies
+
+
+def _normalize_language_code(value: str | None) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    return text.replace("_", "-")
+
+
+def _strip_subtitle_markup(text: str) -> str:
+    cleaned = html.unescape(str(text or ""))
+    cleaned = _TIMESTAMP_TAG_RE.sub("", cleaned)
+    cleaned = cleaned.replace("\r", " ").replace("\n", " ")
+    return " ".join(cleaned.split()).strip()
+
+
+def _parse_timestamp_to_seconds(value: str) -> float | None:
+    text = str(value or "").strip().replace(",", ".")
+    if not text:
+        return None
+
+    parts = text.split(":")
+    try:
+        numeric_parts = [float(part) for part in parts]
+    except ValueError:
+        return None
+    if len(numeric_parts) == 2:
+        minutes, seconds = numeric_parts
+        return minutes * 60.0 + seconds
+    if len(numeric_parts) == 3:
+        hours, minutes, seconds = numeric_parts
+        return hours * 3600.0 + minutes * 60.0 + seconds
+    return None
+
+
+def _build_transcript_payload(
+    *,
+    segments: list[dict],
+    source: str,
+    language: str | None,
+) -> dict | None:
+    valid_segments = [
+        {
+            "id": index,
+            "start": float(segment["start"]),
+            "end": float(segment["end"]),
+            "text": str(segment["text"]).strip(),
+        }
+        for index, segment in enumerate(segments)
+        if float(segment["end"]) > float(segment["start"]) and str(segment["text"]).strip()
+    ]
+    if not valid_segments:
+        return None
+
+    language_code = _normalize_language_code(language)
+    return {
+        "text": " ".join(segment["text"] for segment in valid_segments).strip(),
+        "segments": valid_segments,
+        "source": source,
+        "language": language_code or "unknown",
+        "languageCode": language_code or "unknown",
+    }
+
+
+def _parse_webvtt_payload(payload_text: str) -> list[dict]:
+    lines = payload_text.splitlines()
+    segments: list[dict] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        if (
+            not line
+            or line.upper() == "WEBVTT"
+            or line.startswith("NOTE")
+            or line.startswith("STYLE")
+            or line.startswith("REGION")
+        ):
+            index += 1
+            continue
+
+        match = _WEBVTT_TIMESTAMP_RE.search(line)
+        if match is None:
+            index += 1
+            continue
+
+        start = _parse_timestamp_to_seconds(match.group("start"))
+        end = _parse_timestamp_to_seconds(match.group("end"))
+        index += 1
+        text_lines: list[str] = []
+        while index < len(lines) and lines[index].strip():
+            text_lines.append(lines[index].strip())
+            index += 1
+        text = _strip_subtitle_markup(" ".join(text_lines))
+        if start is not None and end is not None and end > start and text:
+            segments.append({"start": start, "end": end, "text": text})
+    return segments
+
+
+def _parse_srt_payload(payload_text: str) -> list[dict]:
+    segments: list[dict] = []
+    for block in _SRT_BLOCK_SPLIT_RE.split(payload_text.strip()):
+        lines = [line.strip("\ufeff").strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        timestamp_line = lines[1] if "-->" in lines[1] else lines[0]
+        if "-->" not in timestamp_line:
+            continue
+        start_text, end_text = [part.strip() for part in timestamp_line.split("-->", 1)]
+        start = _parse_timestamp_to_seconds(start_text)
+        end = _parse_timestamp_to_seconds(end_text)
+        text_lines = lines[2:] if timestamp_line == lines[1] else lines[1:]
+        text = _strip_subtitle_markup(" ".join(text_lines))
+        if start is not None and end is not None and end > start and text:
+            segments.append({"start": start, "end": end, "text": text})
+    return segments
+
+
+def _parse_json3_payload(payload_text: str) -> list[dict]:
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return []
+
+    segments: list[dict] = []
+    for event in payload.get("events") or []:
+        start_ms = event.get("tStartMs")
+        duration_ms = event.get("dDurationMs")
+        try:
+            start = float(start_ms) / 1000.0
+            end = start + float(duration_ms) / 1000.0
+        except (TypeError, ValueError):
+            continue
+
+        text = _strip_subtitle_markup(
+            "".join(
+                str(seg.get("utf8") or "")
+                for seg in (event.get("segs") or [])
+            )
+        )
+        if end > start and text:
+            segments.append({"start": start, "end": end, "text": text})
+    return segments
+
+
+def _language_priority(
+    *,
+    preferred_languages: list[str],
+    candidate_language: str | None,
+) -> int:
+    normalized = _normalize_language_code(candidate_language)
+    if normalized is None:
+        return len(preferred_languages) + 20
+
+    base = normalized.split("-", 1)[0]
+    for index, preferred in enumerate(preferred_languages):
+        if normalized == preferred or base == preferred:
+            return index
+        if preferred.startswith(f"{base}-") or normalized.startswith(f"{preferred}-"):
+            return index + len(preferred_languages)
+    return len(preferred_languages) + 20
 
 
 class VideoProbeError(RuntimeError):
@@ -670,14 +846,8 @@ class VideoDownloader:
         )
         raise VideoProbeError(reason, str(last_exc)) from last_exc
 
-    def probe_url(self, url: str) -> dict:
-        """Validate URL with yt-dlp and return probe metadata.
-
-        This does not download media. It only extracts metadata needed for:
-        - can we access downloadable formats?
-        - does the source expose subtitles/captions?
-        - what is the duration for cost calculation?
-        """
+    def _probe_info(self, url: str) -> dict:
+        """Fetch source metadata from yt-dlp without downloading media."""
         _validate_url(url)
         ydl_opts = self._base_ydl_opts(max_height=1080)
         # Probing doesn't need cookies — stale/IP-mismatched cookies can
@@ -691,8 +861,149 @@ class VideoDownloader:
                 "noplaylist": True,
             }
         )
+        return self._extract_with_proxy_rotation(url, ydl_opts)
 
-        info = self._extract_with_proxy_rotation(url, ydl_opts)
+    def _preferred_languages(self, language_hint: str | None = None) -> list[str]:
+        preferred: list[str] = []
+        normalized = _normalize_language_code(language_hint)
+        if normalized and normalized not in preferred:
+            preferred.append(normalized)
+        if normalized:
+            base = normalized.split("-", 1)[0]
+            if base and base not in preferred:
+                preferred.append(base)
+        for fallback in ("en", "en-us", "en-gb"):
+            if fallback not in preferred:
+                preferred.append(fallback)
+        return preferred
+
+    def _pick_provider_subtitle_track(
+        self,
+        info: dict,
+        *,
+        preferred_languages: list[str],
+    ) -> dict[str, object]:
+        selected_track: dict[str, object] | None = None
+        selected_rank: tuple[int, int, int] | None = None
+        unsupported_languages: set[str] = set()
+        empty_languages: set[str] = set()
+
+        for kind, track_map in (
+            ("provider_subtitles", info.get("subtitles") or {}),
+            ("provider_automatic_captions", info.get("automatic_captions") or {}),
+        ):
+            if not isinstance(track_map, dict):
+                continue
+            source_rank = 0 if kind == "provider_subtitles" else 1
+            for language, entries in track_map.items():
+                normalized_language = _normalize_language_code(language) or "unknown"
+                if not isinstance(entries, list) or not entries:
+                    empty_languages.add(normalized_language)
+                    continue
+
+                supported_entries = []
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    ext = str(entry.get("ext") or "").strip().lower()
+                    url = str(entry.get("url") or "").strip()
+                    if not url:
+                        continue
+                    if ext not in _SUBTITLE_EXTENSION_PRIORITY:
+                        continue
+                    supported_entries.append(
+                        {
+                            "kind": kind,
+                            "language": normalized_language,
+                            "ext": ext,
+                            "url": url,
+                        }
+                    )
+
+                if not supported_entries:
+                    unsupported_languages.add(normalized_language)
+                    continue
+
+                supported_entries.sort(
+                    key=lambda entry: _SUBTITLE_EXTENSION_PRIORITY[entry["ext"]]
+                )
+                candidate = supported_entries[0]
+                rank = (
+                    source_rank,
+                    _language_priority(
+                        preferred_languages=preferred_languages,
+                        candidate_language=str(candidate["language"]),
+                    ),
+                    _SUBTITLE_EXTENSION_PRIORITY[str(candidate["ext"])],
+                )
+                if selected_rank is None or rank < selected_rank:
+                    selected_track = candidate
+                    selected_rank = rank
+
+        fallback_reason: str | None = None
+        if selected_track is None:
+            if unsupported_languages:
+                fallback_reason = (
+                    "provider_caption_unsupported_format:"
+                    + ",".join(sorted(unsupported_languages))
+                )
+            elif empty_languages:
+                fallback_reason = (
+                    "provider_caption_missing_url:" + ",".join(sorted(empty_languages))
+                )
+            else:
+                fallback_reason = "provider_caption_unavailable"
+
+        return {
+            "track": selected_track,
+            "fallback_reason": fallback_reason,
+        }
+
+    def _parse_provider_subtitle_payload(
+        self,
+        *,
+        subtitle_url: str,
+        subtitle_ext: str,
+        language: str | None,
+    ) -> dict | None:
+        try:
+            with httpx.Client(follow_redirects=True, timeout=30.0) as client:
+                response = client.get(subtitle_url)
+                response.raise_for_status()
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch provider subtitle payload (%s): %s",
+                subtitle_url,
+                exc,
+            )
+            return None
+
+        payload_text = response.text
+        subtitle_ext = str(subtitle_ext or "").strip().lower()
+        if subtitle_ext == "vtt":
+            segments = _parse_webvtt_payload(payload_text)
+        elif subtitle_ext == "srt":
+            segments = _parse_srt_payload(payload_text)
+        elif subtitle_ext == "json3":
+            segments = _parse_json3_payload(payload_text)
+        else:
+            return None
+
+        return _build_transcript_payload(
+            segments=segments,
+            source="provider_captions",
+            language=language,
+        )
+
+    def probe_url(self, url: str) -> dict:
+        """Validate URL with yt-dlp and return probe metadata.
+
+        This does not download media. It only extracts metadata needed for:
+        - can we access downloadable formats?
+        - does the source expose subtitles/captions?
+        - what is the duration for cost calculation?
+        """
+        info = self._probe_info(url)
 
         duration_seconds = int(info.get("duration") or 0)
         subtitles = info.get("subtitles") or {}
@@ -720,18 +1031,66 @@ class VideoDownloader:
             "detected_language": detected_language,
         }
 
-    def get_youtube_transcript(self, video_id: str) -> dict | None:
+    def get_provider_transcript(
+        self,
+        url: str,
+        *,
+        preferred_languages: list[str] | None = None,
+    ) -> dict[str, object]:
+        info = self._probe_info(url)
+        preferred = preferred_languages or self._preferred_languages()
+        selection = self._pick_provider_subtitle_track(
+            info,
+            preferred_languages=preferred,
+        )
+        track = selection.get("track")
+        if not isinstance(track, dict):
+            return {
+                "transcript": None,
+                "fallback_reason": selection.get("fallback_reason"),
+                "track_source": None,
+                "track_ext": None,
+                "track_language": None,
+            }
+
+        transcript = self._parse_provider_subtitle_payload(
+            subtitle_url=str(track["url"]),
+            subtitle_ext=str(track["ext"]),
+            language=str(track["language"]),
+        )
+        if transcript is None:
+            return {
+                "transcript": None,
+                "fallback_reason": f"provider_caption_parse_failed:{track['ext']}",
+                "track_source": str(track["kind"]),
+                "track_ext": str(track["ext"]),
+                "track_language": str(track["language"]),
+            }
+
+        return {
+            "transcript": transcript,
+            "fallback_reason": None,
+            "track_source": str(track["kind"]),
+            "track_ext": str(track["ext"]),
+            "track_language": str(track["language"]),
+        }
+
+    def get_youtube_transcript(
+        self,
+        video_id: str,
+        *,
+        preferred_languages: list[str] | None = None,
+    ) -> dict | None:
         """Get transcript directly from YouTube (v1.x API).
 
-        Tries English first, then falls back to any available language.
+        Tries preferred languages first, then falls back to any available language.
         """
         fetched = None
+        preferred = preferred_languages or self._preferred_languages()
 
-        # 1. Try English transcript (manual or auto-generated)
+        # 1. Try preferred transcript languages (manual or auto-generated)
         try:
-            fetched = _yt_transcript_api.fetch(
-                video_id, languages=["en", "en-US", "en-GB"]
-            )
+            fetched = _yt_transcript_api.fetch(video_id, languages=preferred)
             logger.info(
                 "Found %s transcript (%s) for %s",
                 fetched.language,

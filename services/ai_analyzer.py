@@ -52,12 +52,32 @@ DEFAULT_ANALYZER_MODEL = _get_env_text(
     "CLAUDE_ANALYZER_MODEL",
     default="gpt-4.1-mini",
 )
+DEFAULT_ANALYZER_SYNTHESIS_MODEL = _get_env_text(
+    "OPENAI_ANALYZER_SYNTHESIS_MODEL",
+    default="gpt-4.1",
+)
 _DEFAULT_FALLBACK_MODELS = "gpt-4.1-mini,gpt-4.1"
 # Approx 4 chars per token; cap transcript to stay within context and reduce cost.
 MAX_TRANSCRIPT_CHARS = _get_env_int(
     "OPENAI_ANALYZER_MAX_TRANSCRIPT_CHARS",
     "CLAUDE_ANALYZER_MAX_TRANSCRIPT_CHARS",
     default=-1,
+)
+_ANALYZER_CHUNK_TARGET_SECONDS = _get_env_int(
+    "OPENAI_ANALYZER_CHUNK_TARGET_SECONDS",
+    default=480,
+)
+_ANALYZER_CHUNK_OVERLAP_SECONDS = _get_env_int(
+    "OPENAI_ANALYZER_CHUNK_OVERLAP_SECONDS",
+    default=30,
+)
+_ANALYZER_CHUNK_MAX_CHARS = _get_env_int(
+    "OPENAI_ANALYZER_CHUNK_MAX_CHARS",
+    default=12000,
+)
+_ANALYZER_CANDIDATES_PER_CHUNK = _get_env_int(
+    "OPENAI_ANALYZER_CANDIDATES_PER_CHUNK",
+    default=4,
 )
 _OPENAI_TIMEOUT_SECONDS = _get_env_float(
     "OPENAI_ANALYZER_TIMEOUT_SECONDS",
@@ -151,6 +171,26 @@ REASONING: For each clip, you MUST provide a "reasoning" field: 1-2 sentences ex
 
 Return a JSON object with a top-level "clips" array matching the requested response format. Verify duration = end_time - start_time for each clip."""
 
+_SYNTHESIS_SYSTEM_PROMPT = """\
+You are ranking candidate short-form clips selected from a longer video.
+
+INPUT FORMAT:
+- Each candidate already has exact transcript-aligned timestamps.
+- Each candidate includes title, hook, summary, reasoning, and confidence from a first-pass analyzer.
+- Use ONLY the candidate start/end times provided. Do not invent or adjust timestamps.
+
+GOAL:
+- Return the strongest standalone clips for TikTok/Reels/Shorts.
+- Prefer clips with immediate hooks, clear payoff, strong standalone context, and variety across the video.
+- Penalize duplicates, weaker rephrasings of the same moment, filler, intros/outros, sponsor reads, and clips that need outside context.
+
+OUTPUT:
+- Return a JSON object with top-level "clips".
+- Preserve start_time/end_time exactly from the candidate list.
+- Re-rank by overall final confidence using the same 0.00-1.00 scale.
+- Include concise reasoning for why each selected candidate survives the global rerank.
+"""
+
 
 class ClipCandidate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -199,6 +239,13 @@ class AIAnalyzer:
             else:
                 self.model_candidates = [resolved_model, *self.model_candidates]
         self.model = self.model_candidates[0]
+        synthesis_model = str(DEFAULT_ANALYZER_SYNTHESIS_MODEL or "").strip()
+        self.synthesis_configured_model = (
+            synthesis_model if synthesis_model else DEFAULT_ANALYZER_SYNTHESIS_MODEL
+        )
+        self.synthesis_model_candidates = _parse_model_candidates(
+            self.synthesis_configured_model
+        )
 
     @staticmethod
     def _format_transcript_compact(snippets: List[Dict]) -> str:
@@ -454,9 +501,19 @@ class AIAnalyzer:
             return True
         return False
 
-    def _create_with_model_fallback(self, *, max_tokens: int, system_prompt: str, user_message: str):
+    def _create_with_model_fallback(
+        self,
+        *,
+        max_tokens: int,
+        system_prompt: str,
+        user_message: str,
+        model_candidates: list[str] | None = None,
+        configured_model: str | None = None,
+    ):
         last_error: Exception | None = None
-        for index, candidate_model in enumerate(self.model_candidates):
+        candidates = list(model_candidates or self.model_candidates)
+        configured_name = str(configured_model or self.configured_model).strip() or self.configured_model
+        for index, candidate_model in enumerate(candidates):
             transient_attempts = 0
             while True:
                 try:
@@ -470,15 +527,15 @@ class AIAnalyzer:
                         ],
                         response_format=ClipAnalysisResponse,
                     )
-                    if candidate_model != self.configured_model:
+                    if candidate_model != configured_name:
                         logger.warning(
                             "Configured OpenAI model '%s' unavailable; using fallback '%s'.",
-                            self.configured_model,
+                            configured_name,
                             candidate_model,
                         )
-                        AIAnalyzer._model_resolution_cache[self.configured_model] = candidate_model
+                        AIAnalyzer._model_resolution_cache[configured_name] = candidate_model
                     else:
-                        AIAnalyzer._model_resolution_cache.pop(self.configured_model, None)
+                        AIAnalyzer._model_resolution_cache.pop(configured_name, None)
                     self.model = candidate_model
                     return completion
                 except Exception as exc:
@@ -503,13 +560,13 @@ class AIAnalyzer:
                         continue
 
                     is_model_not_found = self._is_model_not_found_error(exc)
-                    has_next_candidate = index < len(self.model_candidates) - 1
+                    has_next_candidate = index < len(candidates) - 1
                     if not is_model_not_found or not has_next_candidate:
                         raise
                     logger.warning(
                         "OpenAI model '%s' not found; retrying with fallback '%s'.",
                         candidate_model,
-                        self.model_candidates[index + 1],
+                        candidates[index + 1],
                     )
                     break
 
@@ -598,24 +655,20 @@ class AIAnalyzer:
             "rank": rank,
         }
 
-    def find_best_clips(
-        self,
-        transcript: dict,
-        num_clips: int = 5,
-        min_duration: int = 10,
-        max_duration: int = 60,
-        extra_prompt: str | None = None,
-        video_title: str | None = None,
-        video_platform: str | None = None,
-        video_duration: float | None = None,
-    ) -> List[Dict]:
-        """Analyze transcript using OpenAI to find best clips."""
+    @staticmethod
+    def _snippet_char_cost(snippet: Dict[str, Any]) -> int:
+        start = float(snippet["start"])
+        end = float(snippet["start"]) + float(snippet["duration"])
+        text = str(snippet["text"]).replace("|", " ").replace("\n", " ")
+        return len(f"{start:.2f}|{end:.2f}|{text}\n")
 
+    @classmethod
+    def _build_snippets(cls, transcript: dict) -> list[Dict[str, Any]]:
         segments = transcript.get("segments") or []
-        snippets = []
+        snippets: list[Dict[str, Any]] = []
         for segment in segments:
-            start = self._as_float(segment.get("start"))
-            end = self._as_float(segment.get("end"))
+            start = cls._as_float(segment.get("start"))
+            end = cls._as_float(segment.get("end"))
             text = str(segment.get("text") or "").strip()
             if start is None or end is None or end <= start or not text:
                 continue
@@ -626,24 +679,19 @@ class AIAnalyzer:
                     "duration": end - start,
                 }
             )
-        if not snippets:
-            raise RuntimeError("Transcript has no valid segments for AI analysis")
-        snippets = self._truncate_snippets(snippets, MAX_TRANSCRIPT_CHARS)
-        if not snippets:
-            raise RuntimeError("Transcript snippet set is empty after truncation")
-        transcript_start = min(float(item["start"]) for item in snippets)
-        transcript_end = max(float(item["start"]) + float(item["duration"]) for item in snippets)
-        transcript_duration = max(0.0, transcript_end - transcript_start)
+        return snippets
 
-        transcript_text = self._format_transcript_compact(snippets)
-        system_prompt = (
-            f"{_STATIC_SYSTEM_PROMPT}\n\n"
-            f"For this request: extract {num_clips} clip(s), "
-            f"each {min_duration}-{max_duration}s duration. "
-            f"Return exactly {num_clips} if possible; fewer if video is too short. "
-            f"Quality over quantity."
-        )
+    @classmethod
+    def _snippets_total_chars(cls, snippets: list[Dict[str, Any]]) -> int:
+        return sum(cls._snippet_char_cost(snippet) for snippet in snippets)
 
+    @staticmethod
+    def _video_context_section(
+        *,
+        video_title: str | None,
+        video_platform: str | None,
+        video_duration: float | None,
+    ) -> str:
         video_context_parts: list[str] = []
         title_text = (video_title or "").strip()
         if title_text:
@@ -653,29 +701,17 @@ class AIAnalyzer:
             video_context_parts.append(f"Platform: {platform_text}")
         if video_duration and video_duration > 0:
             video_context_parts.append(f"Full video duration: {video_duration / 60:.1f} min")
-        video_context_section = (
-            " | ".join(video_context_parts) + "\n"
-            if video_context_parts
-            else ""
-        )
+        return " | ".join(video_context_parts) + "\n" if video_context_parts else ""
 
-        extra_prompt_text = (extra_prompt or "").strip()
-        extra_section = (
-            f"\nAdditional user guidance:\n{extra_prompt_text}\n"
-            if extra_prompt_text
-            else ""
-        )
-
-        user_message = (
-            f"{video_context_section}"
-            f"Transcript span: {transcript_start:.2f}s to {transcript_end:.2f}s "
-            f"({transcript_duration:.2f}s total).\n\n"
-            f"{transcript_text}"
-            f"{extra_section}"
-        )
-
-        max_tokens = min(8192, max(1024, num_clips * 400 + 200))
-
+    def _request_clip_candidates(
+        self,
+        *,
+        max_tokens: int,
+        system_prompt: str,
+        user_message: str,
+        model_candidates: list[str] | None = None,
+        configured_model: str | None = None,
+    ) -> list[Dict[str, Any]]:
         if AIAnalyzer._consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD:
             if time.monotonic() < AIAnalyzer._circuit_open_until:
                 raise RuntimeError(
@@ -691,6 +727,8 @@ class AIAnalyzer:
                 max_tokens=max_tokens,
                 system_prompt=system_prompt,
                 user_message=user_message,
+                model_candidates=model_candidates,
+                configured_model=configured_model,
             )
             AIAnalyzer._consecutive_failures = 0
 
@@ -746,7 +784,7 @@ class AIAnalyzer:
                 item = self._normalize_clip(
                     clip,
                     fallback_rank=idx,
-                    min_duration=min_duration,
+                    min_duration=1,
                 )
                 if item is None:
                     logger.warning("Skipping invalid analyzer clip payload at index %d", idx)
@@ -757,7 +795,7 @@ class AIAnalyzer:
                 raise RuntimeError("Analyzer returned no valid clips")
 
             normalized.sort(key=lambda item: (int(item["rank"]), float(item["start"])))
-            return normalized[: max(1, int(num_clips))]
+            return normalized
 
         except Exception as e:
             AIAnalyzer._consecutive_failures += 1
@@ -771,3 +809,438 @@ class AIAnalyzer:
                 )
             logger.exception("OpenAI analyzer call failed: %s", e)
             raise
+
+    def _analyze_snippets(
+        self,
+        *,
+        snippets: list[Dict[str, Any]],
+        request_count: int,
+        min_duration: int,
+        max_duration: int,
+        extra_prompt: str | None,
+        video_title: str | None,
+        video_platform: str | None,
+        video_duration: float | None,
+        model_candidates: list[str] | None = None,
+        configured_model: str | None = None,
+    ) -> list[Dict[str, Any]]:
+        if not snippets:
+            raise RuntimeError("Transcript has no valid segments for AI analysis")
+
+        transcript_start = min(float(item["start"]) for item in snippets)
+        transcript_end = max(float(item["start"]) + float(item["duration"]) for item in snippets)
+        transcript_duration = max(0.0, transcript_end - transcript_start)
+        transcript_text = self._format_transcript_compact(snippets)
+        system_prompt = (
+            f"{_STATIC_SYSTEM_PROMPT}\n\n"
+            f"For this request: extract {request_count} clip(s), "
+            f"each {min_duration}-{max_duration}s duration. "
+            f"Return exactly {request_count} if possible; fewer if video is too short. "
+            f"Quality over quantity."
+        )
+
+        extra_prompt_text = (extra_prompt or "").strip()
+        extra_section = (
+            f"\nAdditional user guidance:\n{extra_prompt_text}\n"
+            if extra_prompt_text
+            else ""
+        )
+        user_message = (
+            f"{self._video_context_section(video_title=video_title, video_platform=video_platform, video_duration=video_duration)}"
+            f"Transcript span: {transcript_start:.2f}s to {transcript_end:.2f}s "
+            f"({transcript_duration:.2f}s total).\n\n"
+            f"{transcript_text}"
+            f"{extra_section}"
+        )
+        max_tokens = min(8192, max(1024, request_count * 400 + 200))
+        clips = self._request_clip_candidates(
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            model_candidates=model_candidates,
+            configured_model=configured_model,
+        )
+        return clips[: max(1, int(request_count))]
+
+    @classmethod
+    def _build_snippet_chunks(
+        cls,
+        snippets: list[Dict[str, Any]],
+        *,
+        target_seconds: int,
+        overlap_seconds: int,
+        max_chars: int,
+    ) -> list[dict[str, Any]]:
+        if not snippets:
+            return []
+
+        chunks: list[dict[str, Any]] = []
+        start_index = 0
+        snippet_count = len(snippets)
+
+        while start_index < snippet_count:
+            chunk_snippets: list[Dict[str, Any]] = []
+            chunk_start = float(snippets[start_index]["start"])
+            chunk_end = chunk_start
+            chunk_chars = 0
+            index = start_index
+
+            while index < snippet_count:
+                snippet = snippets[index]
+                snippet_end = float(snippet["start"]) + float(snippet["duration"])
+                snippet_cost = cls._snippet_char_cost(snippet)
+                exceeds_time = (
+                    bool(chunk_snippets)
+                    and snippet_end - chunk_start > max(1, int(target_seconds))
+                )
+                exceeds_chars = (
+                    bool(chunk_snippets)
+                    and max_chars > 0
+                    and chunk_chars + snippet_cost > max_chars
+                )
+                if exceeds_time or exceeds_chars:
+                    break
+                chunk_snippets.append(snippet)
+                chunk_chars += snippet_cost
+                chunk_end = snippet_end
+                index += 1
+
+            if not chunk_snippets:
+                snippet = snippets[start_index]
+                chunk_snippets = [snippet]
+                chunk_end = float(snippet["start"]) + float(snippet["duration"])
+                index = start_index + 1
+
+            chunks.append(
+                {
+                    "index": len(chunks) + 1,
+                    "start": chunk_start,
+                    "end": chunk_end,
+                    "snippets": chunk_snippets,
+                }
+            )
+
+            if index >= snippet_count:
+                break
+
+            next_start_threshold = max(chunk_start, chunk_end - max(0, int(overlap_seconds)))
+            next_start_index = index
+            while (
+                next_start_index > start_index
+                and float(snippets[next_start_index - 1]["start"]) >= next_start_threshold
+            ):
+                next_start_index -= 1
+            if next_start_index <= start_index:
+                next_start_index = start_index + 1
+            start_index = next_start_index
+
+        return chunks
+
+    @staticmethod
+    def _build_candidate_excerpt(
+        snippets: list[Dict[str, Any]],
+        *,
+        start: float,
+        end: float,
+        max_chars: int = 260,
+    ) -> str:
+        parts: list[str] = []
+        total_chars = 0
+        for snippet in snippets:
+            snippet_start = float(snippet["start"])
+            snippet_end = snippet_start + float(snippet["duration"])
+            if snippet_end <= start or snippet_start >= end:
+                continue
+            text = str(snippet["text"]).strip()
+            if not text:
+                continue
+            parts.append(text)
+            total_chars += len(text)
+            if total_chars >= max_chars:
+                break
+        excerpt = " ".join(parts).strip()
+        if len(excerpt) <= max_chars:
+            return excerpt
+        return excerpt[: max_chars - 3].rstrip() + "..."
+
+    @staticmethod
+    def _dedupe_candidates(candidates: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+        deduped: dict[tuple[float, float], Dict[str, Any]] = {}
+        for candidate in candidates:
+            key = (round(float(candidate["start"]), 2), round(float(candidate["end"]), 2))
+            existing = deduped.get(key)
+            candidate_score = float(candidate.get("score") or 0.0)
+            existing_score = float(existing.get("score") or 0.0) if existing else -1.0
+            if existing is None or candidate_score > existing_score:
+                deduped[key] = dict(candidate)
+        return sorted(
+            deduped.values(),
+            key=lambda item: (
+                -float(item.get("score") or 0.0),
+                int(item.get("rank") or 9999),
+                float(item["start"]),
+            ),
+        )
+
+    @classmethod
+    def _candidate_time_match(
+        cls,
+        candidate: Dict[str, Any],
+        allowed_candidates: list[Dict[str, Any]],
+    ) -> Dict[str, Any] | None:
+        start = float(candidate["start"])
+        end = float(candidate["end"])
+        exact_key = (round(start, 2), round(end, 2))
+        for allowed in allowed_candidates:
+            allowed_key = (
+                round(float(allowed["start"]), 2),
+                round(float(allowed["end"]), 2),
+            )
+            if allowed_key == exact_key:
+                return allowed
+
+        matches = [
+            allowed
+            for allowed in allowed_candidates
+            if abs(float(allowed["start"]) - start) <= 0.75
+            and abs(float(allowed["end"]) - end) <= 0.75
+        ]
+        if not matches:
+            return None
+        return min(
+            matches,
+            key=lambda allowed: abs(float(allowed["start"]) - start)
+            + abs(float(allowed["end"]) - end),
+        )
+
+    def _synthesize_candidates(
+        self,
+        *,
+        candidates: list[Dict[str, Any]],
+        candidate_target: int,
+        min_duration: int,
+        max_duration: int,
+        extra_prompt: str | None,
+        video_title: str | None,
+        video_platform: str | None,
+        video_duration: float | None,
+    ) -> list[Dict[str, Any]]:
+        lines = [
+            self._video_context_section(
+                video_title=video_title,
+                video_platform=video_platform,
+                video_duration=video_duration,
+            ).strip(),
+            f"Return the best {candidate_target} clip(s) from this candidate shortlist.",
+            (
+                f"Target duration range: {min_duration}-{max_duration}s. "
+                "Use only candidate timestamps exactly as provided."
+            ),
+            "",
+            "Candidates:",
+        ]
+        for index, candidate in enumerate(candidates, start=1):
+            tags = ", ".join(candidate.get("tags") or [])
+            lines.extend(
+                [
+                    f"Candidate {index}:",
+                    f"start_time={float(candidate['start']):.2f}",
+                    f"end_time={float(candidate['end']):.2f}",
+                    f"duration={float(candidate['duration']):.2f}",
+                    f"title={str(candidate.get('title') or '').strip()}",
+                    f"hook={str(candidate.get('hook') or candidate.get('hook_text') or '').strip()}",
+                    f"summary={str(candidate.get('text') or '').strip()}",
+                    f"reasoning={str(candidate.get('reasoning') or '').strip()}",
+                    f"first_pass_confidence={float(candidate.get('first_pass_score') or candidate.get('score') or 0.0):.2f}",
+                    f"source_chunk={int(candidate.get('source_chunk_index') or 0)}",
+                    f"tags={tags}",
+                    f"excerpt={str(candidate.get('excerpt') or '').strip()}",
+                    "",
+                ]
+            )
+
+        extra_prompt_text = (extra_prompt or "").strip()
+        if extra_prompt_text:
+            lines.extend(["Additional user guidance:", extra_prompt_text, ""])
+
+        user_message = "\n".join(line for line in lines if line is not None).strip()
+        max_tokens = min(8192, max(1600, candidate_target * 420 + 400))
+        reranked = self._request_clip_candidates(
+            max_tokens=max_tokens,
+            system_prompt=_SYNTHESIS_SYSTEM_PROMPT,
+            user_message=user_message,
+            model_candidates=self.synthesis_model_candidates,
+            configured_model=self.synthesis_configured_model,
+        )
+
+        matched: list[Dict[str, Any]] = []
+        used_keys: set[tuple[float, float]] = set()
+        for candidate in reranked:
+            allowed = self._candidate_time_match(candidate, candidates)
+            if allowed is None:
+                continue
+            key = (round(float(allowed["start"]), 2), round(float(allowed["end"]), 2))
+            if key in used_keys:
+                continue
+            merged = dict(allowed)
+            merged.update(
+                {
+                    "title": candidate.get("title") or allowed.get("title"),
+                    "text": candidate.get("text") or allowed.get("text"),
+                    "hook": candidate.get("hook") or allowed.get("hook"),
+                    "hook_text": candidate.get("hook_text") or allowed.get("hook_text"),
+                    "reasoning": candidate.get("reasoning") or allowed.get("reasoning"),
+                    "content_category": candidate.get("content_category") or allowed.get("content_category"),
+                    "score": candidate.get("score"),
+                    "rank": len(matched) + 1,
+                }
+            )
+            merged["start"] = float(allowed["start"])
+            merged["end"] = float(allowed["end"])
+            merged["duration"] = float(allowed["duration"])
+            matched.append(merged)
+            used_keys.add(key)
+            if len(matched) >= candidate_target:
+                break
+
+        if matched:
+            return matched
+        raise RuntimeError("Synthesis rerank returned no valid candidates")
+
+    def find_best_clips_detailed(
+        self,
+        transcript: dict,
+        num_clips: int = 5,
+        min_duration: int = 10,
+        max_duration: int = 60,
+        extra_prompt: str | None = None,
+        video_title: str | None = None,
+        video_platform: str | None = None,
+        video_duration: float | None = None,
+    ) -> Dict[str, Any]:
+        """Analyze transcript and return clips plus diagnostics."""
+        requested_count = max(1, int(num_clips))
+        candidate_target = min(20, max(requested_count * 3, requested_count + 4))
+        snippets = self._build_snippets(transcript)
+        if not snippets:
+            raise RuntimeError("Transcript has no valid segments for AI analysis")
+
+        transcript_duration = max(
+            0.0,
+            max(float(item["start"]) + float(item["duration"]) for item in snippets)
+            - min(float(item["start"]) for item in snippets),
+        )
+        transcript_chars = self._snippets_total_chars(snippets)
+        single_pass_mode = (
+            transcript_duration <= float(_ANALYZER_CHUNK_TARGET_SECONDS)
+            and transcript_chars <= int(_ANALYZER_CHUNK_MAX_CHARS)
+        )
+
+        diagnostics: Dict[str, Any] = {
+            "analysis_mode": "single_pass" if single_pass_mode else "chunked",
+            "chunk_count": 1,
+            "candidate_target": candidate_target,
+            "candidate_returned": 0,
+            "chunk_candidate_count": 0,
+            "transcript_chars": transcript_chars,
+            "transcript_duration": transcript_duration,
+        }
+
+        if single_pass_mode:
+            clips = self._analyze_snippets(
+                snippets=snippets,
+                request_count=candidate_target,
+                min_duration=min_duration,
+                max_duration=max_duration,
+                extra_prompt=extra_prompt,
+                video_title=video_title,
+                video_platform=video_platform,
+                video_duration=video_duration,
+            )
+            diagnostics["candidate_returned"] = len(clips)
+            return {"clips": clips, "diagnostics": diagnostics}
+
+        chunks = self._build_snippet_chunks(
+            snippets,
+            target_seconds=_ANALYZER_CHUNK_TARGET_SECONDS,
+            overlap_seconds=_ANALYZER_CHUNK_OVERLAP_SECONDS,
+            max_chars=_ANALYZER_CHUNK_MAX_CHARS,
+        )
+        diagnostics["chunk_count"] = len(chunks)
+
+        merged_candidates: list[Dict[str, Any]] = []
+        for chunk in chunks:
+            chunk_candidates = self._analyze_snippets(
+                snippets=list(chunk["snippets"]),
+                request_count=max(1, int(_ANALYZER_CANDIDATES_PER_CHUNK)),
+                min_duration=min_duration,
+                max_duration=max_duration,
+                extra_prompt=extra_prompt,
+                video_title=video_title,
+                video_platform=video_platform,
+                video_duration=video_duration,
+            )
+            for candidate in chunk_candidates:
+                candidate_copy = dict(candidate)
+                candidate_copy["first_pass_score"] = candidate.get("score")
+                candidate_copy["source_chunk_index"] = int(chunk["index"])
+                candidate_copy["excerpt"] = self._build_candidate_excerpt(
+                    list(chunk["snippets"]),
+                    start=float(candidate_copy["start"]),
+                    end=float(candidate_copy["end"]),
+                )
+                merged_candidates.append(candidate_copy)
+
+        if not merged_candidates:
+            raise RuntimeError("Analyzer returned no valid candidates across transcript chunks")
+
+        deduped_candidates = self._dedupe_candidates(merged_candidates)
+        diagnostics["chunk_candidate_count"] = len(deduped_candidates)
+        synthesis_shortlist = deduped_candidates[
+            : max(candidate_target * 2, candidate_target + 8)
+        ]
+
+        try:
+            final_candidates = self._synthesize_candidates(
+                candidates=synthesis_shortlist,
+                candidate_target=candidate_target,
+                min_duration=min_duration,
+                max_duration=max_duration,
+                extra_prompt=extra_prompt,
+                video_title=video_title,
+                video_platform=video_platform,
+                video_duration=video_duration,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Synthesis rerank failed; falling back to first-pass candidates: %s",
+                exc,
+            )
+            diagnostics["analysis_mode"] = "chunked_fallback"
+            final_candidates = synthesis_shortlist[:candidate_target]
+
+        diagnostics["candidate_returned"] = len(final_candidates)
+        return {"clips": final_candidates, "diagnostics": diagnostics}
+
+    def find_best_clips(
+        self,
+        transcript: dict,
+        num_clips: int = 5,
+        min_duration: int = 10,
+        max_duration: int = 60,
+        extra_prompt: str | None = None,
+        video_title: str | None = None,
+        video_platform: str | None = None,
+        video_duration: float | None = None,
+    ) -> List[Dict]:
+        detailed = self.find_best_clips_detailed(
+            transcript=transcript,
+            num_clips=num_clips,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            extra_prompt=extra_prompt,
+            video_title=video_title,
+            video_platform=video_platform,
+            video_duration=video_duration,
+        )
+        return list(detailed["clips"])[: max(1, int(num_clips))]

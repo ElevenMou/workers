@@ -39,6 +39,7 @@ from tasks.clips.helpers.source_video import (
 )
 from tasks.models.jobs import CustomClipJob
 from tasks.models.layout import merge_layout_configs
+from tasks.videos.source_transcript import resolve_source_transcript
 from tasks.videos.transcript import (
     transcript_has_word_timing,
     transcribe_clip_window_with_whisper,
@@ -487,26 +488,36 @@ def custom_clip_task(job_data: CustomClipJob):
         # 2. Get transcript ----------------------------------------------------
         transcript = None
         partial_transcript = False
-
-        # Reuse stored transcript if the video already has one.
         existing_transcript = existing_video.get("transcript")
-        if isinstance(existing_transcript, dict) and existing_transcript.get("segments"):
-            transcript = existing_transcript
-            logger.info("[%s] Reusing transcript already stored on video", job_id)
+        resolved_full_video_transcript = (
+            existing_transcript
+            if isinstance(existing_transcript, dict) and existing_transcript.get("segments")
+            else None
+        )
 
-        if not transcript and source_platform == "youtube" and source_external_id:
+        update_clip_job_progress(
+            job_id=job_id,
+            progress=30,
+            stage="fetching_source_captions",
+            detail_key="checking_existing_captions",
+        )
+
+        def _on_transcript_attempt(step: str):
+            if step in {"youtube_captions", "provider_captions"}:
+                update_clip_job_progress(
+                    job_id=job_id,
+                    progress=30,
+                    stage="fetching_source_captions",
+                    detail_key="checking_existing_captions",
+                )
+
+        def _partial_whisper_fallback(language_hint: str | None) -> tuple[dict, bool]:
             update_clip_job_progress(
                 job_id=job_id,
                 progress=30,
                 stage="fetching_source_captions",
                 detail_key="checking_existing_captions",
             )
-            logger.info("[%s] Attempting to get YouTube transcript ...", job_id)
-            transcript = downloader.get_youtube_transcript(str(source_external_id))
-            if transcript:
-                logger.info("[%s] Got transcript from YouTube", job_id)
-
-        if not transcript:
             update_clip_job_progress(
                 job_id=job_id,
                 progress=30,
@@ -535,8 +546,26 @@ def custom_clip_task(job_data: CustomClipJob):
                 start_time=start_time,
                 end_time=end_time,
                 video_duration_seconds=duration_seconds,
+                language_hint=language_hint,
             )
-            partial_transcript = True
+            return transcript_payload, False
+
+        transcript_resolution = resolve_source_transcript(
+            existing_transcript=resolved_full_video_transcript,
+            downloader=downloader,
+            source_url=url,
+            source_platform=source_platform,
+            source_external_id=str(source_external_id or "").strip() or None,
+            source_detected_language=None,
+            source_has_audio=None,
+            whisper_fallback=_partial_whisper_fallback,
+            job_id=job_id,
+            on_attempt=_on_transcript_attempt,
+        )
+        transcript = transcript_resolution.transcript
+        partial_transcript = not transcript_resolution.is_full_transcript
+        if transcript_resolution.is_full_transcript:
+            resolved_full_video_transcript = transcript_resolution.transcript
 
         if smart_cleanup_enabled:
             update_clip_job_progress(
@@ -572,8 +601,8 @@ def custom_clip_task(job_data: CustomClipJob):
 
         # Save transcript on video row only when it represents the full video.
         video_update = {"status": "completed"}
-        if not partial_transcript:
-            video_update["transcript"] = transcript
+        if resolved_full_video_transcript:
+            video_update["transcript"] = resolved_full_video_transcript
 
         save_video_resp = (
             supabase.table("videos").update(video_update).eq("id", video_id).execute()

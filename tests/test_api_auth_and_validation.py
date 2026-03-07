@@ -764,12 +764,12 @@ def test_analyze_video_rejects_clip_count_above_density_ratio(client, monkeypatc
         "/videos/analyze",
         json={
             "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
-            "numClips": 3,
+            "numClips": 6,
         },
     )
 
     assert response.status_code == 400
-    assert "1 clip every 3 minutes" in response.json()["detail"]
+    assert "selected 90s max clip length" in response.json()["detail"]
 
 
 def test_analyze_video_queues_range_based_analysis_credits(client, monkeypatch):

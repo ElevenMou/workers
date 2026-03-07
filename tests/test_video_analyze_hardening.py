@@ -216,12 +216,22 @@ class _FakeDownloader:
             "thumbnail": "https://example.com/thumb.jpg",
             "platform": "youtube",
             "external_id": "yt123",
+            "detected_language": "en",
             "has_captions": self._has_captions,
             "has_audio": self._has_audio,
         }
 
-    def get_youtube_transcript(self, _video_id: str):
+    def get_youtube_transcript(self, _video_id: str, *, preferred_languages=None):
         return self._transcript
+
+    def get_provider_transcript(self, _url: str, *, preferred_languages=None):
+        return {
+            "transcript": None,
+            "fallback_reason": "provider_caption_unavailable",
+            "track_source": None,
+            "track_ext": None,
+            "track_language": None,
+        }
 
     def extract_audio(self, _video_path: str):
         self.extract_audio_calls += 1
@@ -315,7 +325,7 @@ def _install_common_patches(
 
     if transcriber_factory is None:
         transcriber_factory = lambda: SimpleNamespace(
-            transcribe=lambda _audio_path: {
+            transcribe=lambda _audio_path, **_kwargs: {
                 "source": "whisper",
                 "language": "en",
                 "segments": [{"start": 0.0, "end": 90.0, "text": "whisper transcript"}],
@@ -455,14 +465,15 @@ def test_analysis_uses_precomputed_source_metadata_before_any_media_download(
     analyze_task_module.analyze_video_task(
         _job_data(
             analysisDurationSeconds=180,
-            sourceTitle="Preloaded metadata title",
-            sourceThumbnailUrl="https://example.com/thumb.jpg",
-            sourcePlatform="youtube",
-            sourceExternalId="yt123",
-            sourceHasCaptions=True,
-            sourceHasAudio=True,
+                sourceTitle="Preloaded metadata title",
+                sourceThumbnailUrl="https://example.com/thumb.jpg",
+                sourcePlatform="youtube",
+                sourceExternalId="yt123",
+                sourceDetectedLanguage="en",
+                sourceHasCaptions=True,
+                sourceHasAudio=True,
+            )
         )
-    )
 
     assert downloader.probe_calls == 0
     assert downloader.download_calls == 0
@@ -1198,6 +1209,175 @@ def test_ai_analyzer_circuit_breaker_opens_after_repeated_failures(monkeypatch):
             min_duration=30,
             max_duration=90,
         )
+
+
+def test_provider_transcript_path_without_audio_skips_whisper(monkeypatch, tmp_path: Path):
+    supabase = _FakeSupabase()
+    downloader = _FakeDownloader(
+        work_dir=str(tmp_path),
+        transcript=None,
+        duration_seconds=180,
+        has_captions=True,
+        has_audio=False,
+    )
+    provider_transcript = {
+        "source": "provider_captions",
+        "language": "es",
+        "languageCode": "es",
+        "segments": [
+            {"id": 0, "start": 0.0, "end": 60.0, "text": "segmento uno"},
+            {"id": 1, "start": 60.0, "end": 120.0, "text": "segmento dos"},
+            {"id": 2, "start": 120.0, "end": 180.0, "text": "segmento tres"},
+        ],
+    }
+    downloader.probe_url = lambda _url: {
+        "duration_seconds": 180,
+        "title": "Provider Caption Test",
+        "thumbnail": "https://example.com/thumb.jpg",
+        "platform": "vimeo",
+        "external_id": "vm123",
+        "detected_language": "es",
+        "has_captions": True,
+        "has_audio": False,
+    }
+    downloader.get_provider_transcript = lambda _url, *, preferred_languages=None: {
+        "transcript": provider_transcript,
+        "fallback_reason": None,
+        "track_source": "provider_subtitles",
+        "track_ext": "vtt",
+        "track_language": "es",
+    }
+
+    state = _install_common_patches(
+        monkeypatch,
+        tmp_path=tmp_path,
+        supabase=supabase,
+        downloader=downloader,
+        analyzer_clips=[],
+        transcriber_factory=lambda: (_ for _ in ()).throw(
+            RuntimeError("transcriber should not be initialized")
+        ),
+    )
+    monkeypatch.setattr(
+        analyze_task_module,
+        "AIAnalyzer",
+        lambda: SimpleNamespace(find_best_clips=lambda *_a, **_k: []),
+    )
+
+    analyze_task_module.analyze_video_task(_job_data(url="https://vimeo.com/123456"))
+
+    assert downloader.extract_audio_calls == 0
+    assert downloader.download_calls == 0
+    assert downloader.download_audio_only_calls == 0
+    completed_jobs = [update for update in state["job_updates"] if update["status"] == "completed"]
+    assert completed_jobs[-1]["result_data"]["transcript_source"] == "provider_captions"
+    assert completed_jobs[-1]["result_data"]["transcript_language"] == "es"
+
+
+def test_validation_backfills_past_invalid_candidates(monkeypatch, tmp_path: Path):
+    supabase = _FakeSupabase()
+    downloader = _FakeDownloader(work_dir=str(tmp_path), transcript=_base_transcript(), duration_seconds=180)
+    state = _install_common_patches(
+        monkeypatch,
+        tmp_path=tmp_path,
+        supabase=supabase,
+        downloader=downloader,
+        analyzer_clips=[
+            {
+                "start": 300.0,
+                "end": 360.0,
+                "duration": 60.0,
+                "text": "outside window",
+                "title": "Invalid window clip",
+                "score": 0.91,
+                "rank": 1,
+            },
+            {
+                "start": 0.0,
+                "end": 60.0,
+                "duration": 60.0,
+                "text": "segment one",
+                "title": "First valid clip",
+                "score": 0.93,
+                "rank": 2,
+            },
+            {
+                "start": 120.0,
+                "end": 180.0,
+                "duration": 60.0,
+                "text": "segment three",
+                "title": "Second valid clip",
+                "score": 0.94,
+                "rank": 3,
+            },
+        ],
+    )
+
+    analyze_task_module.analyze_video_task(_job_data(numClips=2))
+
+    assert [clip["title"] for clip in supabase.inserted_clips] == [
+        "First valid clip",
+        "Second valid clip",
+    ]
+    completed_jobs = [update for update in state["job_updates"] if update["status"] == "completed"]
+    clip_stats = completed_jobs[-1]["result_data"]["clip_validation_stats"]
+    assert clip_stats["candidate_validated"] == 3
+    assert clip_stats["accepted"] == 2
+    assert clip_stats["skipped_outside_window"] == 1
+
+
+def test_ai_analyzer_chunked_mode_keeps_tail_candidates(monkeypatch):
+    transcript = {
+        "source": "provider_captions",
+        "language": "en",
+        "segments": [
+            {
+                "id": index,
+                "start": float(index * 120),
+                "end": float(index * 120 + 60),
+                "text": f"segment {index}",
+            }
+            for index in range(10)
+        ],
+    }
+
+    monkeypatch.setattr(
+        ai_analyzer_module.AIAnalyzer,
+        "_analyze_snippets",
+        lambda self, *, snippets, request_count, **_kwargs: [
+            {
+                "start": float(snippets[0]["start"]),
+                "end": float(snippets[0]["start"]) + 60.0,
+                "duration": 60.0,
+                "text": f"chunk {int(snippets[0]['start'])}",
+                "title": f"Chunk {int(snippets[0]['start'])}",
+                "hook": "hook",
+                "hook_text": "hook",
+                "reasoning": "reason",
+                "content_category": "education",
+                "score": 0.7 if float(snippets[0]["start"]) < 900 else 0.95,
+                "tags": [],
+                "rank": 1,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        ai_analyzer_module.AIAnalyzer,
+        "_synthesize_candidates",
+        lambda self, *, candidates, candidate_target, **_kwargs: list(candidates)[:candidate_target],
+    )
+
+    analyzer = ai_analyzer_module.AIAnalyzer()
+    result = analyzer.find_best_clips_detailed(
+        transcript=transcript,
+        num_clips=2,
+        min_duration=30,
+        max_duration=90,
+    )
+
+    assert result["diagnostics"]["analysis_mode"] == "chunked"
+    assert result["diagnostics"]["chunk_count"] > 1
+    assert any(float(candidate["start"]) >= 900.0 for candidate in result["clips"])
 
 
 def test_validate_env_accepts_openai_api_key_only(monkeypatch):

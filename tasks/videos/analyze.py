@@ -15,6 +15,8 @@ from tasks.clips.helpers.source_video import (
     upload_raw_video_to_storage,
 )
 from tasks.models.jobs import AnalyzeVideoJob
+from tasks.videos.source_transcript import resolve_source_transcript
+from tasks.videos.transcript import normalize_transcript_for_analysis_window
 from utils.sentry_context import configure_job_scope
 from utils.workdirs import create_work_dir
 from utils.supabase_client import (
@@ -150,114 +152,6 @@ def _as_optional_bool(value: Any) -> bool | None:
     if text in {"0", "false", "no", "off"}:
         return False
     return None
-
-
-def _clip_transcript_for_analysis_window(
-    *,
-    transcript: dict[str, Any],
-    processing_start_seconds: float,
-    processing_end_seconds: float,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """
-    Build a strict analysis transcript within [processing_start_seconds, processing_end_seconds].
-
-    For segments with no word timing, partial boundary overlaps are dropped to avoid leaking
-    ambiguous out-of-window text.
-    """
-    input_segments = transcript.get("segments") or []
-    stats = {
-        "segments_total": len(input_segments),
-        "segments_used": 0,
-        "segments_dropped_partial_without_words": 0,
-        "segments_dropped_invalid": 0,
-        "segments_clipped_with_words": 0,
-    }
-
-    clipped_segments: list[dict[str, Any]] = []
-    for segment in input_segments:
-        seg_start = _as_float(segment.get("start"))
-        seg_end = _as_float(segment.get("end"))
-        text = str(segment.get("text") or "").strip()
-        if (
-            seg_start is None
-            or seg_end is None
-            or seg_end <= seg_start
-            or not text
-        ):
-            stats["segments_dropped_invalid"] += 1
-            continue
-
-        if seg_end <= processing_start_seconds or seg_start >= processing_end_seconds:
-            continue
-
-        overlap_start = max(seg_start, processing_start_seconds)
-        overlap_end = min(seg_end, processing_end_seconds)
-        if overlap_end <= overlap_start:
-            continue
-
-        is_partial = overlap_start > seg_start or overlap_end < seg_end
-        words = segment.get("words")
-        clipped_segment: dict[str, Any] | None = None
-        if isinstance(words, list) and words:
-            clipped_words: list[dict[str, Any]] = []
-            for word in words:
-                ws = _as_float(word.get("start"))
-                we = _as_float(word.get("end"))
-                token = str(word.get("word", word.get("text", "")) or "").strip()
-                if (
-                    ws is None
-                    or we is None
-                    or we <= ws
-                    or not token
-                    or we <= overlap_start
-                    or ws >= overlap_end
-                ):
-                    continue
-
-                clipped_ws = max(ws, overlap_start)
-                clipped_we = min(we, overlap_end)
-                if clipped_we <= clipped_ws:
-                    continue
-                clipped_words.append(
-                    {
-                        "word": token,
-                        "start": clipped_ws,
-                        "end": clipped_we,
-                    }
-                )
-
-            if not clipped_words:
-                continue
-
-            clipped_words.sort(key=lambda item: (float(item["start"]), float(item["end"])))
-            clipped_segment = {
-                "start": float(clipped_words[0]["start"]),
-                "end": float(clipped_words[-1]["end"]),
-                "text": " ".join(str(word["word"]) for word in clipped_words).strip(),
-                "words": clipped_words,
-            }
-            stats["segments_clipped_with_words"] += 1
-        else:
-            if is_partial:
-                stats["segments_dropped_partial_without_words"] += 1
-                continue
-            clipped_segment = {
-                "start": seg_start,
-                "end": seg_end,
-                "text": text,
-            }
-
-        if (
-            clipped_segment is None
-            or clipped_segment["end"] <= clipped_segment["start"]
-            or not str(clipped_segment.get("text") or "").strip()
-        ):
-            continue
-        clipped_segments.append(clipped_segment)
-        stats["segments_used"] += 1
-
-    clipped_segments.sort(key=lambda item: float(item["start"]))
-    return clipped_segments, stats
 
 
 def _nearest_boundary(
@@ -416,6 +310,9 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
     source_thumbnail_url = str(job_data.get("sourceThumbnailUrl") or "").strip() or None
     source_platform = str(job_data.get("sourcePlatform") or "").strip().lower() or None
     source_external_id = str(job_data.get("sourceExternalId") or "").strip() or None
+    source_detected_language = (
+        str(job_data.get("sourceDetectedLanguage") or "").strip() or None
+    )
     source_has_captions = _as_optional_bool(job_data.get("sourceHasCaptions"))
     source_has_audio = _as_optional_bool(job_data.get("sourceHasAudio"))
 
@@ -441,9 +338,11 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         "segments_dropped_partial_without_words": 0,
         "segments_dropped_invalid": 0,
         "segments_clipped_with_words": 0,
+        "segments_split_plain_text": 0,
     }
     clip_validation_stats: dict[str, int] = {
-        "returned_by_ai": 0,
+        "candidate_returned": 0,
+        "candidate_validated": 0,
         "accepted": 0,
         "skipped_invalid_payload": 0,
         "skipped_outside_window": 0,
@@ -453,6 +352,18 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         "skipped_non_viral_content": 0,
         "skipped_overlap": 0,
         "skipped_duplicate": 0,
+    }
+    transcript_diagnostics: dict[str, Any] = {
+        "transcript_source": None,
+        "transcript_language": None,
+        "transcript_reused": False,
+        "transcript_fallback_reason": None,
+    }
+    analysis_ai_diagnostics: dict[str, Any] = {
+        "analysis_mode": "single_pass",
+        "chunk_count": 1,
+        "candidate_target": 0,
+        "candidate_returned": 0,
     }
 
     billing_state: dict[str, Any] = {
@@ -530,6 +441,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             "thumbnail": source_thumbnail_url,
             "platform": source_platform,
             "external_id": source_external_id,
+            "detected_language": source_detected_language,
             "has_captions": source_has_captions,
             "has_audio": source_has_audio,
             "duration": int(job_data.get("analysisDurationSeconds") or 0),
@@ -539,6 +451,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             or not str(source_info.get("platform") or "").strip()
             or source_info.get("has_captions") is None
             or source_info.get("has_audio") is None
+            or not str(source_info.get("detected_language") or "").strip()
         )
         if needs_probe:
             logger.info("[%s] Probing source metadata without media download ...", job_id)
@@ -561,6 +474,10 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 source_info["has_captions"] = bool(probe_data.get("has_captions"))
             if source_info.get("has_audio") is None:
                 source_info["has_audio"] = bool(probe_data.get("has_audio"))
+            if not str(source_info.get("detected_language") or "").strip():
+                source_info["detected_language"] = (
+                    str(probe_data.get("detected_language") or "").strip() or None
+                )
 
         _update_analysis_job_progress(
             job_id,
@@ -655,28 +572,24 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         )
 
         # 2. Get transcript ---------------------------------------------------
-        transcript = None
-        platform = str(source_info.get("platform") or "").strip().lower()
-        external_id = str(source_info.get("external_id") or "").strip() or None
-        if platform == "youtube" and external_id:
-            _update_analysis_job_progress(
-                job_id,
-                35,
-                "fetching_source_captions",
-                billing_state=billing_state,
-            )
-            logger.info("[%s] Attempting to get YouTube transcript ...", job_id)
-            transcript = downloader.get_youtube_transcript(external_id)
-            if transcript:
-                logger.info("[%s] Got transcript from YouTube", job_id)
+        _update_analysis_job_progress(
+            job_id,
+            35,
+            "fetching_source_captions",
+            billing_state=billing_state,
+        )
+
+        def _on_transcript_attempt(step: str):
+            if step in {"youtube_captions", "provider_captions"}:
                 _update_analysis_job_progress(
                     job_id,
-                    60,
+                    35,
                     "fetching_source_captions",
                     billing_state=billing_state,
                 )
 
-        if not transcript:
+        def _transcribe_with_whisper(language_hint: str | None) -> tuple[dict[str, Any], bool]:
+            nonlocal source_media_path, video_path, audio_path, source_info
             if source_info.get("has_audio") is False:
                 raise RuntimeError(
                     "Source does not expose downloadable audio and no source captions were found"
@@ -756,19 +669,45 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             )
             logger.info("[%s] Transcribing with Whisper ...", job_id)
             transcriber = Transcriber()
-            transcript = transcriber.transcribe(audio_path)
-            transcript["source"] = "whisper"
+            transcript_payload = transcriber.transcribe(
+                audio_path,
+                language_hint=language_hint,
+            )
+            transcript_payload["source"] = "whisper"
             _update_analysis_job_progress(
                 job_id,
                 60,
                 "transcribing_audio",
                 billing_state=billing_state,
             )
+            return transcript_payload, True
 
-        analysis_segments, transcript_window_stats = _clip_transcript_for_analysis_window(
+        transcript_resolution = resolve_source_transcript(
+            existing_transcript=None,
+            downloader=downloader,
+            source_url=url,
+            source_platform=str(source_info.get("platform") or "").strip().lower() or None,
+            source_external_id=str(source_info.get("external_id") or "").strip() or None,
+            source_detected_language=str(source_info.get("detected_language") or "").strip() or None,
+            source_has_audio=_as_optional_bool(source_info.get("has_audio")),
+            whisper_fallback=_transcribe_with_whisper,
+            job_id=job_id,
+            on_attempt=_on_transcript_attempt,
+        )
+        transcript = transcript_resolution.transcript
+        transcript_diagnostics = dict(transcript_resolution.diagnostics)
+        if transcript_diagnostics.get("transcript_source") != "whisper":
+            _update_analysis_job_progress(
+                job_id,
+                60,
+                "fetching_source_captions",
+                billing_state=billing_state,
+            )
+
+        analysis_segments, transcript_window_stats = normalize_transcript_for_analysis_window(
             transcript=transcript,
-            processing_start_seconds=processing_start_seconds,
-            processing_end_seconds=processing_end_seconds,
+            start_time=processing_start_seconds,
+            end_time=processing_end_seconds,
         )
         if not analysis_segments:
             raise RuntimeError(
@@ -786,16 +725,35 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             billing_state=billing_state,
         )
         logger.info("[%s] Analysing for %d clips with OpenAI ...", job_id, num_clips)
-        clips = analyzer.find_best_clips(
-            transcript_for_analysis,
-            num_clips=num_clips,
-            min_duration=min_clip_seconds,
-            max_duration=max_clip_seconds,
-            extra_prompt=extra_prompt,
-            video_title=source_info.get("title"),
-            video_platform=source_info.get("platform"),
-            video_duration=float(duration_seconds),
-        )
+        if hasattr(analyzer, "find_best_clips_detailed"):
+            analysis_result = analyzer.find_best_clips_detailed(
+                transcript_for_analysis,
+                num_clips=num_clips,
+                min_duration=min_clip_seconds,
+                max_duration=max_clip_seconds,
+                extra_prompt=extra_prompt,
+                video_title=source_info.get("title"),
+                video_platform=source_info.get("platform"),
+                video_duration=float(duration_seconds),
+            )
+            clips = list(analysis_result.get("clips") or [])
+            analysis_ai_diagnostics = {
+                **analysis_ai_diagnostics,
+                **dict(analysis_result.get("diagnostics") or {}),
+            }
+        else:
+            clips = analyzer.find_best_clips(
+                transcript_for_analysis,
+                num_clips=num_clips,
+                min_duration=min_clip_seconds,
+                max_duration=max_clip_seconds,
+                extra_prompt=extra_prompt,
+                video_title=source_info.get("title"),
+                video_platform=source_info.get("platform"),
+                video_duration=float(duration_seconds),
+            )
+            analysis_ai_diagnostics["candidate_target"] = int(num_clips)
+            analysis_ai_diagnostics["candidate_returned"] = len(clips)
         _update_analysis_job_progress(
             job_id,
             90,
@@ -830,7 +788,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
 
         accepted_ranges: list[tuple[float, float]] = []
 
-        clip_validation_stats["returned_by_ai"] = len(clips)
+        clip_validation_stats["candidate_returned"] = len(clips)
         existing_resp = (
             supabase.table("clips")
             .select("start_time,end_time,title")
@@ -848,6 +806,9 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         }
 
         for clip in clips:
+            if inserted_count >= max(1, int(num_clips)):
+                break
+            clip_validation_stats["candidate_validated"] += 1
             start = _as_float(clip.get("start"))
             end = _as_float(clip.get("end"))
             if start is None or end is None or end <= start:
@@ -968,6 +929,9 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             inserted_count += 1
             clip_validation_stats["accepted"] += 1
 
+        analysis_ai_diagnostics["candidate_validated"] = clip_validation_stats["candidate_validated"]
+        analysis_ai_diagnostics["accepted_clip_count"] = inserted_count
+
         # Charge credits atomically at finalization time.
         _update_analysis_job_progress(
             job_id,
@@ -994,6 +958,14 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             "suggested_clip_count": inserted_count,
             "transcript_window_stats": transcript_window_stats,
             "clip_validation_stats": clip_validation_stats,
+            "transcript_source": transcript_diagnostics.get("transcript_source"),
+            "transcript_language": transcript_diagnostics.get("transcript_language"),
+            "analysis_mode": analysis_ai_diagnostics.get("analysis_mode"),
+            "chunk_count": analysis_ai_diagnostics.get("chunk_count"),
+            "candidate_target": analysis_ai_diagnostics.get("candidate_target"),
+            "candidate_returned": analysis_ai_diagnostics.get("candidate_returned"),
+            "candidate_validated": clip_validation_stats.get("candidate_validated"),
+            "accepted_clip_count": inserted_count,
             "platform": source_info.get("platform"),
         }
 
@@ -1089,6 +1061,19 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 "processing_start_seconds": processing_start_seconds,
                 "processing_end_seconds": processing_end_seconds,
                 "extra_prompt_provided": bool(extra_prompt),
+                "transcript_source": transcript_diagnostics.get("transcript_source"),
+                "transcript_language": transcript_diagnostics.get("transcript_language"),
+                "transcript_reused": transcript_diagnostics.get("transcript_reused"),
+                "transcript_fallback_reason": transcript_diagnostics.get("transcript_fallback_reason"),
+                "provider_track_source": transcript_diagnostics.get("provider_track_source"),
+                "provider_track_ext": transcript_diagnostics.get("provider_track_ext"),
+                "provider_track_language": transcript_diagnostics.get("provider_track_language"),
+                "analysis_mode": analysis_ai_diagnostics.get("analysis_mode"),
+                "chunk_count": analysis_ai_diagnostics.get("chunk_count"),
+                "candidate_target": analysis_ai_diagnostics.get("candidate_target"),
+                "candidate_returned": analysis_ai_diagnostics.get("candidate_returned"),
+                "candidate_validated": clip_validation_stats.get("candidate_validated"),
+                "accepted_clip_count": inserted_count,
                 "transcript_window_stats": transcript_window_stats,
                 "clip_validation_stats": clip_validation_stats,
                 "billing": dict(billing_state),

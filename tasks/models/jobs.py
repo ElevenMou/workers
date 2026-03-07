@@ -21,6 +21,7 @@ class AnalyzeVideoJob(TypedDict):
     sourceThumbnailUrl: NotRequired[str | None]
     sourcePlatform: NotRequired[str | None]
     sourceExternalId: NotRequired[str | None]
+    sourceDetectedLanguage: NotRequired[str | None]
     sourceHasCaptions: NotRequired[bool | None]
     sourceHasAudio: NotRequired[bool | None]
     workspaceTeamId: NotRequired[str | None]

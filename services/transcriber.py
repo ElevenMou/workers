@@ -40,10 +40,27 @@ class Transcriber:
         self.model_name = _resolve_model_name(model_name)
         self.model = _get_model(self.model_name)
 
-    def transcribe(self, audio_path: str) -> dict:
+    @staticmethod
+    def _normalize_language_hint(language_hint: str | None) -> str | None:
+        text = str(language_hint or "").strip().lower()
+        if not text:
+            return None
+        base = text.split("-", 1)[0].split("_", 1)[0].strip()
+        return base or None
+
+    def transcribe(
+        self,
+        audio_path: str,
+        *,
+        language_hint: str | None = None,
+    ) -> dict:
         """Transcribe audio with word-level timestamps."""
         logger.info("Transcribing %s (Whisper model '%s')", audio_path, self.model_name)
-        result = self.model.transcribe(audio_path, word_timestamps=True, language="en")
+        transcribe_kwargs = {"word_timestamps": True}
+        normalized_hint = self._normalize_language_hint(language_hint)
+        if normalized_hint:
+            transcribe_kwargs["language"] = normalized_hint
+        result = self.model.transcribe(audio_path, **transcribe_kwargs)
         language = str(result.get("language") or "en").strip().lower()
         return {
             "text": result["text"],
