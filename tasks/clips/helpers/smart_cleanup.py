@@ -341,23 +341,23 @@ def _snap_interval_to_word_boundaries(
     if snapped_end - snapped_start < _MIN_INTERVAL_SECONDS:
         return (snapped_start, snapped_end)
 
-    overlapped_words = [
-        word
-        for word in words
-        if _interval_overlaps_word(
-            interval_start=snapped_start,
-            interval_end=snapped_end,
-            word_start=float(word["start"]),
-            word_end=float(word["end"]),
-        )
-    ]
-    if not overlapped_words:
-        return (snapped_start, snapped_end)
+    # Shrink the interval away from partially overlapping words so that
+    # removal intervals never cut inside a word.  If the interval start
+    # lands inside a word, push it to that word's end.  If the interval
+    # end lands inside a word, pull it back to that word's start.
+    adjusted_start = snapped_start
+    adjusted_end = snapped_end
+    for word in words:
+        ws = float(word["start"])
+        we = float(word["end"])
+        if ws + 1e-6 < adjusted_start < we - 1e-6:
+            adjusted_start = we
+        if ws + 1e-6 < adjusted_end < we - 1e-6:
+            adjusted_end = ws
 
-    return (
-        max(float(window_start), min(float(word["start"]) for word in overlapped_words)),
-        min(float(window_end), max(float(word["end"]) for word in overlapped_words)),
-    )
+    if adjusted_end - adjusted_start < _MIN_INTERVAL_SECONDS:
+        return (snapped_start, snapped_end)
+    return (adjusted_start, adjusted_end)
 
 
 def _expand_window_to_word_boundaries(
@@ -903,8 +903,10 @@ def plan_balanced_smart_cleanup(
         min_start=effective_window_start,
         max_end=effective_window_end,
     )
-    word_safe_intervals: list[tuple[float, float]] = []
-    for interval_start, interval_end in [*stopword_intervals, *silence_intervals]:
+    # Stopword intervals are already snapped in _build_stopword_intervals,
+    # so only snap silence intervals here.
+    word_safe_intervals: list[tuple[float, float]] = list(stopword_intervals)
+    for interval_start, interval_end in silence_intervals:
         snapped_start, snapped_end = _snap_interval_to_word_boundaries(
             start=interval_start,
             end=interval_end,
@@ -1106,13 +1108,8 @@ def render_condensed_video_from_keep_intervals(
             ffmpeg_lib.input(concat_list_path, format="concat", safe=0)
             .output(
                 output_path,
-                vcodec="libx264",
-                acodec="aac",
-                audio_bitrate="192k",
-                ar=44100,
-                crf=crf,
-                preset=preset,
-                pix_fmt="yuv420p",
+                vcodec="copy",
+                acodec="copy",
                 movflags="+faststart",
             )
             .overwrite_output()
@@ -1126,6 +1123,17 @@ def render_condensed_video_from_keep_intervals(
             stderr_output,
         )
         raise RuntimeError("Smart Cleanup failed while concatenating cleaned segments.") from exc
+
+    # Clean up temporary segment files and concat list.
+    for path in segment_paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    try:
+        os.remove(concat_list_path)
+    except OSError:
+        pass
 
     return _probe_video_duration_seconds(output_path)
 

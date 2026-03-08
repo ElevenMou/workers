@@ -163,24 +163,18 @@ def calculate_video_analysis_cost(duration_seconds: int) -> int:
 
 
 CREDIT_COST_CLIP_GENERATION = 3
-CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE = 1
-_SMART_CLEANUP_SURCHARGE_WAIVED_TIERS = {"basic", "pro", "enterprise"}
-
-
-def smart_cleanup_surcharge_for_tier(tier: str | None) -> int:
-    normalized_tier = str(tier or "").strip().lower()
-    if normalized_tier in _SMART_CLEANUP_SURCHARGE_WAIVED_TIERS:
-        return 0
-    return int(CREDIT_COST_CLIP_SMART_CLEANUP_SURCHARGE)
 
 
 def calculate_clip_generation_cost(
     smart_cleanup_enabled: bool,
     tier: str | None = None,
 ) -> int:
-    """Return clip generation credit cost with optional tier-aware Smart Cleanup surcharge."""
-    surcharge = smart_cleanup_surcharge_for_tier(tier) if smart_cleanup_enabled else 0
-    return int(CREDIT_COST_CLIP_GENERATION) + surcharge
+    """Return clip generation credit cost.
+
+    Smart Cleanup is gated by tier access checks (free tier is blocked),
+    so there is no surcharge — just the base generation cost.
+    """
+    return int(CREDIT_COST_CLIP_GENERATION)
 
 
 def normalize_clip_generation_credits(

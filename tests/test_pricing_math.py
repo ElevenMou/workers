@@ -25,18 +25,15 @@ def test_calculate_video_analysis_cost_rounds_up_started_minutes(
     assert calculate_video_analysis_cost(duration_seconds) == expected_credits
 
 
-def test_calculate_clip_generation_cost_waives_smart_cleanup_surcharge_for_paid_tiers():
+def test_calculate_clip_generation_cost_returns_base_cost_regardless_of_tier():
     assert calculate_clip_generation_cost(False, "basic") == 3
     assert calculate_clip_generation_cost(True, "basic") == 3
     assert calculate_clip_generation_cost(False, "pro") == 3
     assert calculate_clip_generation_cost(True, "pro") == 3
     assert calculate_clip_generation_cost(False, "enterprise") == 3
     assert calculate_clip_generation_cost(True, "enterprise") == 3
-
-
-def test_calculate_clip_generation_cost_keeps_surcharge_for_free_tier():
     assert calculate_clip_generation_cost(False, "free") == 3
-    assert calculate_clip_generation_cost(True, "free") == 4
+    assert calculate_clip_generation_cost(True, "free") == 3
 
 
 def test_calculate_custom_clip_generation_cost_never_drops_below_base_cost():
@@ -45,7 +42,7 @@ def test_calculate_custom_clip_generation_cost_never_drops_below_base_cost():
     assert calculate_custom_clip_generation_cost(False, "pro") == 3
     assert calculate_custom_clip_generation_cost(True, "pro") == 3
     assert calculate_custom_clip_generation_cost(False, "free") == 3
-    assert calculate_custom_clip_generation_cost(True, "free") == 4
+    assert calculate_custom_clip_generation_cost(True, "free") == 3
 
 
 @pytest.mark.parametrize(
