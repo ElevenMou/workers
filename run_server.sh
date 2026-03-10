@@ -49,3 +49,5 @@ if [ "${FOLLOW_LOGS:-false}" = "true" ]; then
 else
   docker compose "${COMPOSE_ARGS[@]}" ps
 fi
+
+# run: sudo bash run_server.sh
