@@ -1,15 +1,51 @@
-# Enter project directory
-cd /opt/clipscut/workers
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Clone your repo (or copy the workers directory)
-git pull https://github.com/ElevenMou/workers.git
+PROJECT_DIR="/opt/clipscut/workers"
+DEFAULT_ENV_FILE=".env"
 
-# Build and run the Docker containers
-docker compose up -d --build
+cd "$PROJECT_DIR"
 
-# Clean old Docker images
-docker system prune -af
-docker image prune -af
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "Expected a git repository at $PROJECT_DIR" >&2
+  exit 1
+fi
 
-# Check logs (optional)
-docker compose logs -f
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is not installed." >&2
+  exit 1
+fi
+
+BRANCH="$(git branch --show-current)"
+if [ -z "$BRANCH" ]; then
+  echo "Could not determine the current git branch." >&2
+  exit 1
+fi
+
+ENV_FILE="${ENV_FILE:-$DEFAULT_ENV_FILE}"
+if [ ! -f "$ENV_FILE" ]; then
+  if [ -f ".env.production" ]; then
+    ENV_FILE=".env.production"
+  else
+    echo "Missing env file. Expected $PROJECT_DIR/.env or $PROJECT_DIR/.env.production" >&2
+    exit 1
+  fi
+fi
+
+COMPOSE_ARGS=(--env-file "$ENV_FILE")
+
+git fetch origin
+git pull --ff-only origin "$BRANCH"
+
+docker compose "${COMPOSE_ARGS[@]}" config >/dev/null
+docker compose "${COMPOSE_ARGS[@]}" up -d --build --remove-orphans
+
+if [ "${RUN_DOCKER_PRUNE:-false}" = "true" ]; then
+  docker image prune -af
+fi
+
+if [ "${FOLLOW_LOGS:-false}" = "true" ]; then
+  docker compose "${COMPOSE_ARGS[@]}" logs -f
+else
+  docker compose "${COMPOSE_ARGS[@]}" ps
+fi

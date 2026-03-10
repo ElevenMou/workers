@@ -83,7 +83,6 @@ services:
       - WORKER_SCALE_ADMIN_USER_IDS=${WORKER_SCALE_ADMIN_USER_IDS:-}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-}
       - CORS_ALLOWED_ORIGIN_REGEX=${CORS_ALLOWED_ORIGIN_REGEX:-}
-      - YTDLP_COOKIES_SOURCE_FILE=/run/secrets/${YTDLP_COOKIES_SECRET_FILE:-youtube-cookies.local.txt}
       - YTDLP_COOKIES_FILE=/tmp/video_clipper/yt-dlp/cookies.txt
       - YTDLP_PROXY=${YTDLP_PROXY:-}
       - YTDLP_PROXY_LIST=${YTDLP_PROXY_LIST:-}
@@ -126,7 +125,6 @@ services:
       retries: 3
       start_period: 60s
     environment:
-      - YTDLP_COOKIES_SOURCE_FILE=/run/secrets/${YTDLP_COOKIES_SECRET_FILE:-youtube-cookies.local.txt}
       - YTDLP_COOKIES_FILE=/tmp/video_clipper/yt-dlp/cookies.txt
       - YTDLP_PROXY=${YTDLP_PROXY:-}
       - YTDLP_PROXY_LIST=${YTDLP_PROXY_LIST:-}
@@ -196,7 +194,6 @@ services:
       retries: 3
       start_period: 60s
     environment:
-      - YTDLP_COOKIES_SOURCE_FILE=/run/secrets/${YTDLP_COOKIES_SECRET_FILE:-youtube-cookies.local.txt}
       - YTDLP_COOKIES_FILE=/tmp/video_clipper/yt-dlp/cookies.txt
       - YTDLP_PROXY=${YTDLP_PROXY:-}
       - YTDLP_PROXY_LIST=${YTDLP_PROXY_LIST:-}

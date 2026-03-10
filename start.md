@@ -90,7 +90,6 @@ POLAR_USAGE_EVENT_TIMEOUT_SECONDS=5
 Notes:
 - `PURGE_QUEUED_JOBS_ON_START` now defaults to `false` and should stay `false` in production.
 - Legacy `ANTHROPIC_API_KEY` and `CLAUDE_ANALYZER_*` env vars are still accepted during the migration window, but new deployments should use the `OPENAI_*` names above.
-- Docker compose mounts `./secrets` into `/run/secrets` automatically. If you need logged-in YouTube cookies, place an exported Netscape cookie file at `workers/secrets/youtube-cookies.local.txt` or override `YTDLP_COOKIES_SECRET_DIR` / `YTDLP_COOKIES_SECRET_FILE`. If the file is absent, the stack now starts without cookies.
 - Run a dedicated `maintenance-supervisor` instance with `SUPERVISOR_ROLE=maintenance`.
 - Use `WORKER_SCALE_ADMIN_USER_IDS` (comma-separated) to allow `/workers/scale` admin access.
 - Mutating API routes (`/videos/analyze`, `/clips/generate`, `/clips/custom`, `/workers/scale`) now require a valid `Authorization: Bearer <supabase-jwt>` header.
