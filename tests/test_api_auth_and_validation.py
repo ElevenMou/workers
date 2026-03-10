@@ -898,6 +898,176 @@ def test_analyze_video_queues_range_based_analysis_credits(client, monkeypatch):
     assert enqueued_payload["sourceHasAudio"] is True
 
 
+def test_analyze_video_supersedes_prior_active_jobs_for_same_video(client, monkeypatch):
+    from api_app.app import app
+
+    class _FakeAnalyzeSupersedeQuery:
+        def __init__(self, store: "_FakeAnalyzeSupersedeSupabase", table_name: str):
+            self.store = store
+            self.table_name = table_name
+            self._mode = "select"
+            self._payload = None
+            self._eq_filters: dict[str, object] = {}
+            self._in_filters: dict[str, set[object]] = {}
+            self._is_null_filters: dict[str, bool] = {}
+
+        def select(self, *_args, **_kwargs):
+            self._mode = "select"
+            return self
+
+        def upsert(self, payload, **_kwargs):
+            self._mode = "upsert"
+            self._payload = dict(payload)
+            return self
+
+        def update(self, payload):
+            self._mode = "update"
+            self._payload = dict(payload)
+            return self
+
+        def eq(self, key, value):
+            self._eq_filters[str(key)] = value
+            return self
+
+        def in_(self, key, values):
+            self._in_filters[str(key)] = set(values)
+            return self
+
+        def is_(self, key, value):
+            self._is_null_filters[str(key)] = value == "null"
+            return self
+
+        def order(self, *_args, **_kwargs):
+            return self
+
+        def limit(self, *_args, **_kwargs):
+            return self
+
+        def execute(self):
+            if self.table_name == "videos" and self._mode == "select":
+                return _FakeResponse(data=[{"id": self.store.video_id}])
+
+            if self.table_name == "videos" and self._mode == "upsert":
+                self.store.video_upserts.append(dict(self._payload or {}))
+                return _FakeResponse(data=[self._payload] if self._payload else [])
+
+            if self.table_name == "jobs" and self._mode == "upsert":
+                payload = dict(self._payload or {})
+                self.store.job_upserts.append(payload)
+                self.store.jobs.insert(0, payload)
+                return _FakeResponse(data=[payload])
+
+            if self.table_name == "jobs" and self._mode == "update":
+                self.store.job_updates.append(
+                    {
+                        "payload": dict(self._payload or {}),
+                        "filters": dict(self._eq_filters),
+                    }
+                )
+                return _FakeResponse(data=[self._payload] if self._payload else [])
+
+            if self.table_name == "jobs" and self._mode == "select":
+                rows = list(self.store.jobs)
+                for key, value in self._eq_filters.items():
+                    rows = [row for row in rows if row.get(key) == value]
+                for key, values in self._in_filters.items():
+                    rows = [row for row in rows if row.get(key) in values]
+                for key, expect_null in self._is_null_filters.items():
+                    rows = [row for row in rows if (row.get(key) is None) == expect_null]
+                return _FakeResponse(data=rows)
+
+            raise AssertionError(f"Unexpected query mode {self._mode} for {self.table_name}")
+
+    class _FakeAnalyzeSupersedeSupabase:
+        def __init__(self):
+            self.video_id = "video-existing"
+            self.video_upserts: list[dict] = []
+            self.job_upserts: list[dict] = []
+            self.job_updates: list[dict] = []
+            self.jobs = [
+                {
+                    "id": "job-old-retrying",
+                    "video_id": self.video_id,
+                    "type": "analyze_video",
+                    "status": "retrying",
+                    "user_id": "user-id",
+                    "team_id": None,
+                },
+                {
+                    "id": "job-old-processing",
+                    "video_id": self.video_id,
+                    "type": "analyze_video",
+                    "status": "processing",
+                    "user_id": "user-id",
+                    "team_id": None,
+                },
+            ]
+
+        def table(self, name: str):
+            if name in {"videos", "jobs"}:
+                return _FakeAnalyzeSupersedeQuery(self, name)
+            raise AssertionError(f"Unexpected table access: {name}")
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+
+    fake_supabase = _FakeAnalyzeSupersedeSupabase()
+    monkeypatch.setattr(videos_router, "supabase", fake_supabase)
+    monkeypatch.setattr(videos_router, "raise_on_error", lambda *_a, **_k: None)
+    monkeypatch.setattr(videos_router, "enforce_monthly_video_limit", lambda *_a, **_k: None)
+    monkeypatch.setattr(videos_router, "enqueue_or_fail", lambda **_k: None)
+    monkeypatch.setattr(videos_router, "has_sufficient_credits", lambda **_k: True)
+    monkeypatch.setattr(videos_router, "get_credit_balance", lambda _user_id: 999)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_args, **_kwargs: access_rules.UserAccessContext(
+            tier="pro",
+            status="active",
+            interval="month",
+            max_videos_per_month=220,
+            max_clip_duration_seconds=300,
+            max_analysis_duration_seconds=2 * 60 * 60,
+            allow_custom_clips=True,
+            max_active_jobs=5,
+        ),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_probe_credit_cost_for_url",
+        lambda _url: {
+            "valid_url": True,
+            "analysis_credits": 10,
+            "duration_seconds": 10 * 60,
+            "video_title": "Queued metadata title",
+            "thumbnail_url": "https://example.com/thumb.jpg",
+            "platform": "youtube",
+            "external_id": "yt123",
+            "has_captions": True,
+            "has_audio": True,
+        },
+    )
+
+    response = client.post(
+        "/videos/analyze",
+        json={
+            "url": "https://www.youtube.com/watch?v=FWkVBjcVw18",
+            "numClips": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    superseded_ids = {
+        update["filters"].get("id")
+        for update in fake_supabase.job_updates
+        if update["payload"].get("status") == "failed"
+    }
+    assert superseded_ids == {"job-old-retrying", "job-old-processing"}
+
+
 def test_analyze_video_accepts_explicit_clip_length_range(client, monkeypatch):
     from api_app.app import app
 

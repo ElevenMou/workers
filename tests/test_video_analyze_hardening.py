@@ -323,6 +323,11 @@ def _install_common_patches(
         "AIAnalyzer",
         lambda: SimpleNamespace(find_best_clips=lambda *_a, **_k: list(analyzer_clips)),
     )
+    monkeypatch.setattr(
+        analyze_task_module,
+        "_is_latest_analyze_job_for_video",
+        lambda **_k: True,
+    )
 
     if transcriber_factory is None:
         transcriber_factory = lambda: SimpleNamespace(
@@ -589,6 +594,11 @@ def test_marks_failed_when_initializer_errors(monkeypatch, tmp_path: Path):
     failed_video_calls: list[tuple[str, dict[str, Any]]] = []
 
     monkeypatch.setattr(analyze_task_module, "create_work_dir", lambda _name: str(tmp_path))
+    monkeypatch.setattr(
+        analyze_task_module,
+        "_is_latest_analyze_job_for_video",
+        lambda **_k: True,
+    )
     monkeypatch.setattr(analyze_task_module, "has_sufficient_credits", lambda **_k: True)
     monkeypatch.setattr(analyze_task_module, "reserve_credits", lambda **_k: "res-1")
     monkeypatch.setattr(analyze_task_module, "capture_credit_reservation", lambda **_k: True)
@@ -606,6 +616,60 @@ def test_marks_failed_when_initializer_errors(monkeypatch, tmp_path: Path):
 
     assert any(call["args"][1] == "failed" for call in failed_job_calls)
     assert any(status == "failed" for status, _ in failed_video_calls)
+
+
+def test_superseded_analyze_job_exits_before_processing(monkeypatch, tmp_path: Path):
+    supabase = _FakeSupabase()
+    downloader = _FakeDownloader(work_dir=str(tmp_path), transcript=_base_transcript(), duration_seconds=180)
+    state = _install_common_patches(
+        monkeypatch,
+        tmp_path=tmp_path,
+        supabase=supabase,
+        downloader=downloader,
+        analyzer_clips=[],
+    )
+    monkeypatch.setattr(
+        analyze_task_module,
+        "_is_latest_analyze_job_for_video",
+        lambda **_k: False,
+    )
+
+    analyze_task_module.analyze_video_task(_job_data(jobId="job-stale", videoId="video-stale"))
+
+    assert downloader.probe_calls == 0
+    assert downloader.download_calls == 0
+    assert state["capture_calls"] == []
+    failed_jobs = [u for u in state["job_updates"] if u["status"] == "failed"]
+    assert failed_jobs
+    assert failed_jobs[-1]["result_data"]["stage"] == "superseded"
+
+
+def test_superseded_analyze_job_releases_reservation_before_saving(monkeypatch, tmp_path: Path):
+    supabase = _FakeSupabase()
+    downloader = _FakeDownloader(work_dir=str(tmp_path), transcript=_base_transcript(), duration_seconds=180)
+    state = _install_common_patches(
+        monkeypatch,
+        tmp_path=tmp_path,
+        supabase=supabase,
+        downloader=downloader,
+        analyzer_clips=[],
+    )
+    stale_checks = iter([True, False])
+    monkeypatch.setattr(
+        analyze_task_module,
+        "_is_latest_analyze_job_for_video",
+        lambda **_k: next(stale_checks),
+    )
+
+    analyze_task_module.analyze_video_task(_job_data(jobId="job-stale-late", videoId="video-stale-late"))
+
+    assert state["release_calls"] == ["res-1"]
+    assert state["capture_calls"] == []
+    completed_jobs = [u for u in state["job_updates"] if u["status"] == "completed"]
+    assert completed_jobs == []
+    failed_jobs = [u for u in state["job_updates"] if u["status"] == "failed"]
+    assert failed_jobs
+    assert failed_jobs[-1]["result_data"]["stage"] == "superseded"
 
 
 def test_analysis_transcript_is_strictly_clipped_to_processing_window(monkeypatch, tmp_path: Path):

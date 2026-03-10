@@ -1,6 +1,7 @@
 """Video analysis and credit-cost endpoints."""
 
 import asyncio
+from datetime import datetime, timezone
 from math import ceil
 from uuid import uuid4
 
@@ -42,6 +43,7 @@ from utils.supabase_client import (
 router = APIRouter()
 _STANDARD_VIDEO_QUEUE = "video-processing"
 _PRIORITY_VIDEO_QUEUE = "video-processing-priority"
+_ACTIVE_ANALYZE_JOB_STATUSES = ("queued", "processing", "retrying")
 _ANALYZE_CLIP_MIN_SECONDS = 10
 _DEFAULT_ANALYZE_LEGACY_CLIP_SECONDS = 90
 
@@ -51,6 +53,92 @@ def _best_effort_delete_video(video_id: str):
         supabase.table("videos").delete().eq("id", video_id).execute()
     except Exception as exc:
         logger.warning("Failed cleanup delete for video %s: %s", video_id, exc)
+
+
+def _best_effort_supersede_prior_analyze_jobs(
+    *,
+    video_id: str,
+    keep_job_id: str,
+    workspace_team_id: str | None,
+    actor_user_id: str,
+):
+    reason = (
+        "Superseded by a newer video analysis request for the same source. "
+        "This job exited without charging credits."
+    )
+    now_utc = datetime.now(timezone.utc).isoformat()
+
+    try:
+        active_job_query = (
+            supabase.table("jobs")
+            .select("id,status")
+            .eq("video_id", video_id)
+            .eq("type", "analyze_video")
+            .in_("status", list(_ACTIVE_ANALYZE_JOB_STATUSES))
+        )
+        if workspace_team_id:
+            active_job_query = active_job_query.eq("team_id", workspace_team_id)
+        else:
+            active_job_query = active_job_query.eq("user_id", actor_user_id).is_("team_id", "null")
+
+        active_job_resp = (
+            active_job_query
+            .order("created_at", desc=True)
+            .order("id", desc=True)
+            .execute()
+        )
+        raise_on_error(active_job_resp, "Failed to load active analyze jobs for supersede")
+        active_jobs = list(active_job_resp.data or [])
+    except Exception as exc:
+        logger.warning(
+            "Failed to inspect prior analyze jobs for video %s: %s",
+            video_id,
+            exc,
+        )
+        return
+
+    superseded_count = 0
+    for row in active_jobs:
+        prior_job_id = str(row.get("id") or "").strip()
+        if not prior_job_id or prior_job_id == keep_job_id:
+            continue
+
+        try:
+            resp = (
+                supabase.table("jobs")
+                .update(
+                    {
+                        "status": "failed",
+                        "progress": 0,
+                        "completed_at": now_utc,
+                        "error_message": reason,
+                        "result_data": {
+                            "stage": "superseded",
+                            "detail_key": "superseded_by_newer_request",
+                            "video_id": video_id,
+                        },
+                    }
+                )
+                .eq("id", prior_job_id)
+                .execute()
+            )
+            raise_on_error(resp, f"Failed to mark prior analyze job {prior_job_id} superseded")
+            superseded_count += 1
+        except Exception as exc:
+            logger.warning(
+                "Failed to mark prior analyze job %s superseded for video %s: %s",
+                prior_job_id,
+                video_id,
+                exc,
+            )
+
+    if superseded_count:
+        logger.info(
+            "Superseded %d prior analyze job(s) for video=%s in favor of job=%s",
+            superseded_count,
+            video_id,
+            keep_job_id,
+        )
 
 
 def _video_queue_for_context(context: UserAccessContext) -> str:
@@ -471,6 +559,12 @@ async def analyze_video(
         job_type="analyze_video",
         video_id=video_id,
         on_queue_full_cleanup=_cleanup_analyze_queue_full,
+    )
+    _best_effort_supersede_prior_analyze_jobs(
+        video_id=video_id,
+        keep_job_id=job_id,
+        workspace_team_id=access_context.workspace_team_id,
+        actor_user_id=user_id,
     )
 
     return AnalyzeVideoResponse(jobId=job_id, videoId=video_id, status="queued")

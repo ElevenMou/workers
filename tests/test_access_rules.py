@@ -123,3 +123,31 @@ def test_enforce_analysis_duration_limit_blocks_when_over_cap():
 
     assert exc_info.value.status_code == 400
     assert "20 minutes" in str(exc_info.value.detail).lower()
+
+
+def test_count_logical_active_jobs_dedupes_superseded_analyze_rows():
+    rows = [
+        {
+            "id": "job-new",
+            "type": "analyze_video",
+            "video_id": "video-1",
+            "clip_id": None,
+            "created_at": "2026-03-10T01:00:00+00:00",
+        },
+        {
+            "id": "job-old",
+            "type": "analyze_video",
+            "video_id": "video-1",
+            "clip_id": None,
+            "created_at": "2026-03-10T00:59:00+00:00",
+        },
+        {
+            "id": "job-generate",
+            "type": "generate_clip",
+            "video_id": "video-2",
+            "clip_id": "clip-1",
+            "created_at": "2026-03-10T00:58:00+00:00",
+        },
+    ]
+
+    assert access_rules._count_logical_active_jobs(rows, max_rows=5) == 2

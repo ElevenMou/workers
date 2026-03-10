@@ -12,6 +12,7 @@ from utils.supabase_client import assert_response_ok, supabase
 
 FREE_MAX_CONCURRENT_JOBS = 1
 _ACTIVE_JOB_STATUSES = ("queued", "processing", "retrying")
+_ACTIVE_JOB_SCAN_LIMIT = 200
 _MAX_CLIP_DURATION_SECONDS_BY_TIER: dict[str, int] = {
     "free": 60,
     "basic": 120,
@@ -78,6 +79,42 @@ _DEFAULT_PLAN_LIMITS_BY_TIER: dict[str, dict[str, int | bool | None]] = {
     },
 }
 logger = logging.getLogger(__name__)
+
+
+def _active_job_deduplication_key(row: dict) -> tuple[str, str] | None:
+    job_type = str(row.get("type") or "").strip().lower()
+    if job_type == "analyze_video":
+        video_id = str(row.get("video_id") or "").strip()
+        if video_id:
+            return ("analyze_video", video_id)
+    if job_type == "generate_clip":
+        clip_id = str(row.get("clip_id") or "").strip()
+        if clip_id:
+            return ("generate_clip", clip_id)
+    return None
+
+
+def _count_logical_active_jobs(rows: list[dict], *, max_rows: int) -> int:
+    count = 0
+    seen_keys: set[tuple[str, str]] = set()
+
+    for row in rows:
+        key = _active_job_deduplication_key(row)
+        if key is None:
+            job_id = str(row.get("id") or "").strip()
+            if not job_id:
+                continue
+            key = ("job", job_id)
+
+        if key in seen_keys:
+            continue
+
+        seen_keys.add(key)
+        count += 1
+        if count >= max_rows:
+            return count
+
+    return count
 
 
 def _default_max_clip_duration_for_tier(tier: str) -> int:
@@ -363,28 +400,32 @@ def _count_active_jobs_for_owner(
         try:
             response = (
                 supabase_client.table("jobs")
-                .select("id")
+                .select("id,type,clip_id,video_id,created_at")
                 .eq("billing_owner_user_id", owner_user_id)
                 .in_("status", list(_ACTIVE_JOB_STATUSES))
-                .limit(max_rows)
+                .order("created_at", desc=True)
+                .order("id", desc=True)
+                .limit(max(_ACTIVE_JOB_SCAN_LIMIT, max_rows))
                 .execute()
             )
             assert_response_ok(response, f"Failed to load active jobs for owner={owner_user_id}")
-            return len(response.data or [])
+            return _count_logical_active_jobs(list(response.data or []), max_rows=max_rows)
         except Exception:
             fallback_response = (
                 supabase_client.table("jobs")
-                .select("id")
+                .select("id,type,clip_id,video_id,created_at")
                 .eq("user_id", owner_user_id)
                 .in_("status", list(_ACTIVE_JOB_STATUSES))
-                .limit(max_rows)
+                .order("created_at", desc=True)
+                .order("id", desc=True)
+                .limit(max(_ACTIVE_JOB_SCAN_LIMIT, max_rows))
                 .execute()
             )
             assert_response_ok(
                 fallback_response,
                 f"Failed to load active jobs fallback for owner={owner_user_id}",
             )
-            return len(fallback_response.data or [])
+            return _count_logical_active_jobs(list(fallback_response.data or []), max_rows=max_rows)
     except Exception as exc:  # pragma: no cover - defensive fallback
         logger.warning("Failed to read active jobs for owner=%s: %s", owner_user_id, exc)
         return 0

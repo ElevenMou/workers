@@ -238,6 +238,47 @@ def _update_analysis_job_progress(
     )
 
 
+def _is_latest_analyze_job_for_video(*, job_id: str, video_id: str) -> bool:
+    latest_job_resp = (
+        supabase.table("jobs")
+        .select("id")
+        .eq("video_id", video_id)
+        .eq("type", "analyze_video")
+        .order("created_at", desc=True)
+        .order("id", desc=True)
+        .limit(1)
+        .execute()
+    )
+    assert_response_ok(latest_job_resp, f"Failed to load latest analyze job for video {video_id}")
+    latest_jobs = latest_job_resp.data or []
+    if not latest_jobs:
+        return True
+
+    latest_job_id = latest_jobs[0].get("id")
+    return latest_job_id == job_id
+
+
+def _best_effort_mark_superseded(*, job_id: str, video_id: str):
+    reason = (
+        "Superseded by a newer video analysis request for the same source. "
+        "This job exited without charging credits."
+    )
+    try:
+        update_job_status(
+            job_id,
+            "failed",
+            0,
+            reason,
+            result_data={
+                "stage": "superseded",
+                "detail_key": "superseded_by_newer_request",
+                "video_id": video_id,
+            },
+        )
+    except Exception as exc:
+        logger.warning("[%s] Failed to mark analyze job superseded: %s", job_id, exc)
+
+
 def _best_effort_mark_failed(*, job_id: str, video_id: str, error_msg: str):
     try:
         update_job_status(job_id, "failed", 0, error_msg)
@@ -260,6 +301,57 @@ def _has_retries_remaining() -> bool:
         return int(getattr(current, "retries_left", 0) or 0) > 0
     except Exception:
         return False
+
+
+def _release_pending_analysis_reservation(
+    *,
+    job_id: str,
+    charge_source: str,
+    reservation_id: str | None,
+    reservation_captured: bool,
+    billing_state: dict[str, Any],
+):
+    if charge_source != "owner_wallet" or not reservation_id or reservation_captured:
+        return
+
+    try:
+        release_credit_reservation(reservation_id=reservation_id)
+        billing_state["status"] = "released"
+    except Exception as exc:
+        logger.warning(
+            "[%s] Failed to release superseded analysis credit reservation %s: %s",
+            job_id,
+            reservation_id,
+            exc,
+        )
+
+
+def _should_exit_for_newer_analyze_job(
+    *,
+    job_id: str,
+    video_id: str,
+    charge_source: str,
+    reservation_id: str | None,
+    reservation_captured: bool,
+    billing_state: dict[str, Any],
+) -> bool:
+    if _is_latest_analyze_job_for_video(job_id=job_id, video_id=video_id):
+        return False
+
+    logger.info(
+        "[%s] Skipping analysis for video %s because a newer job is active",
+        job_id,
+        video_id,
+    )
+    _release_pending_analysis_reservation(
+        job_id=job_id,
+        charge_source=charge_source,
+        reservation_id=reservation_id,
+        reservation_captured=reservation_captured,
+        billing_state=billing_state,
+    )
+    _best_effort_mark_superseded(job_id=job_id, video_id=video_id)
+    return True
 
 
 def _count_video_clips(video_id: str) -> int:
@@ -379,6 +471,16 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
 
     try:
         _update_analysis_job_progress(job_id, 0, "starting", billing_state=billing_state)
+
+        if _should_exit_for_newer_analyze_job(
+            job_id=job_id,
+            video_id=video_id,
+            charge_source=charge_source,
+            reservation_id=reservation_id,
+            reservation_captured=reservation_captured,
+            billing_state=billing_state,
+        ):
+            return
 
         if expected_credits > 0 and not has_sufficient_credits(
             user_id=billing_owner_user_id,
@@ -754,6 +856,17 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             )
             analysis_ai_diagnostics["candidate_target"] = int(num_clips)
             analysis_ai_diagnostics["candidate_returned"] = len(clips)
+
+        if _should_exit_for_newer_analyze_job(
+            job_id=job_id,
+            video_id=video_id,
+            charge_source=charge_source,
+            reservation_id=reservation_id,
+            reservation_captured=reservation_captured,
+            billing_state=billing_state,
+        ):
+            return
+
         _update_analysis_job_progress(
             job_id,
             90,
