@@ -5,6 +5,10 @@ import time
 from typing import Any, Dict, List
 
 from openai import NotFoundError, OpenAI
+try:
+    from openai import LengthFinishReasonError
+except ImportError:  # older SDK versions
+    LengthFinishReasonError = None  # type: ignore[assignment,misc]
 from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
@@ -311,6 +315,43 @@ class AIAnalyzer:
         return out
 
     @staticmethod
+    def _repair_truncated_json(text: str) -> str | None:
+        """Attempt to repair JSON truncated by a max_tokens limit.
+
+        The model typically produces ``{"clips": [{...}, {...]`` before
+        hitting the token limit.  We try progressively simpler closings
+        to recover whatever complete clip objects exist.
+        """
+        # Find the start of the JSON object.
+        start = text.find("{")
+        if start == -1:
+            return None
+        fragment = text[start:]
+
+        # Strategy 1: close the array + object  (``]}`` or ``]}``)
+        for suffix in ("]}", "]}"):
+            candidate = fragment.rstrip().rstrip(",") + suffix
+            try:
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                pass
+
+        # Strategy 2: trim back to the last complete object in the clips
+        # array, then close.  Look for ``}, {`` boundaries and try from
+        # the rightmost one.
+        last_obj_end = fragment.rfind("},")
+        while last_obj_end > 0:
+            candidate = fragment[: last_obj_end + 1] + "]}"
+            try:
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                last_obj_end = fragment.rfind("},", 0, last_obj_end)
+
+        return None
+
+    @staticmethod
     def _extract_json_payload(response_text: str) -> str:
         """Extract a JSON object payload from raw model output."""
         text = (response_text or "").strip()
@@ -332,9 +373,21 @@ class AIAnalyzer:
 
         start_idx = text.find("{")
         end_idx = text.rfind("}")
-        if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
-            raise ValueError("Analyzer response did not contain a JSON object payload")
-        return text[start_idx : end_idx + 1]
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            return text[start_idx : end_idx + 1]
+
+        # The response may be truncated (e.g. max_tokens reached).
+        # Try to repair the JSON by closing open brackets.
+        repaired = AIAnalyzer._repair_truncated_json(text)
+        if repaired is not None:
+            logger.warning(
+                "Repaired truncated JSON response (%d chars → %d chars)",
+                len(text),
+                len(repaired),
+            )
+            return repaired
+
+        raise ValueError("Analyzer response did not contain a JSON object payload")
 
     @staticmethod
     def _as_float(value: Any) -> float | None:
@@ -517,16 +570,45 @@ class AIAnalyzer:
             transient_attempts = 0
             while True:
                 try:
-                    completion = self.client.beta.chat.completions.parse(
-                        model=candidate_model,
-                        max_completion_tokens=max_tokens,
-                        temperature=0,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_message},
-                        ],
-                        response_format=ClipAnalysisResponse,
-                    )
+                    try:
+                        completion = self.client.beta.chat.completions.parse(
+                            model=candidate_model,
+                            max_completion_tokens=max_tokens,
+                            temperature=0,
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_message},
+                            ],
+                            response_format=ClipAnalysisResponse,
+                        )
+                    except Exception as length_exc:
+                        # Handle LengthFinishReasonError: the model hit
+                        # max_tokens before completing the structured output.
+                        # Extract the partial completion so downstream parsing
+                        # can salvage whatever clips were generated.
+                        if (
+                            LengthFinishReasonError is not None
+                            and isinstance(length_exc, LengthFinishReasonError)
+                        ):
+                            partial = getattr(length_exc, "completion", None)
+                            if partial is not None:
+                                logger.warning(
+                                    "OpenAI structured output truncated at %d tokens "
+                                    "(max_tokens=%d) on model '%s'. "
+                                    "Attempting to salvage partial response.",
+                                    getattr(
+                                        getattr(partial, "usage", None),
+                                        "completion_tokens",
+                                        0,
+                                    ),
+                                    max_tokens,
+                                    candidate_model,
+                                )
+                                completion = partial
+                            else:
+                                raise
+                        else:
+                            raise
                     if candidate_model != configured_name:
                         logger.warning(
                             "Configured OpenAI model '%s' unavailable; using fallback '%s'.",
@@ -852,7 +934,9 @@ class AIAnalyzer:
             f"{transcript_text}"
             f"{extra_section}"
         )
-        max_tokens = min(8192, max(1024, request_count * 400 + 200))
+        # Each clip in structured output uses ~500-600 tokens (title, hook,
+        # summary, reasoning, tags, etc.). Use 600 per clip + 400 overhead.
+        max_tokens = min(16384, max(2048, request_count * 600 + 400))
         clips = self._request_clip_candidates(
             max_tokens=max_tokens,
             system_prompt=system_prompt,
@@ -1064,7 +1148,7 @@ class AIAnalyzer:
             lines.extend(["Additional user guidance:", extra_prompt_text, ""])
 
         user_message = "\n".join(line for line in lines if line is not None).strip()
-        max_tokens = min(8192, max(1600, candidate_target * 420 + 400))
+        max_tokens = min(30000, max(2048, candidate_target * 600 + 400))
         reranked = self._request_clip_candidates(
             max_tokens=max_tokens,
             system_prompt=_SYNTHESIS_SYSTEM_PROMPT,
