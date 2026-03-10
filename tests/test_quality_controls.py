@@ -9,7 +9,7 @@ def test_high_quality_controls_force_fidelity_mode():
 
     assert controls.effective_source_max_height is None
     assert controls.prefer_fresh_source_download is True
-    assert controls.allow_upload_reencode is False
+    assert controls.allow_upload_reencode is True
     assert controls.smart_cleanup_crf == 10
     assert controls.smart_cleanup_preset == "slow"
 

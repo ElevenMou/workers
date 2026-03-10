@@ -221,10 +221,7 @@ def _run_maintenance_loop(
         max(5, int(leader_lock_ttl_seconds)),
         renew_every,
     )
-    should_warm_whisper = (
-        os.getenv("MAINTENANCE_WARM_WHISPER", "true").strip().lower()
-        in {"1", "true", "yes", "on"}
-    )
+    should_warm_whisper = env_bool("MAINTENANCE_WARM_WHISPER", False)
     if should_warm_whisper:
         try:
             from services.transcriber import Transcriber

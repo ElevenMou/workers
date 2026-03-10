@@ -849,13 +849,25 @@ def update_job_status(
     if action:
         data["action"] = action
 
-    resp = supabase.table("jobs").update(data).eq("id", job_id).execute()
-    if action:
-        resp_error = getattr(resp, "error", None)
-        if resp_error and _is_missing_column_error(resp_error, "action"):
-            fallback_data = dict(data)
-            fallback_data.pop("action", None)
-            resp = supabase.table("jobs").update(fallback_data).eq("id", job_id).execute()
+    fallback_data = dict(data)
+    fallback_data.pop("action", None)
+
+    try:
+        resp = supabase.table("jobs").update(data).eq("id", job_id).execute()
+    except Exception as exc:
+        if not action or not _is_missing_column_error(exc, "action"):
+            raise
+        resp = supabase.table("jobs").update(fallback_data).eq("id", job_id).execute()
+    else:
+        if action:
+            resp_error = getattr(resp, "error", None)
+            if resp_error and _is_missing_column_error(resp_error, "action"):
+                resp = (
+                    supabase.table("jobs")
+                    .update(fallback_data)
+                    .eq("id", job_id)
+                    .execute()
+                )
     assert_response_ok(resp, f"Failed to update job status for {job_id}")
 
     if status in {"completed", "failed"}:

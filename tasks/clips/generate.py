@@ -133,6 +133,50 @@ def _is_missing_action_column_error(exc: Exception) -> bool:
     )
 
 
+def _update_failed_clip_record(*, clip_id: str, payload: dict):
+    try:
+        response = (
+            supabase.table("clips")
+            .update(payload)
+            .eq("id", clip_id)
+            .execute()
+        )
+    except Exception as exc:
+        if not _is_missing_action_column_error(exc):
+            raise
+        fallback_payload = dict(payload)
+        fallback_payload.pop("action", None)
+        fallback_response = (
+            supabase.table("clips")
+            .update(fallback_payload)
+            .eq("id", clip_id)
+            .execute()
+        )
+        assert_response_ok(
+            fallback_response,
+            f"Failed to mark clip {clip_id} failed (fallback without action)",
+        )
+        return
+
+    try:
+        assert_response_ok(response, f"Failed to mark clip {clip_id} failed")
+    except Exception as exc:
+        if not _is_missing_action_column_error(exc):
+            raise
+        fallback_payload = dict(payload)
+        fallback_payload.pop("action", None)
+        fallback_response = (
+            supabase.table("clips")
+            .update(fallback_payload)
+            .eq("id", clip_id)
+            .execute()
+        )
+        assert_response_ok(
+            fallback_response,
+            f"Failed to mark clip {clip_id} failed (fallback without action)",
+        )
+
+
 def _best_effort_mark_failed(*, job_id: str, clip_id: str, error_msg: str):
     try:
         update_job_status(job_id, "failed", 0, error_msg, action="retry")
@@ -141,29 +185,7 @@ def _best_effort_mark_failed(*, job_id: str, clip_id: str, error_msg: str):
 
     try:
         payload = {"status": "failed", "error_message": error_msg, "action": "retry"}
-        fail_resp = (
-            supabase.table("clips")
-            .update(payload)
-            .eq("id", clip_id)
-            .execute()
-        )
-        try:
-            assert_response_ok(fail_resp, f"Failed to mark clip {clip_id} failed")
-        except Exception as exc:
-            if not _is_missing_action_column_error(exc):
-                raise
-            fallback_payload = dict(payload)
-            fallback_payload.pop("action", None)
-            fallback_resp = (
-                supabase.table("clips")
-                .update(fallback_payload)
-                .eq("id", clip_id)
-                .execute()
-            )
-            assert_response_ok(
-                fallback_resp,
-                f"Failed to mark clip {clip_id} failed (fallback without action)",
-            )
+        _update_failed_clip_record(clip_id=clip_id, payload=payload)
     except Exception as exc:
         logger.warning("[%s] Failed to mark clip %s failed: %s", job_id, clip_id, exc)
 

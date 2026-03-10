@@ -23,9 +23,16 @@ class _FakeResponse:
 
 
 class _FakeTableQuery:
-    def __init__(self, store: list[dict[str, object]], table_name: str):
+    def __init__(
+        self,
+        store: list[dict[str, object]],
+        table_name: str,
+        *,
+        raise_on_action_tables: set[str] | None = None,
+    ):
         self._store = store
         self._table_name = table_name
+        self._raise_on_action_tables = set(raise_on_action_tables or set())
         self._payload: dict[str, object] | None = None
         self._filters: dict[str, object] = {}
 
@@ -44,6 +51,14 @@ class _FakeTableQuery:
             "filters": dict(self._filters),
         }
         self._store.append(call)
+        if (
+            self._table_name in self._raise_on_action_tables
+            and "action" in call["payload"]
+            and call["payload"]["action"]
+        ):
+            raise RuntimeError(
+                f"Could not find the 'action' column of '{self._table_name}' in the schema cache"
+            )
         if self._table_name == "jobs" and "action" in call["payload"] and call["payload"]["action"]:
             # Simulate environments where the jobs.action column has not been deployed yet.
             return _FakeResponse(
@@ -53,11 +68,21 @@ class _FakeTableQuery:
 
 
 class _FakeSupabase:
-    def __init__(self, store: list[dict[str, object]]):
+    def __init__(
+        self,
+        store: list[dict[str, object]],
+        *,
+        raise_on_action_tables: set[str] | None = None,
+    ):
         self._store = store
+        self._raise_on_action_tables = set(raise_on_action_tables or set())
 
     def table(self, table_name: str):
-        return _FakeTableQuery(self._store, table_name)
+        return _FakeTableQuery(
+            self._store,
+            table_name,
+            raise_on_action_tables=self._raise_on_action_tables,
+        )
 
 
 def test_update_job_status_falls_back_without_action_column(monkeypatch):
@@ -66,6 +91,28 @@ def test_update_job_status_falls_back_without_action_column(monkeypatch):
 
     supabase_client.update_job_status(
         job_id="job-1",
+        status="failed",
+        progress=0,
+        error="boom",
+        action="retry",
+    )
+
+    assert calls[0]["table"] == "jobs"
+    assert calls[0]["payload"]["action"] == "retry"
+    assert calls[1]["table"] == "jobs"
+    assert "action" not in calls[1]["payload"]
+
+
+def test_update_job_status_falls_back_when_action_column_error_raises(monkeypatch):
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        supabase_client,
+        "supabase",
+        _FakeSupabase(calls, raise_on_action_tables={"jobs"}),
+    )
+
+    supabase_client.update_job_status(
+        job_id="job-raise",
         status="failed",
         progress=0,
         error="boom",
@@ -104,6 +151,34 @@ def test_generate_mark_failed_sets_retry_action(monkeypatch):
     assert clip_updates[0]["payload"]["action"] == "retry"
 
 
+def test_generate_mark_failed_falls_back_when_clip_action_error_raises(monkeypatch):
+    calls: list[dict[str, object]] = []
+    job_updates: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        generate_task_module,
+        "supabase",
+        _FakeSupabase(calls, raise_on_action_tables={"clips"}),
+    )
+    monkeypatch.setattr(generate_task_module, "assert_response_ok", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        generate_task_module,
+        "update_job_status",
+        lambda *args, **kwargs: job_updates.append((args, kwargs)),
+    )
+
+    generate_task_module._best_effort_mark_failed(
+        job_id="job-generate-raise",
+        clip_id="clip-raise",
+        error_msg="failed stage",
+    )
+
+    clip_updates = [call for call in calls if call["table"] == "clips"]
+    assert len(clip_updates) == 2
+    assert clip_updates[0]["payload"]["action"] == "retry"
+    assert "action" not in clip_updates[1]["payload"]
+
+
 def test_custom_mark_failed_sets_retry_action(monkeypatch):
     calls: list[dict[str, object]] = []
     job_updates: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -137,3 +212,38 @@ def test_custom_mark_failed_sets_retry_action(monkeypatch):
     assert clip_updates[0]["payload"]["action"] == "retry"
     assert video_updates[0][0][:2] == ("video-2", "failed")
     assert video_updates[0][1].get("error_message") == "custom failed stage"
+
+
+def test_custom_mark_failed_falls_back_when_clip_action_error_raises(monkeypatch):
+    calls: list[dict[str, object]] = []
+    job_updates: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    video_updates: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        custom_task_module,
+        "supabase",
+        _FakeSupabase(calls, raise_on_action_tables={"clips"}),
+    )
+    monkeypatch.setattr(custom_task_module, "assert_response_ok", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        custom_task_module,
+        "update_job_status",
+        lambda *args, **kwargs: job_updates.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        custom_task_module,
+        "update_video_status",
+        lambda *args, **kwargs: video_updates.append((args, kwargs)),
+    )
+
+    custom_task_module._best_effort_mark_failed(
+        job_id="job-custom-raise",
+        clip_id="clip-raise",
+        video_id="video-raise",
+        error_msg="custom failed stage",
+    )
+
+    clip_updates = [call for call in calls if call["table"] == "clips"]
+    assert len(clip_updates) == 2
+    assert clip_updates[0]["payload"]["action"] == "retry"
+    assert "action" not in clip_updates[1]["payload"]

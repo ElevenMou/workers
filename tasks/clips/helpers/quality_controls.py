@@ -48,7 +48,7 @@ def resolve_quality_controls(
         return ClipQualityControls(
             effective_source_max_height=None,
             prefer_fresh_source_download=True,
-            allow_upload_reencode=False,
+            allow_upload_reencode=True,
             smart_cleanup_crf=10,
             smart_cleanup_preset="slow",
         )
