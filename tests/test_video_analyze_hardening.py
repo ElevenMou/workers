@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -1089,6 +1090,58 @@ def test_ai_analyzer_falls_back_when_text_has_json(monkeypatch):
 
     assert len(clips) == 1
     assert clips[0]["title"] == "Recovered from text"
+
+
+def test_ai_analyzer_logs_salvage_for_repaired_truncated_json(monkeypatch, caplog):
+    payload_text = json.dumps(
+        {
+            "clips": [
+                {
+                    "rank": 1,
+                    "start_time": 0.0,
+                    "end_time": 45.0,
+                    "duration": 45.0,
+                    "clip_title": "Recovered truncated",
+                    "summary": "Recovered summary",
+                    "confidence_score": 0.81,
+                    "tags": [],
+                },
+                {
+                    "rank": 2,
+                    "start_time": 45.0,
+                    "end_time": 90.0,
+                    "duration": 45.0,
+                    "clip_title": "Incomplete clip",
+                    "summary": "Should be dropped because payload truncates here",
+                    "confidence_score": 0.62,
+                    "tags": [],
+                },
+            ]
+        }
+    )
+    second_clip_marker = payload_text.find('{"rank": 2')
+    assert second_clip_marker > 0
+    truncated_payload = payload_text[: second_clip_marker + 28]
+
+    monkeypatch.setattr(
+        ai_analyzer_module,
+        "OpenAI",
+        lambda **_kwargs: _FakeOpenAIClient(response_text=truncated_payload),
+    )
+    analyzer = ai_analyzer_module.AIAnalyzer()
+
+    caplog.set_level(logging.WARNING)
+    clips = analyzer.find_best_clips(
+        transcript=_base_transcript(),
+        num_clips=1,
+        min_duration=30,
+        max_duration=90,
+    )
+
+    assert len(clips) == 1
+    assert clips[0]["title"] == "Recovered truncated"
+    assert "Repaired truncated JSON response" in caplog.text
+    assert "Analyzer salvaged" in caplog.text
 
 
 def test_ai_analyzer_accepts_json_block_payload(monkeypatch):

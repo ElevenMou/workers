@@ -89,6 +89,7 @@ def test_resolve_source_video_deduplicates_download_for_concurrent_same_video(
     monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
     monkeypatch.setattr(source_video, "SOURCE_VIDEO_LOCK_WAIT_SECONDS", 5)
     monkeypatch.setattr(source_video, "_WAIT_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(source_video, "RAW_VIDEO_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(
         source_video,
         "upload_raw_video_to_storage",
@@ -341,6 +342,7 @@ def test_resolve_source_video_prefers_fresh_but_reuses_waited_download(
     monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
     monkeypatch.setattr(source_video, "SOURCE_VIDEO_LOCK_WAIT_SECONDS", 5)
     monkeypatch.setattr(source_video, "_WAIT_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(source_video, "RAW_VIDEO_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr(
         source_video,
         "upload_raw_video_to_storage",
@@ -387,7 +389,214 @@ def test_resolve_source_video_prefers_fresh_but_reuses_waited_download(
     assert "waited_and_reused" in strategies
     reused = [resolution for resolution in results.values() if resolution.strategy == "waited_and_reused"]
     assert reused
-    assert reused[0].video_path == str(fresh_path)
+    assert reused[0].video_path == str(tmp_path / "cache" / "video-fresh-wait.mp4")
+    assert Path(reused[0].video_path).is_file()
+
+
+def test_resolve_source_video_prefers_fresh_with_three_waiters_uses_first_fresh_result(
+    monkeypatch,
+    tmp_path: Path,
+):
+    shared_row = {
+        "raw_video_path": None,
+        "raw_video_storage_path": None,
+        "url": "https://example.com/watch?v=triple-fresh",
+    }
+    row_lock = threading.Lock()
+    fake_redis = _FakeRedis()
+    download_calls: list[str] = []
+
+    class _FakeDownloader:
+        def download(self, _url: str, video_id: str):
+            download_calls.append(video_id)
+            time.sleep(0.08)
+            output_path = tmp_path / f"{threading.current_thread().name}-{video_id}.mp4"
+            output_path.write_bytes(b"video")
+            return {
+                "path": str(output_path),
+                "duration": 120,
+            }
+
+    def _load_video_row(_video_id: str) -> dict:
+        with row_lock:
+            return dict(shared_row)
+
+    def _persist_raw_video_path(_video_id: str, raw_path: str):
+        with row_lock:
+            shared_row["raw_video_path"] = raw_path
+        time.sleep(0.2)
+
+    def _persist_raw_video_metadata(_video_id: str, payload: dict):
+        with row_lock:
+            shared_row.update(payload)
+        time.sleep(0.2)
+
+    monkeypatch.setattr(source_video, "get_redis_connection", lambda: fake_redis)
+    monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
+    monkeypatch.setattr(source_video, "SOURCE_VIDEO_LOCK_WAIT_SECONDS", 5)
+    monkeypatch.setattr(source_video, "_WAIT_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(source_video, "RAW_VIDEO_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        source_video,
+        "upload_raw_video_to_storage",
+        lambda **_kwargs: ("raw/video-triple-fresh.mp4", "etag-triple-fresh"),
+    )
+
+    results: dict[str, source_video.SourceVideoResolution] = {}
+    errors: list[Exception] = []
+
+    def _run(worker_name: str, delay: float):
+        try:
+            if delay:
+                time.sleep(delay)
+            resolution = source_video.resolve_source_video(
+                video_id="video-triple-fresh",
+                source_url=shared_row["url"],
+                initial_raw_video_path=None,
+                initial_raw_video_storage_path=None,
+                downloader=_FakeDownloader(),
+                load_video_row=_load_video_row,
+                persist_raw_video_path=_persist_raw_video_path,
+                persist_raw_video_metadata=_persist_raw_video_metadata,
+                logger=type("Logger", (), {"warning": lambda *args, **kwargs: None})(),
+                job_id=worker_name,
+                prefer_fresh_download=True,
+                on_wait_for_download=lambda _elapsed: None,
+                on_download_start=lambda: None,
+            )
+            results[worker_name] = resolution
+        except Exception as exc:  # pragma: no cover - assertion path
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_run, name="job-a", args=("job-a", 0.0), daemon=True),
+        threading.Thread(target=_run, name="job-b", args=("job-b", 0.02), daemon=True),
+        threading.Thread(target=_run, name="job-c", args=("job-c", 0.12), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=3)
+
+    assert not errors
+    assert len(download_calls) == 1
+    assert len(results) == 3
+    waited = [
+        resolution for resolution in results.values() if resolution.strategy == "waited_and_reused"
+    ]
+    assert len(waited) == 2
+    expected_cache_path = str(tmp_path / "cache" / "video-triple-fresh.mp4")
+    assert {resolution.video_path for resolution in waited} == {expected_cache_path}
+    assert Path(expected_cache_path).is_file()
+
+
+def test_resolve_source_video_waiter_reuses_shared_cache_not_producer_workdir(
+    monkeypatch,
+    tmp_path: Path,
+):
+    shared_row = {
+        "raw_video_path": None,
+        "raw_video_storage_path": None,
+        "url": "https://example.com/watch?v=durable-handoff",
+    }
+    row_lock = threading.Lock()
+    fake_redis = _FakeRedis()
+    raw_path_persisted = threading.Event()
+    producer_paths: list[str] = []
+
+    class _FakeDownloader:
+        def download(self, _url: str, video_id: str):
+            output_path = tmp_path / f"{threading.current_thread().name}-{video_id}.mp4"
+            output_path.write_bytes(b"producer-video")
+            producer_paths.append(str(output_path))
+            return {
+                "path": str(output_path),
+                "duration": 120,
+            }
+
+    def _load_video_row(_video_id: str) -> dict:
+        with row_lock:
+            return dict(shared_row)
+
+    def _persist_raw_video_path(_video_id: str, raw_path: str):
+        with row_lock:
+            shared_row["raw_video_path"] = raw_path
+        raw_path_persisted.set()
+        time.sleep(0.2)
+
+    def _persist_raw_video_metadata(_video_id: str, payload: dict):
+        with row_lock:
+            shared_row.update(payload)
+
+    monkeypatch.setattr(source_video, "get_redis_connection", lambda: fake_redis)
+    monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
+    monkeypatch.setattr(source_video, "SOURCE_VIDEO_LOCK_WAIT_SECONDS", 5)
+    monkeypatch.setattr(source_video, "_WAIT_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(source_video, "RAW_VIDEO_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        source_video,
+        "upload_raw_video_to_storage",
+        lambda **_kwargs: ("raw/video-durable-handoff.mp4", "etag-durable-handoff"),
+    )
+
+    results: dict[str, source_video.SourceVideoResolution] = {}
+    errors: list[Exception] = []
+
+    def _run_producer():
+        try:
+            results["producer"] = source_video.resolve_source_video(
+                video_id="video-durable-handoff",
+                source_url=shared_row["url"],
+                initial_raw_video_path=None,
+                initial_raw_video_storage_path=None,
+                downloader=_FakeDownloader(),
+                load_video_row=_load_video_row,
+                persist_raw_video_path=_persist_raw_video_path,
+                persist_raw_video_metadata=_persist_raw_video_metadata,
+                logger=type("Logger", (), {"warning": lambda *args, **kwargs: None})(),
+                job_id="job-producer",
+                prefer_fresh_download=True,
+                on_wait_for_download=lambda _elapsed: None,
+                on_download_start=lambda: None,
+            )
+        except Exception as exc:  # pragma: no cover - assertion path
+            errors.append(exc)
+
+    def _run_waiter():
+        try:
+            assert raw_path_persisted.wait(timeout=1)
+            results["waiter"] = source_video.resolve_source_video(
+                video_id="video-durable-handoff",
+                source_url=shared_row["url"],
+                initial_raw_video_path=None,
+                initial_raw_video_storage_path=None,
+                downloader=_FakeDownloader(),
+                load_video_row=_load_video_row,
+                persist_raw_video_path=_persist_raw_video_path,
+                persist_raw_video_metadata=_persist_raw_video_metadata,
+                logger=type("Logger", (), {"warning": lambda *args, **kwargs: None})(),
+                job_id="job-waiter",
+                prefer_fresh_download=True,
+                on_wait_for_download=lambda _elapsed: None,
+                on_download_start=lambda: None,
+            )
+        except Exception as exc:  # pragma: no cover - assertion path
+            errors.append(exc)
+
+    producer = threading.Thread(target=_run_producer, daemon=True)
+    waiter = threading.Thread(target=_run_waiter, daemon=True)
+    producer.start()
+    waiter.start()
+    producer.join(timeout=3)
+    waiter.join(timeout=3)
+
+    assert not errors
+    assert results["producer"].strategy == "downloaded_now"
+    assert results["waiter"].strategy == "waited_and_reused"
+    expected_cache_path = str(tmp_path / "cache" / "video-durable-handoff.mp4")
+    assert results["waiter"].video_path == expected_cache_path
+    assert results["waiter"].video_path != producer_paths[0]
+    assert Path(expected_cache_path).read_bytes() == b"producer-video"
 
 
 def test_resolve_source_video_times_out_when_lock_is_never_released(monkeypatch):

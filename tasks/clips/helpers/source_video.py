@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -71,6 +72,54 @@ def build_raw_video_storage_path(video_id: str) -> str:
     return f"raw/{video_id}.mp4"
 
 
+def _normalize_optional_text(value: object) -> str | None:
+    if not isinstance(value, (str, bytes)):
+        return None
+    text = str(value).strip() if value else ""
+    return text or None
+
+
+def _paths_match(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    try:
+        return os.path.abspath(left) == os.path.abspath(right)
+    except Exception:
+        return left == right
+
+
+def _path_is_fresh(candidate: str | None, entry_snapshot: str | None) -> bool:
+    if not candidate:
+        return False
+    if not entry_snapshot:
+        return True
+    return not _paths_match(candidate, entry_snapshot)
+
+
+def _value_is_fresh(candidate: str | None, entry_snapshot: str | None) -> bool:
+    if not candidate:
+        return False
+    if not entry_snapshot:
+        return True
+    return candidate != entry_snapshot
+
+
+def _should_force_storage_cache_refresh(
+    *,
+    latest_storage_path: str | None,
+    entry_raw_storage_path: str | None,
+    prefer_fresh_download: bool,
+) -> bool:
+    if not prefer_fresh_download or not latest_storage_path:
+        return False
+    if entry_raw_storage_path:
+        return latest_storage_path != entry_raw_storage_path
+    # When a waited job had no storage snapshot at entry time, a cache file
+    # keyed only by video_id may still contain an older raw source. Refresh it
+    # from canonical storage before reusing the artifact.
+    return True
+
+
 def _raw_cache_path(video_id: str) -> str:
     base = Path(RAW_VIDEO_CACHE_DIR)
     base.mkdir(parents=True, exist_ok=True)
@@ -118,19 +167,21 @@ def _resolve_storage_video_path(
     job_id: str,
     logger,
     raw_video_storage_path: str | None,
+    force_refresh_cache: bool = False,
 ) -> tuple[str, int, int] | None:
     if not raw_video_storage_path:
         return None
 
     cache_path = _raw_cache_path(video_id)
-    cached_existing = _resolve_existing_video_path(
-        video_id=video_id,
-        job_id=job_id,
-        logger=logger,
-        raw_video_path=cache_path,
-    )
-    if cached_existing is not None:
-        return cached_existing
+    if not force_refresh_cache:
+        cached_existing = _resolve_existing_video_path(
+            video_id=video_id,
+            job_id=job_id,
+            logger=logger,
+            raw_video_path=cache_path,
+        )
+        if cached_existing is not None:
+            return cached_existing
 
     try:
         payload = supabase.storage.from_(_RAW_VIDEO_STORAGE_BUCKET).download(raw_video_storage_path)
@@ -198,6 +249,139 @@ def _resolve_existing_video_path(
     return raw_video_path, width, height
 
 
+def _materialize_waited_local_video_to_cache(
+    *,
+    video_id: str,
+    job_id: str,
+    logger,
+    raw_video_path: str | None,
+) -> tuple[str, int, int] | None:
+    normalized_path = _normalize_optional_text(raw_video_path)
+    if normalized_path is None:
+        return None
+
+    cache_path = _raw_cache_path(video_id)
+    if _paths_match(normalized_path, cache_path):
+        return _resolve_existing_video_path(
+            video_id=video_id,
+            job_id=job_id,
+            logger=logger,
+            raw_video_path=cache_path,
+        )
+
+    source_existing = _resolve_existing_video_path(
+        video_id=video_id,
+        job_id=job_id,
+        logger=logger,
+        raw_video_path=normalized_path,
+    )
+    if source_existing is None:
+        return None
+
+    tmp_cache_path = f"{cache_path}.tmp.{uuid.uuid4().hex}"
+    try:
+        shutil.copyfile(normalized_path, tmp_cache_path)
+        os.replace(tmp_cache_path, cache_path)
+    except Exception as exc:
+        logger.warning(
+            "[%s] Failed to materialize waited raw video to shared cache for %s (%s -> %s): %s",
+            job_id,
+            video_id,
+            normalized_path,
+            cache_path,
+            exc,
+        )
+        try:
+            if os.path.exists(tmp_cache_path):
+                os.remove(tmp_cache_path)
+        except OSError:
+            pass
+        return None
+
+    cached_existing = _resolve_existing_video_path(
+        video_id=video_id,
+        job_id=job_id,
+        logger=logger,
+        raw_video_path=cache_path,
+    )
+    if cached_existing is not None:
+        return cached_existing
+
+    try:
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+    except OSError:
+        pass
+    return None
+
+
+def _try_resolve_waited_video(
+    *,
+    video_id: str,
+    job_id: str,
+    logger,
+    latest_path: str | None,
+    latest_storage_path: str | None,
+    entry_raw_video_path: str | None,
+    entry_raw_storage_path: str | None,
+    prefer_fresh_download: bool,
+    waited_seconds: float,
+) -> SourceVideoResolution | None:
+    """Try to resolve a source video from storage or local cache after waiting.
+
+    Shared by both the in-loop and post-loop resolution paths.
+    """
+    if (
+        not prefer_fresh_download
+        or _value_is_fresh(latest_storage_path, entry_raw_storage_path)
+    ):
+        storage_is_fresh = _should_force_storage_cache_refresh(
+            latest_storage_path=latest_storage_path,
+            entry_raw_storage_path=entry_raw_storage_path,
+            prefer_fresh_download=prefer_fresh_download,
+        )
+        latest_storage_existing = _resolve_storage_video_path(
+            video_id=video_id,
+            job_id=job_id,
+            logger=logger,
+            raw_video_storage_path=latest_storage_path,
+            force_refresh_cache=storage_is_fresh,
+        )
+        if latest_storage_existing is not None:
+            path, width, height = latest_storage_existing
+            return SourceVideoResolution(
+                video_path=path,
+                width=width,
+                height=height,
+                strategy="waited_and_downloaded_from_storage",
+                wait_seconds=float(max(0.0, waited_seconds)),
+                download_seconds=0.0,
+                download_metadata=None,
+                storage_path=latest_storage_path,
+            )
+
+    if not prefer_fresh_download or _path_is_fresh(latest_path, entry_raw_video_path):
+        latest_existing = _materialize_waited_local_video_to_cache(
+            video_id=video_id,
+            job_id=job_id,
+            logger=logger,
+            raw_video_path=latest_path,
+        )
+        if latest_existing is not None:
+            path, width, height = latest_existing
+            return SourceVideoResolution(
+                video_path=path,
+                width=width,
+                height=height,
+                strategy="waited_and_reused",
+                wait_seconds=float(max(0.0, waited_seconds)),
+                download_seconds=0.0,
+                download_metadata=None,
+            )
+
+    return None
+
+
 def _expires_at_iso() -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=_VIDEO_RAW_TTL_HOURS)).isoformat()
 
@@ -220,12 +404,8 @@ def resolve_source_video(
     on_download_start: Callable[[], None] | None = None,
 ) -> SourceVideoResolution:
     """Resolve a usable source-video path with same-video download deduplication."""
-    baseline_raw_video_path = str(initial_raw_video_path).strip() if initial_raw_video_path else None
-    baseline_raw_storage_path = (
-        str(initial_raw_video_storage_path).strip()
-        if initial_raw_video_storage_path
-        else None
-    )
+    entry_raw_video_path = _normalize_optional_text(initial_raw_video_path)
+    entry_raw_storage_path = _normalize_optional_text(initial_raw_video_storage_path)
     if not prefer_fresh_download:
         existing = _resolve_existing_video_path(
             video_id=video_id,
@@ -249,7 +429,7 @@ def resolve_source_video(
             video_id=video_id,
             job_id=job_id,
             logger=logger,
-            raw_video_storage_path=baseline_raw_storage_path,
+            raw_video_storage_path=entry_raw_storage_path,
         )
         if storage_existing is not None:
             path, width, height = storage_existing
@@ -261,7 +441,7 @@ def resolve_source_video(
                 wait_seconds=0.0,
                 download_seconds=0.0,
                 download_metadata=None,
-                storage_path=baseline_raw_storage_path,
+                storage_path=entry_raw_storage_path,
             )
 
     wait_started_at = time.monotonic()
@@ -297,13 +477,13 @@ def resolve_source_video(
 
     def _load_latest_path_url_and_storage() -> tuple[str | None, str | None, str | None]:
         row = load_video_row(video_id) or {}
-        latest_path = row.get("raw_video_path")
-        latest_url = row.get("url")
-        latest_storage_path = row.get("raw_video_storage_path")
+        latest_path = _normalize_optional_text(row.get("raw_video_path"))
+        latest_url = _normalize_optional_text(row.get("url"))
+        latest_storage_path = _normalize_optional_text(row.get("raw_video_storage_path"))
         return (
-            str(latest_path).strip() if latest_path else None,
-            str(latest_url).strip() if latest_url else None,
-            str(latest_storage_path).strip() if latest_storage_path else None,
+            latest_path,
+            latest_url,
+            latest_storage_path,
         )
 
     try:
@@ -328,53 +508,19 @@ def resolve_source_video(
             _emit_wait_stage(float(elapsed))
 
             latest_path, _, latest_storage_path = _load_latest_path_url_and_storage()
-            if not baseline_raw_video_path and latest_path:
-                baseline_raw_video_path = latest_path
-            if not baseline_raw_storage_path and latest_storage_path:
-                baseline_raw_storage_path = latest_storage_path
-            latest_existing = _resolve_existing_video_path(
+            waited_resolution = _try_resolve_waited_video(
                 video_id=video_id,
                 job_id=job_id,
                 logger=logger,
-                raw_video_path=latest_path,
+                latest_path=latest_path,
+                latest_storage_path=latest_storage_path,
+                entry_raw_video_path=entry_raw_video_path,
+                entry_raw_storage_path=entry_raw_storage_path,
+                prefer_fresh_download=prefer_fresh_download,
+                waited_seconds=float(elapsed),
             )
-            if latest_existing is not None:
-                if not prefer_fresh_download or (
-                    baseline_raw_video_path is None or latest_path != baseline_raw_video_path
-                ):
-                    path, width, height = latest_existing
-                    return SourceVideoResolution(
-                        video_path=path,
-                        width=width,
-                        height=height,
-                        strategy="waited_and_reused",
-                        wait_seconds=float(elapsed),
-                        download_seconds=0.0,
-                        download_metadata=None,
-                    )
-
-            latest_storage_existing = _resolve_storage_video_path(
-                video_id=video_id,
-                job_id=job_id,
-                logger=logger,
-                raw_video_storage_path=latest_storage_path,
-            )
-            if latest_storage_existing is not None:
-                if not prefer_fresh_download or (
-                    baseline_raw_storage_path is None
-                    or latest_storage_path != baseline_raw_storage_path
-                ):
-                    path, width, height = latest_storage_existing
-                    return SourceVideoResolution(
-                        video_path=path,
-                        width=width,
-                        height=height,
-                        strategy="waited_and_downloaded_from_storage",
-                        wait_seconds=float(elapsed),
-                        download_seconds=0.0,
-                        download_metadata=None,
-                        storage_path=latest_storage_path,
-                    )
+            if waited_resolution is not None:
+                return waited_resolution
 
             if elapsed >= lock_wait_seconds:
                 raise RuntimeError(
@@ -386,71 +532,52 @@ def resolve_source_video(
 
         latest_path, latest_url, latest_storage_path = _load_latest_path_url_and_storage()
         waited_seconds = time.monotonic() - wait_started_at
-        latest_existing = _resolve_existing_video_path(
-            video_id=video_id,
-            job_id=job_id,
-            logger=logger,
-            raw_video_path=latest_path,
-        )
-        if latest_existing is not None:
-            if not prefer_fresh_download:
+        if waited_for_lock:
+            waited_resolution = _try_resolve_waited_video(
+                video_id=video_id,
+                job_id=job_id,
+                logger=logger,
+                latest_path=latest_path,
+                latest_storage_path=latest_storage_path,
+                entry_raw_video_path=entry_raw_video_path,
+                entry_raw_storage_path=entry_raw_storage_path,
+                prefer_fresh_download=prefer_fresh_download,
+                waited_seconds=float(waited_seconds),
+            )
+            if waited_resolution is not None:
+                return waited_resolution
+        else:
+            latest_existing = _resolve_existing_video_path(
+                video_id=video_id,
+                job_id=job_id,
+                logger=logger,
+                raw_video_path=latest_path,
+            )
+            if latest_existing is not None and not prefer_fresh_download:
                 path, width, height = latest_existing
                 return SourceVideoResolution(
                     video_path=path,
                     width=width,
                     height=height,
-                    strategy="waited_and_reused" if waited_seconds > 0 else "reused_existing",
-                    wait_seconds=float(max(0.0, waited_seconds)),
-                    download_seconds=0.0,
-                    download_metadata=None,
-                )
-            if waited_for_lock and (
-                baseline_raw_video_path is None or latest_path != baseline_raw_video_path
-            ):
-                path, width, height = latest_existing
-                return SourceVideoResolution(
-                    video_path=path,
-                    width=width,
-                    height=height,
-                    strategy="waited_and_reused",
+                    strategy="reused_existing",
                     wait_seconds=float(max(0.0, waited_seconds)),
                     download_seconds=0.0,
                     download_metadata=None,
                 )
 
-        latest_storage_existing = _resolve_storage_video_path(
-            video_id=video_id,
-            job_id=job_id,
-            logger=logger,
-            raw_video_storage_path=latest_storage_path,
-        )
-        if latest_storage_existing is not None:
-            if not prefer_fresh_download:
+            latest_storage_existing = _resolve_storage_video_path(
+                video_id=video_id,
+                job_id=job_id,
+                logger=logger,
+                raw_video_storage_path=latest_storage_path,
+            )
+            if latest_storage_existing is not None and not prefer_fresh_download:
                 path, width, height = latest_storage_existing
                 return SourceVideoResolution(
                     video_path=path,
                     width=width,
                     height=height,
-                    strategy=(
-                        "waited_and_downloaded_from_storage"
-                        if waited_seconds > 0
-                        else "downloaded_from_storage"
-                    ),
-                    wait_seconds=float(max(0.0, waited_seconds)),
-                    download_seconds=0.0,
-                    download_metadata=None,
-                    storage_path=latest_storage_path,
-                )
-            if waited_for_lock and (
-                baseline_raw_storage_path is None
-                or latest_storage_path != baseline_raw_storage_path
-            ):
-                path, width, height = latest_storage_existing
-                return SourceVideoResolution(
-                    video_path=path,
-                    width=width,
-                    height=height,
-                    strategy="waited_and_downloaded_from_storage",
+                    strategy="downloaded_from_storage",
                     wait_seconds=float(max(0.0, waited_seconds)),
                     download_seconds=0.0,
                     download_metadata=None,

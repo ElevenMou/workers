@@ -328,8 +328,9 @@ class AIAnalyzer:
             return None
         fragment = text[start:]
 
-        # Strategy 1: close the array + object  (``]}`` or ``]}``)
-        for suffix in ("]}", "]}"):
+        # Strategy 1: close the array + object.
+        # Try ``]}`` first (last value was complete), then ``"]}`` (string was open).
+        for suffix in ("]}", '"]}'):
             candidate = fragment.rstrip().rstrip(",") + suffix
             try:
                 json.loads(candidate)
@@ -352,7 +353,7 @@ class AIAnalyzer:
         return None
 
     @staticmethod
-    def _extract_json_payload(response_text: str) -> str:
+    def _extract_json_payload(response_text: str) -> tuple[str, bool]:
         """Extract a JSON object payload from raw model output."""
         text = (response_text or "").strip()
         if not text:
@@ -369,12 +370,17 @@ class AIAnalyzer:
             text = "\n".join(lines).strip()
 
         if text.startswith("{") and text.endswith("}"):
-            return text
+            return text, False
 
         start_idx = text.find("{")
         end_idx = text.rfind("}")
         if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            return text[start_idx : end_idx + 1]
+            candidate = text[start_idx : end_idx + 1]
+            try:
+                json.loads(candidate)
+                return candidate, False
+            except json.JSONDecodeError:
+                pass
 
         # The response may be truncated (e.g. max_tokens reached).
         # Try to repair the JSON by closing open brackets.
@@ -385,7 +391,7 @@ class AIAnalyzer:
                 len(text),
                 len(repaired),
             )
-            return repaired
+            return repaired, True
 
         raise ValueError("Analyzer response did not contain a JSON object payload")
 
@@ -829,6 +835,7 @@ class AIAnalyzer:
             result: Any = None
             raw_clips: list[Any] | None = None
             candidate_source: str | None = None
+            repaired_truncated_json = False
 
             parsed = self._coerce_parsed_payload(getattr(message, "parsed", None))
             if parsed is not None:
@@ -840,7 +847,9 @@ class AIAnalyzer:
             if raw_clips is None:
                 response_text = self._message_text(getattr(message, "content", None))
                 if response_text:
-                    payload = self._extract_json_payload(response_text)
+                    payload, repaired_truncated_json = self._extract_json_payload(
+                        response_text
+                    )
                     result = json.loads(payload)
                     raw_clips = self._extract_raw_clips(result)
                     candidate_source = "text_fallback"
@@ -875,6 +884,15 @@ class AIAnalyzer:
 
             if not normalized:
                 raise RuntimeError("Analyzer returned no valid clips")
+
+            if repaired_truncated_json:
+                logger.warning(
+                    "Analyzer salvaged %d/%d valid clip payload item(s) from truncated JSON "
+                    "(max_tokens=%d)",
+                    len(normalized),
+                    len(raw_clips),
+                    max_tokens,
+                )
 
             normalized.sort(key=lambda item: (int(item["rank"]), float(item["start"])))
             return normalized
