@@ -163,10 +163,14 @@ try:
     import postgrest.utils as _postgrest_utils
     import storage3.utils as _storage_utils
 
+    _SUPABASE_HTTP_TIMEOUT = float(os.getenv("SUPABASE_HTTP_TIMEOUT_SECONDS", "30"))
+
     class _PatchedSyncClient(httpx.Client):
         def __init__(self, *args, proxy=None, **kwargs):
             if proxy is not None and "proxies" not in kwargs:
                 kwargs["proxies"] = proxy
+            # Set a default timeout so RPC calls don't hang workers indefinitely.
+            kwargs.setdefault("timeout", _SUPABASE_HTTP_TIMEOUT)
             super().__init__(*args, **kwargs)
 
         def aclose(self) -> None:

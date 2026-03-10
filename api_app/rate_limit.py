@@ -32,6 +32,13 @@ def _get_real_client_ip(request: Request) -> str:
     return get_remote_address(request)
 
 
+_FAIL_OPEN_ON_REDIS_DOWN = os.getenv("RATE_LIMIT_FAIL_OPEN", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+
 def _build_limiter() -> Limiter:
     try:
         redis.Redis(
@@ -48,11 +55,26 @@ def _build_limiter() -> Limiter:
             enabled=_rate_limits_enabled,
         )
     except Exception as exc:
-        logger.warning(
-            "Rate limiter redis backend unavailable (%s). Falling back to in-memory limits.",
+        if _FAIL_OPEN_ON_REDIS_DOWN:
+            logger.warning(
+                "Rate limiter redis backend unavailable (%s). "
+                "Falling back to in-memory limits.",
+                exc,
+            )
+            return Limiter(key_func=_get_real_client_ip, enabled=_rate_limits_enabled)
+        # Fail closed: keep the Redis URI so requests are rejected when
+        # Redis is unreachable, rather than silently bypassing rate limits.
+        logger.error(
+            "Rate limiter redis backend unavailable (%s). "
+            "Rate limiting will fail closed (reject requests). "
+            "Set RATE_LIMIT_FAIL_OPEN=true to fall back to in-memory limits.",
             exc,
         )
-        return Limiter(key_func=_get_real_client_ip, enabled=_rate_limits_enabled)
+        return Limiter(
+            key_func=_get_real_client_ip,
+            storage_uri=_rate_limit_storage_uri,
+            enabled=_rate_limits_enabled,
+        )
 
 
 limiter = _build_limiter()

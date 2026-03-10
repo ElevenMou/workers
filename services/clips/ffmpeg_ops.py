@@ -62,21 +62,35 @@ def _run_ffmpeg_with_timeout(
     effective_timeout = timeout if timeout is not None else _FFMPEG_TIMEOUT_SECONDS
     import subprocess
     import signal
+    import sys
 
     cmd = stream.compile()
     stderr_pipe = subprocess.PIPE if (capture_stderr or quiet) else None
     stdout_pipe = subprocess.PIPE if quiet else None
+
+    # On POSIX, start a new process group so we can kill all child processes.
+    popen_kwargs: dict = {}
+    if sys.platform != "win32":
+        popen_kwargs["preexec_fn"] = os.setsid
+
     process = subprocess.Popen(
-        cmd, stdout=stdout_pipe, stderr=stderr_pipe
+        cmd, stdout=stdout_pipe, stderr=stderr_pipe, **popen_kwargs
     )
     try:
         stdout, stderr = process.communicate(timeout=effective_timeout)
     except subprocess.TimeoutExpired:
-        process.kill()
+        # Kill the entire process group to prevent orphaned FFmpeg children.
+        if sys.platform != "win32":
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except OSError:
+                process.kill()
+        else:
+            process.kill()
         process.wait(timeout=10)
         raise RuntimeError(
             f"FFmpeg process timed out after {effective_timeout}s. "
-            "The subprocess was killed to prevent resource leaks."
+            "The subprocess and all child processes were killed."
         )
     if process.returncode != 0:
         err_msg = stderr.decode("utf-8", errors="replace") if stderr else ""

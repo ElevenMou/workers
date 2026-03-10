@@ -114,6 +114,11 @@ services:
   video-workers:
     build: .
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    pids_limit: ${VIDEO_WORKERS_PIDS_LIMIT:-512}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os, signal; os.kill(1, 0)\""]
       interval: 30s
@@ -179,6 +184,11 @@ services:
   clip-workers:
     build: .
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    pids_limit: ${CLIP_WORKERS_PIDS_LIMIT:-512}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os, signal; os.kill(1, 0)\""]
       interval: 30s
@@ -244,6 +254,11 @@ services:
   social-workers:
     build: .
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    pids_limit: ${SOCIAL_WORKERS_PIDS_LIMIT:-256}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os, signal; os.kill(1, 0)\""]
       interval: 30s

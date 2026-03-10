@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -17,7 +18,15 @@ def _normalize_filter_path(path: str) -> str:
 
 
 def _quote_filter_value(value: str) -> str:
-    return "'" + value.replace("'", r"\'") + "'"
+    """Escape a value for use inside an FFmpeg filter expression.
+
+    FFmpeg filter values need single-quote wrapping and escaping of
+    the characters ``'``, ``\\``, ``;``, and ``[`` / ``]`` which have
+    special meaning in filter graphs.
+    """
+    escaped = value.replace("\\", "\\\\").replace("'", r"\'")
+    escaped = escaped.replace(";", r"\;").replace("[", r"\[").replace("]", r"\]")
+    return "'" + escaped + "'"
 
 
 def resolve_font_dir(
@@ -42,10 +51,24 @@ def resolve_font_dir(
     return None
 
 
+_SAFE_PATH_CHARS = re.compile(r"^[\w\s./:\-]+$")
+
+
+def _validate_filter_path(path: str, label: str) -> None:
+    """Reject paths containing characters that could inject FFmpeg filters."""
+    if not _SAFE_PATH_CHARS.match(path):
+        raise ValueError(
+            f"Unsafe characters in {label} path: {path!r}. "
+            "Only alphanumeric, spaces, dots, slashes, colons, and hyphens are allowed."
+        )
+
+
 def _build_ass_filter(ass_path: str, font_dir: str | None) -> str:
+    _validate_filter_path(ass_path, "ASS subtitle")
     normalized_ass = _quote_filter_value(_normalize_filter_path(ass_path))
     if not font_dir:
         return f"ass=filename={normalized_ass}"
+    _validate_filter_path(font_dir, "font directory")
     normalized_fonts = _quote_filter_value(_normalize_filter_path(font_dir))
     return f"ass=filename={normalized_ass}:fontsdir={normalized_fonts}"
 

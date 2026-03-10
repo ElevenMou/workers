@@ -18,6 +18,16 @@ try:
 except ImportError:  # pragma: no cover
     _sentry_sdk = None  # type: ignore[assignment]
 
+try:
+    from jwt.exceptions import PyJWTError as _PyJWTError
+except ImportError:  # pragma: no cover
+    _PyJWTError = None  # type: ignore[assignment,misc]
+
+# Tuple of exceptions expected from local JWT verification failures.
+_JWT_EXPECTED_ERRORS: tuple[type[BaseException], ...] = (RuntimeError, ValueError, KeyError)
+if _PyJWTError is not None:
+    _JWT_EXPECTED_ERRORS = (*_JWT_EXPECTED_ERRORS, _PyJWTError)
+
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -117,8 +127,16 @@ def get_current_user(
             if _sentry_sdk is not None:
                 _sentry_sdk.set_user({"id": user.id, "email": user.email or ""})
             return user
-    except Exception:
-        pass  # Fall through to remote verification
+    except _JWT_EXPECTED_ERRORS:
+        pass  # Expected failures: missing PyJWT, bad token format, missing claims
+    except Exception as exc:
+        # Unexpected error — log so it doesn't silently mask bugs.
+        import logging
+        logging.getLogger(__name__).warning(
+            "Unexpected error during local JWT verification, falling through to remote: %s", exc
+        )
+        if _sentry_sdk is not None:
+            _sentry_sdk.capture_exception(exc)
 
     # Fallback: verify against Supabase Auth HTTP endpoint.
     payload = _fetch_user_from_token(token)
