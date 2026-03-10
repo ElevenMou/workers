@@ -12,6 +12,10 @@ from typing import Any
 
 from services.captions.ass_generator import generate_ass_file
 
+_FFMPEG_CAPTION_TIMEOUT_SECONDS = int(
+    os.getenv("FFMPEG_CAPTION_TIMEOUT_SECONDS", os.getenv("FFMPEG_TIMEOUT_SECONDS", "1200"))
+)
+
 
 def _normalize_filter_path(path: str) -> str:
     return path.replace("\\", "/").replace(":", r"\:")
@@ -124,6 +128,7 @@ def render_captions(
             capture_output=True,
             text=True,
             check=False,
+            timeout=_FFMPEG_CAPTION_TIMEOUT_SECONDS,
         )
         if proc.returncode != 0:
             quoted = " ".join(shlex.quote(part) for part in command)
