@@ -81,6 +81,12 @@ def publish_reel(
             recoverable=True,
         )
 
+    if media.duration_seconds is not None and media.duration_seconds > 900.0:
+        raise SocialProviderError(
+            "Instagram Reels requires clips that are 15 minutes or shorter.",
+            code="instagram_reels_duration_exceeded",
+        )
+
     create_response = httpx.post(
         f"{_GRAPH_BASE}/{account.external_account_id}/media",
         data={

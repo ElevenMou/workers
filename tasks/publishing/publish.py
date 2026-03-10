@@ -268,6 +268,11 @@ def _validate_media_for_provider(provider: str, media_duration: float | None) ->
             f"YouTube Shorts must be {YOUTUBE_SHORTS_MAX_DURATION_SECONDS} seconds or shorter.",
             code="youtube_duration_limit_exceeded",
         )
+    if provider == "instagram_business" and media_duration and media_duration > 900.0:
+        raise SocialProviderError(
+            "Instagram Reels requires clips that are 15 minutes or shorter.",
+            code="instagram_duration_limit_exceeded",
+        )
 
 
 def publish_clip_task(job_data: PublishClipJob) -> None:

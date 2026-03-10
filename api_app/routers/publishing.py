@@ -13,6 +13,7 @@ from api_app.access_rules import (
 )
 from api_app.auth import AuthenticatedUser, get_current_user
 from api_app.constants import PUBLISH_TASK_PATH
+from config import YOUTUBE_SHORTS_MAX_DURATION_SECONDS
 from api_app.helpers import enqueue_or_fail, raise_on_error
 from api_app.models import (
     CancelClipPublicationResponse,
@@ -142,22 +143,27 @@ def _resolve_publish_access(user_id: str):
 
 
 def _validate_provider_specific_constraints(*, clip: dict, social_accounts: list[dict]) -> None:
-    facebook_selected = any(
-        str(row.get("provider") or "") == "facebook_page" for row in social_accounts
-    )
-    if not facebook_selected:
-        return
-
     raw_duration = clip.get("duration_seconds")
     try:
         duration_seconds = float(raw_duration) if raw_duration is not None else None
     except (TypeError, ValueError):
         duration_seconds = None
 
-    if duration_seconds is not None and duration_seconds > 60.0:
+    if duration_seconds is None:
+        return
+
+    providers = {str(row.get("provider") or "") for row in social_accounts}
+
+    if "youtube_channel" in providers and duration_seconds > float(YOUTUBE_SHORTS_MAX_DURATION_SECONDS):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Facebook Reels requires clips that are 60 seconds or shorter.",
+            detail=f"YouTube Shorts requires clips that are {YOUTUBE_SHORTS_MAX_DURATION_SECONDS} seconds or shorter.",
+        )
+
+    if "instagram_business" in providers and duration_seconds > 900.0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Instagram Reels requires clips that are 15 minutes or shorter.",
         )
 
 
