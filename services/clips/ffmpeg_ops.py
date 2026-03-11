@@ -728,7 +728,15 @@ def compose_clip(
 
     scale_mode = normalize_video_scale_mode(video_scale_mode)
 
-    foreground = source.video.filter(
+    source_video = source.video
+    foreground_source = source_video
+    background_source = source_video
+    if style == "blur":
+        split_streams = source_video.filter_multi_output("split")
+        foreground_source = split_streams[0]
+        background_source = split_streams[1]
+
+    foreground = foreground_source.filter(
         "scale",
         vid_w,
         vid_h,
@@ -740,7 +748,7 @@ def compose_clip(
 
     if style == "blur":
         background = (
-            source.video.filter(
+            background_source.filter(
                 "scale", canvas_w, canvas_h,
                 force_original_aspect_ratio="increase",
                 flags="lanczos",
@@ -886,6 +894,9 @@ def compose_clip(
             .overwrite_output()
         )
         _run_ffmpeg_with_timeout(compose_stream, capture_stderr=True)
+    except ValueError as e:
+        logger.error("FFmpeg compose graph compilation failed: %s", e)
+        raise
     except ffmpeg.Error as e:
         stderr_output = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
         logger.error("FFmpeg compose failed:\n%s", stderr_output)

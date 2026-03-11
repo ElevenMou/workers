@@ -38,6 +38,8 @@ def detect_faces_in_video(
     sample_fps: float = _SAMPLE_FPS,
     min_confidence: float = _MIN_DETECTION_CONFIDENCE,
     max_frames: int = 600,
+    start_time: float | None = None,
+    end_time: float | None = None,
 ) -> list[FaceDetection]:
     """Sample frames from *video_path* and detect faces.
 
@@ -61,10 +63,25 @@ def detect_faces_in_video(
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    source_duration = (total_frames / fps) if total_frames > 0 and fps > 0 else 0.0
+    safe_start = max(0.0, float(start_time or 0.0))
+    safe_end = source_duration if end_time is None else max(safe_start, float(end_time))
+    if source_duration > 0.0:
+        safe_start = min(safe_start, source_duration)
+        safe_end = min(max(safe_end, safe_start), source_duration)
+
+    start_frame = max(0, int(round(safe_start * fps)))
+    end_frame = None
+    if end_time is not None or source_duration > 0.0:
+        end_frame = max(start_frame + 1, int(round(safe_end * fps)))
+
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
     frame_interval = max(1, int(round(fps / sample_fps)))
 
     detections: list[FaceDetection] = []
-    frame_idx = 0
+    frame_idx = start_frame
     sampled = 0
 
     mp_face = mp.solutions.face_detection
@@ -73,6 +90,9 @@ def detect_faces_in_video(
         min_detection_confidence=min_confidence,
     ) as face_detection:
         while True:
+            if end_frame is not None and frame_idx >= end_frame:
+                break
+
             ret, frame = cap.read()
             if not ret:
                 break
@@ -84,7 +104,7 @@ def detect_faces_in_video(
             if sampled >= max_frames:
                 break
 
-            timestamp = frame_idx / fps
+            timestamp = max(0.0, (frame_idx - start_frame) / fps)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = face_detection.process(rgb)
 
@@ -115,12 +135,22 @@ def detect_faces_in_video(
             frame_idx += 1
 
     cap.release()
-    logger.info(
-        "Face detection: %d detections from %d sampled frames (%s)",
-        len(detections),
-        sampled,
-        video_path,
-    )
+    if start_time is not None or end_time is not None:
+        logger.info(
+            "Face detection: %d detections from %d sampled frames (%s, window %.2f-%.2f)",
+            len(detections),
+            sampled,
+            video_path,
+            safe_start,
+            safe_end,
+        )
+    else:
+        logger.info(
+            "Face detection: %d detections from %d sampled frames (%s)",
+            len(detections),
+            sampled,
+            video_path,
+        )
     return detections
 
 

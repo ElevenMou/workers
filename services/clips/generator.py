@@ -149,20 +149,34 @@ class ClipGenerator:
 
         # Optional speaker reframe: crop the source to follow the face.
         effective_video_path = video_path
+        compose_start_time = start_time
+        compose_end_time = end_time
+        requested_window_duration = max(0.1, float(end_time) - float(start_time))
         if reframe_enabled:
             try:
                 from services.reframe.reframer import reframe_video as _reframe
 
                 reframed_path = os.path.join(self.temp_dir, f"{clip_id}_reframed.mp4")
+                logger.info(
+                    "[%s] Reframe requested for window %.2f-%.2f (%.2fs)",
+                    clip_id,
+                    start_time,
+                    end_time,
+                    requested_window_duration,
+                )
                 reframe_ok = _reframe(
                     video_path,
                     reframed_path,
                     smoothing=reframe_smoothing,
                     face_padding=reframe_padding,
                     output_quality=output_quality,
+                    start_time=start_time,
+                    end_time=end_time,
                 )
                 if reframe_ok:
                     effective_video_path = reframed_path
+                    compose_start_time = 0.0
+                    compose_end_time = requested_window_duration
                     intermediates.append(reframed_path)
                     # Re-probe the reframed video for updated resolution.
                     src_w, src_h = _probe_video_resolution(reframed_path)
@@ -185,7 +199,12 @@ class ClipGenerator:
                         source_width=src_w,
                         source_height=src_h,
                     )
-                    logger.info("[%s] Reframe applied — using reframed source", clip_id)
+                    logger.info(
+                        "[%s] Reframe applied - using reframed source with compose seek %.2f-%.2f",
+                        clip_id,
+                        compose_start_time,
+                        compose_end_time,
+                    )
                 else:
                     logger.info("[%s] Reframe skipped (no faces / unavailable)", clip_id)
             except Exception:
@@ -229,8 +248,8 @@ class ClipGenerator:
             overlay_cfg=overlay_cfg,
             background_color=background_color,
             background_image_path=background_image_path,
-            start_time=start_time,
-            end_time=end_time,
+            start_time=compose_start_time,
+            end_time=compose_end_time,
         )
         intermediates.append(composited_path)
 

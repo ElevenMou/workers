@@ -73,14 +73,16 @@ def reframe_video(
     smoothing: float = 0.08,
     sample_fps: float = 3.0,
     output_quality: str = "high",
+    start_time: float | None = None,
+    end_time: float | None = None,
 ) -> bool:
     """Detect faces and produce a reframed (cropped) video.
 
     Returns ``True`` if reframing succeeded, ``False`` if it was skipped
     (e.g. no faces detected, mediapipe unavailable).
 
-    The output is a video with the same duration but cropped to follow the
-    speaker.  Audio is copied unchanged.
+    The output is a video for the requested window cropped to follow the
+    speaker. Audio is copied unchanged for the same window.
     """
     info = _probe_video(input_path)
     src_w, src_h = info["width"], info["height"]
@@ -91,10 +93,27 @@ def reframe_video(
         logger.warning("Cannot reframe: source duration is 0")
         return False
 
+    safe_start = max(0.0, float(start_time or 0.0))
+    safe_end = duration if end_time is None else max(safe_start, float(end_time))
+    safe_start = min(safe_start, duration)
+    safe_end = min(max(safe_end, safe_start), duration)
+    segment_duration = safe_end - safe_start
+
+    if segment_duration <= 0:
+        logger.warning(
+            "Cannot reframe: window %.2f-%.2f is empty for %s",
+            safe_start,
+            safe_end,
+            input_path,
+        )
+        return False
+
     # Step 1: Detect faces.
     detections = detect_faces_in_video(
         input_path,
         sample_fps=sample_fps,
+        start_time=safe_start,
+        end_time=safe_end,
     )
     if not detections:
         logger.info("No faces detected — skipping reframe for %s", input_path)
@@ -103,7 +122,7 @@ def reframe_video(
     # Step 2: Smooth trajectory.
     keyframes = smooth_trajectory(
         detections,
-        duration,
+        segment_duration,
         fps,
         smoothing=smoothing,
     )
@@ -139,8 +158,11 @@ def reframe_video(
         return False
 
     logger.info(
-        "Reframing %s: %dx%d → crop %dx%d (aspect %d:%d, %d keyframes)",
+        "Reframing %s window %.2f-%.2f (%.2fs): %dx%d -> crop %dx%d (aspect %d:%d, %d keyframes)",
         input_path,
+        safe_start,
+        safe_end,
+        segment_duration,
         src_w,
         src_h,
         crop_w,
@@ -155,6 +177,11 @@ def reframe_video(
     if not cap.isOpened():
         logger.error("Cannot open video for reframing: %s", input_path)
         return False
+
+    start_frame = max(0, int(round(safe_start * fps)))
+    end_frame = max(start_frame + 1, int(round(safe_end * fps)))
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     from config import FFMPEG_THREADS
     threads = max(1, int(FFMPEG_THREADS))
@@ -173,6 +200,8 @@ def reframe_video(
         "-r", str(fps),
         "-i", "pipe:0",
         # Copy audio from original.
+        "-ss", str(safe_start),
+        "-t", str(segment_duration),
         "-i", input_path,
         "-map", "0:v:0",
         "-map", "1:a:0?",
@@ -188,6 +217,7 @@ def reframe_video(
         "-colorspace", "bt709",
         "-color_primaries", "bt709",
         "-color_trc", "bt709",
+        "-shortest",
         output_path,
     ]
 
@@ -203,16 +233,20 @@ def reframe_video(
         **popen_kwargs,
     )
 
-    frame_idx = 0
+    frame_idx = start_frame
+    processed_frames = 0
     total_frames = len(keyframes)
     try:
         while True:
+            if frame_idx >= end_frame:
+                break
+
             ret, frame = cap.read()
             if not ret:
                 break
 
             # Look up crop position for this frame.
-            kf_idx = min(frame_idx, total_frames - 1)
+            kf_idx = min(max(0, frame_idx - start_frame), total_frames - 1)
             kf = keyframes[kf_idx] if kf_idx >= 0 else CropKeyframe(0, 0.5, 0.5)
             x, y = _compute_crop_box(kf, src_w, src_h, crop_w, crop_h)
 
@@ -224,6 +258,7 @@ def reframe_video(
 
             proc.stdin.write(cropped.tobytes())
             frame_idx += 1
+            processed_frames += 1
 
     except BrokenPipeError:
         logger.warning("FFmpeg pipe closed early during reframe")
@@ -243,8 +278,11 @@ def reframe_video(
         return False
 
     logger.info(
-        "Reframe complete: %d frames processed → %s (%.1f MB)",
-        frame_idx,
+        "Reframe complete: %d frames processed for window %.2f-%.2f (%.2fs) -> %s (%.1f MB)",
+        processed_frames,
+        safe_start,
+        safe_end,
+        segment_duration,
         output_path,
         os.path.getsize(output_path) / (1024 * 1024),
     )
