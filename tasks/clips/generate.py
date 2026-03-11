@@ -775,12 +775,40 @@ def generate_clip_task(job_data: GenerateClipJob):
         )
         logger.info("[%s] Uploading clip to storage ...", job_id)
 
+        def _handle_upload_status(status: str, detail: dict[str, object]) -> None:
+            if status != "optimizing_upload":
+                return
+
+            detail_params: dict[str, object] = {
+                "attempt": int(detail.get("attempt", 1)),
+                "reason": str(detail.get("reason", "payload_too_large")),
+            }
+            bucket_limit_bytes = detail.get("bucket_limit_bytes")
+            if isinstance(bucket_limit_bytes, int) and bucket_limit_bytes > 0:
+                detail_params["bucket_limit_bytes"] = bucket_limit_bytes
+
+            candidate_size_bytes = detail.get("candidate_size_bytes")
+            source_size_bytes = detail.get("source_size_bytes")
+            if isinstance(candidate_size_bytes, int) and candidate_size_bytes > 0:
+                detail_params["source_size_bytes"] = candidate_size_bytes
+            elif isinstance(source_size_bytes, int) and source_size_bytes > 0:
+                detail_params["source_size_bytes"] = source_size_bytes
+
+            update_clip_job_progress(
+                job_id=job_id,
+                progress=82,
+                stage="uploading_clip",
+                detail_key="optimizing_clip_for_upload",
+                detail_params=detail_params,
+            )
+
         uploaded_file_size = upload_clip_with_replace(
             local_clip_path=result["clip_path"],
             storage_path=storage_path,
             job_id=job_id,
             logger=logger,
             allow_reencode=quality_controls.allow_upload_reencode,
+            status_callback=_handle_upload_status,
         )
         uploaded_storage_path = storage_path
 
