@@ -184,23 +184,25 @@ def test_mode_selection_grouped_highlight_and_karaoke():
     assert r"{\kf" in karaoke_ass
 
 
-def test_animation_karaoke_does_not_force_karaoke_mode_without_style_or_word_highlight():
+def test_removed_legacy_animations_do_not_force_word_modes():
     transcript = _sample_transcript()
 
-    ass = generate_ass_content(
-        transcript,
-        "clean",
-        overrides={
-            "style": "grouped",
-            "animation": "karaoke",
-            "word_highlight": False,
-            "max_chars_per_line": 120,
-            "max_lines": 2,
-        },
-    )
+    for legacy_animation in ("karaoke", "typewriter"):
+        ass = generate_ass_content(
+            transcript,
+            "clean",
+            overrides={
+                "style": "grouped",
+                "animation": legacy_animation,
+                "word_highlight": False,
+                "max_chars_per_line": 120,
+                "max_lines": 2,
+            },
+        )
 
-    assert ass.count("Dialogue:") == 1
-    assert r"{\kf" not in ass
+        assert ass.count("Dialogue:") == 1
+        assert r"{\kf" not in ass
+        assert r"\fscx0" not in ass
 
 
 def test_highlight_events_show_all_words_per_event():
