@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, TypedDict
 
-AnimationType = Literal["none", "fade", "pop", "slide_up", "bounce", "glow", "karaoke"]
+AnimationType = Literal["none", "fade", "pop", "slide_up", "bounce", "glow", "karaoke", "typewriter"]
 
 
 class CaptionAnimation(TypedDict):
