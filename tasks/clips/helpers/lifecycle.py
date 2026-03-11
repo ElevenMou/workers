@@ -5,8 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
-import time
-from typing import Any, Callable
+from typing import Any
 
 import ffmpeg
 
@@ -25,7 +24,6 @@ _VIDEO_UPLOAD_OPTIONS = {
 _DETAIL_VALUE_TYPES = (str, int, float, bool)
 _BUCKET_LIMIT_UNSET = object()
 _generated_clips_bucket_limit_bytes: int | None | object = _BUCKET_LIMIT_UNSET
-_GENERATED_CLIPS_BUCKET_LIMIT_ENV = "GENERATED_CLIPS_BUCKET_LIMIT_BYTES"
 _UPLOAD_REENCODE_STEPS: tuple[tuple[int, str, str], ...] = (
     # crf, preset, audio bitrate
     (15, "veryslow", "192k"),
@@ -149,27 +147,6 @@ def _get_generated_clips_bucket_limit_bytes(*, job_id: str, logger) -> int | Non
     if _generated_clips_bucket_limit_bytes is not _BUCKET_LIMIT_UNSET:
         return _generated_clips_bucket_limit_bytes
 
-    raw_override = str(os.getenv(_GENERATED_CLIPS_BUCKET_LIMIT_ENV, "")).strip()
-    if raw_override:
-        try:
-            parsed_override = int(raw_override)
-            if parsed_override > 0:
-                _generated_clips_bucket_limit_bytes = parsed_override
-                logger.info(
-                    "[%s] Using %s override for generated-clips bucket size limit: %d bytes",
-                    job_id,
-                    _GENERATED_CLIPS_BUCKET_LIMIT_ENV,
-                    parsed_override,
-                )
-                return parsed_override
-        except (TypeError, ValueError):
-            logger.warning(
-                "[%s] Ignoring invalid %s value %r",
-                job_id,
-                _GENERATED_CLIPS_BUCKET_LIMIT_ENV,
-                raw_override,
-            )
-
     try:
         bucket = supabase.storage.get_bucket("generated-clips")
         raw_limit = getattr(bucket, "file_size_limit", None)
@@ -204,7 +181,6 @@ def upload_clip_with_replace(
     job_id: str,
     logger,
     allow_reencode: bool = True,
-    status_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> int:
     source_path = str(local_clip_path)
     candidate_path = source_path
@@ -231,25 +207,11 @@ def upload_clip_with_replace(
             bucket_limit_bytes,
         )
         step_crf, step_preset, step_audio_bitrate = _UPLOAD_REENCODE_STEPS[attempt]
-        if status_callback is not None:
-            status_callback(
-                "optimizing_upload",
-                {
-                    "attempt": attempt + 1,
-                    "reason": "known_bucket_limit",
-                    "source_size_bytes": original_size,
-                    "bucket_limit_bytes": bucket_limit_bytes,
-                    "crf": step_crf,
-                    "preset": step_preset,
-                    "audio_bitrate": step_audio_bitrate,
-                },
-            )
         output_path = str(
             Path(local_clip_path).with_name(
                 f"{Path(local_clip_path).stem}.upload_opt_{attempt + 1}.mp4"
             )
         )
-        optimization_started_at = time.monotonic()
         _reencode_clip_for_upload(
             # Always encode from original source for best retained quality.
             input_path=source_path,
@@ -260,7 +222,7 @@ def upload_clip_with_replace(
         )
         optimized_size = os.path.getsize(output_path)
         logger.warning(
-            "[%s] Pre-upload optimization applied (attempt=%d crf=%d preset=%s audio=%s size=%d->%d bytes elapsed=%.2fs)",
+            "[%s] Pre-upload optimization applied (attempt=%d crf=%d preset=%s audio=%s size=%d->%d bytes)",
             job_id,
             attempt + 1,
             step_crf,
@@ -268,7 +230,6 @@ def upload_clip_with_replace(
             step_audio_bitrate,
             original_size,
             optimized_size,
-            time.monotonic() - optimization_started_at,
         )
         candidate_path = output_path
         attempt += 1
@@ -323,26 +284,11 @@ def upload_clip_with_replace(
                 )
 
             step_crf, step_preset, step_audio_bitrate = _UPLOAD_REENCODE_STEPS[attempt]
-            if status_callback is not None:
-                status_callback(
-                    "optimizing_upload",
-                    {
-                        "attempt": attempt + 1,
-                        "reason": "payload_too_large",
-                        "source_size_bytes": original_size,
-                        "candidate_size_bytes": os.path.getsize(candidate_path),
-                        "bucket_limit_bytes": bucket_limit_bytes,
-                        "crf": step_crf,
-                        "preset": step_preset,
-                        "audio_bitrate": step_audio_bitrate,
-                    },
-                )
             output_path = str(
                 Path(local_clip_path).with_name(
                     f"{Path(local_clip_path).stem}.upload_opt_{attempt + 1}.mp4"
                 )
             )
-            optimization_started_at = time.monotonic()
             _reencode_clip_for_upload(
                 # Always encode from the original render to avoid cumulative
                 # quality loss across multiple fallback attempts.
@@ -354,7 +300,7 @@ def upload_clip_with_replace(
             )
             optimized_size = os.path.getsize(output_path)
             logger.warning(
-                "[%s] Upload payload too large. Retrying with smaller encode (attempt=%d crf=%d preset=%s audio=%s size=%d->%d bytes elapsed=%.2fs)",
+                "[%s] Upload payload too large. Retrying with smaller encode (attempt=%d crf=%d preset=%s audio=%s size=%d->%d bytes)",
                 job_id,
                 attempt + 1,
                 step_crf,
@@ -362,7 +308,6 @@ def upload_clip_with_replace(
                 step_audio_bitrate,
                 os.path.getsize(candidate_path),
                 optimized_size,
-                time.monotonic() - optimization_started_at,
             )
             candidate_path = output_path
             attempt += 1
