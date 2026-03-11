@@ -10,7 +10,7 @@ CAPTION_FONT_CASES = ["as_typed", "uppercase", "lowercase"]
 CAPTION_POSITIONS = ["top", "middle", "bottom", "custom"]
 CAPTION_LINES_PER_PAGE_OPTIONS = [1, 2, 3, 4]
 CAPTION_STYLES = ["grouped", "karaoke", "highlight", "highlight_box"]
-CAPTION_ANIMATIONS = ["none", "fade", "pop", "slide_up", "bounce", "glow", "karaoke", "typewriter"]
+CAPTION_ANIMATIONS = ["none", "fade", "pop", "slide_up", "bounce", "glow"]
 
 CANVAS_ASPECT_RATIO_OPTIONS = ["9:16", "1:1", "4:5", "16:9"]
 VIDEO_SCALE_MODE_OPTIONS = ["fit", "fill"]

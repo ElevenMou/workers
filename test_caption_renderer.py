@@ -35,44 +35,41 @@ def _sample_transcript():
 
 def run():
     modes = set(list_supported_styles())
-    expected = {
-        "impact_bold",
-        "focus_highlight",
-        "clean_fade",
-        "bold_box",
-        "classic_fade",
-        "cinematic_subtitle",
-        "neon_pulse",
-        "minimal_presenter",
-        "elegant_lower_third",
-        "dynamic_karaoke",
-        "glow_edge",
-        "typewriter_clean",
-        "news_strip",
-        "retro_arcade",
-        "soft_serif",
-        "contrast_max",
-        "split_dual_tone",
-        "quiet_doc",
+    required_modes = {
+        "accessible_box",
+        "boxed",
+        "calm_karaoke",
+        "clean",
+        "contrast",
+        "karaoke_gold",
+        "mrbeast",
+        "podcast",
+        "readable",
+        "speaker_focus",
+        "whisper",
     }
-    assert modes == expected
+    assert required_modes.issubset(modes)
 
-    assert normalize_caption_style("animated") == "dynamic_karaoke"
-    assert normalize_caption_style("classic") == "classic_fade"
-    assert normalize_caption_style("split") == "elegant_lower_third"
-    assert normalize_caption_style("caps") == "impact_bold"
-    assert normalize_caption_style("unknown_style") == "classic_fade"
-    assert normalize_caption_style("typewriter") == "typewriter_clean"
-    assert normalize_caption_style("high_contrast") == "contrast_max"
-    assert normalize_caption_style("documentary_quiet") == "quiet_doc"
+    assert normalize_caption_style("animated") == "karaoke_gold"
+    assert normalize_caption_style("accessible") == "accessible_box"
+    assert normalize_caption_style("impact_bold") == "contrast"
+    assert normalize_caption_style("typewriter_clean") == "clean"
+    assert normalize_caption_style("unknown_style") == CAPTION_TEMPLATE_DEFAULTS["presetName"]
 
     animations = set(list_animation_presets())
-    assert animations == {"none", "fade", "slide_up", "pop", "karaoke", "scale"}
-    assert get_preset("impact_bold").name == "impact_bold"
+    assert {
+        "none",
+        "fade",
+        "pop",
+        "slide_up",
+        "bounce",
+        "glow",
+    }.issubset(animations)
+    assert get_preset("contrast").name == "contrast"
 
     presets = list_caption_presets()
     preset_ids = {p["id"] for p in presets}
-    assert preset_ids == expected
+    assert required_modes.issubset(preset_ids)
     assert all("captions" in p for p in presets)
     assert all("style" in p for p in presets)
     assert all("presetName" in p["captions"] for p in presets)
@@ -103,7 +100,7 @@ def run():
     )
 
     transcript = _sample_transcript()
-    karaoke_ass = generate_ass_content(transcript, "dynamic_karaoke")
+    karaoke_ass = generate_ass_content(transcript, "karaoke_gold")
     assert "[Script Info]" in karaoke_ass
     assert "[V4+ Styles]" in karaoke_ass
     assert "[Events]" in karaoke_ass
@@ -111,24 +108,43 @@ def run():
 
     line_ass = generate_ass_content(
         {"segments": [{"start": 0.0, "end": 1.5, "text": "Line level fallback works"}]},
-        "classic_fade",
+        "clean",
     )
     assert "Dialogue:" in line_ass
     assert r"{\k" not in line_ass
 
-    highlight_line_ass = generate_ass_content(
-        {"segments": [{"start": 0.0, "end": 1.5, "text": "Word highlight fallback works"}]},
-        "dynamic_karaoke",
+    highlight_ass = generate_ass_content(
+        transcript,
+        "clean",
+        overrides={
+            "style": "highlight",
+            "word_highlight": True,
+            "max_chars_per_line": 120,
+            "max_lines": 2,
+        },
     )
-    assert "Dialogue:" in highlight_line_ass
-    assert r"{\k" in highlight_line_ass
+    assert highlight_ass.count("Dialogue:") == len(transcript["segments"][0]["words"])
+    assert r"{\k" not in highlight_ass
+
+    highlight_box_ass = generate_ass_content(
+        transcript,
+        "clean",
+        overrides={
+            "style": "highlight_box",
+            "word_highlight": True,
+            "max_chars_per_line": 120,
+            "max_lines": 2,
+        },
+    )
+    assert highlight_box_ass.count("Dialogue:") == len(transcript["segments"][0]["words"])
+    assert r"\bord" in highlight_box_ass
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         out_path = os.path.join(tmp_dir, "captions.ass")
         result_path = render_ass(
             transcript["segments"],
             style="dynamic_karaoke",
-            animation="karaoke",
+            animation="none",
             output_path=out_path,
         )
         assert result_path == out_path

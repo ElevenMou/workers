@@ -390,12 +390,7 @@ def _animation_tag(
         # Start blurred, resolve to sharp
         return rf"{{\blur4\t(0,{glow_ms},\blur0)}}"
 
-    if animation_type == "typewriter":
-        # Snap in from zero width to full width (horizontal scale)
-        tw_ms = max(1, duration_ms or 80)
-        return rf"{{\fscx0\t(0,{tw_ms},\fscx100)}}"
-
-    # "karaoke" and "none" return empty - karaoke is handled via \kf tags
+    # "none" returns empty - karaoke styling is handled via \kf tags
     return ""
 
 
