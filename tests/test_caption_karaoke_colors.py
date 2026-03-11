@@ -25,16 +25,17 @@ def test_word_highlight_grouped_maps_colors_like_karaoke():
     assert preset["secondary_color"] == "&H00FFFFFF"
 
 
-def test_word_by_word_does_not_swap_primary_and_secondary():
+def test_highlight_does_not_swap_primary_and_secondary():
     preset = resolve_preset(
         "clean",
         overrides={
-            "style": "word_by_word",
+            "style": "highlight",
             "word_highlight": True,
             "primary_color": "&H00FFFFFF",
             "highlight_color": "&H0000D7FF",
         },
     )
+    # highlight style handles colors via inline overrides, not ASS karaoke swap
     assert preset["primary_color"] == "&H00FFFFFF"
 
 

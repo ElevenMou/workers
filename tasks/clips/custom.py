@@ -827,6 +827,10 @@ def custom_clip_task(job_data: CustomClipJob):
             intro_file_path=intro_file_path,
             outro_file_path=outro_file_path,
             overlay_file_path=overlay_file_path,
+            # reframe (speaker tracking)
+            reframe_enabled=bool(vid_cfg.get("reframeEnabled", False)),
+            reframe_smoothing=float(vid_cfg.get("reframeSmoothing", 0.08)),
+            reframe_padding=float(vid_cfg.get("reframePadding", 0.3)),
             # misc
             blur_strength=blur_strength,
             output_quality=output_quality,

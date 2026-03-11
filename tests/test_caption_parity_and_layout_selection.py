@@ -140,7 +140,7 @@ def test_caption_override_fallbacks_for_legacy_and_words_mapping():
     assert abs(from_words_only["line_delay"] - 0.04) < 1e-6
 
 
-def test_mode_selection_grouped_word_by_word_and_karaoke():
+def test_mode_selection_grouped_highlight_and_karaoke():
     transcript = _sample_transcript()
 
     grouped_ass = generate_ass_content(
@@ -156,18 +156,19 @@ def test_mode_selection_grouped_word_by_word_and_karaoke():
     assert grouped_ass.count("Dialogue:") == 1
     assert r"{\kf" not in grouped_ass
 
-    word_by_word_ass = generate_ass_content(
+    highlight_ass = generate_ass_content(
         transcript,
         "clean",
         overrides={
-            "style": "word_by_word",
+            "style": "highlight",
             "word_highlight": True,
             "max_chars_per_line": 120,
             "max_lines": 2,
         },
     )
-    assert word_by_word_ass.count("Dialogue:") == 3
-    assert r"{\kf" not in word_by_word_ass
+    # highlight style produces one event per word (3 words = 3 events)
+    assert highlight_ass.count("Dialogue:") == 3
+    assert r"{\kf" not in highlight_ass
 
     karaoke_ass = generate_ass_content(
         transcript,
@@ -202,7 +203,7 @@ def test_animation_karaoke_does_not_force_karaoke_mode_without_style_or_word_hig
     assert r"{\kf" not in ass
 
 
-def test_word_by_word_events_preserve_page_line_breaks():
+def test_highlight_events_show_all_words_per_event():
     transcript = {
         "segments": [
             {
@@ -225,7 +226,7 @@ def test_word_by_word_events_preserve_page_line_breaks():
         transcript,
         "mrbeast",
         overrides={
-            "style": "word_by_word",
+            "style": "highlight",
             "max_chars_per_line": 10,
             "max_lines": 2,
             "line_delay": 0.0,
@@ -234,28 +235,26 @@ def test_word_by_word_events_preserve_page_line_breaks():
 
     dialogue_texts = [row[2] for row in _dialogue_rows(ass)]
     assert dialogue_texts
+    # Highlight style shows all words on every event; multi-line pages use \N
     assert any(r"\N" in text for text in dialogue_texts)
 
 
-def test_word_by_word_line_delay_is_applied_per_event():
+def test_highlight_box_produces_per_word_events():
     ass = generate_ass_content(
         _sample_transcript(),
-        "mrbeast",
+        "clean",
         overrides={
-            "style": "word_by_word",
+            "style": "highlight_box",
             "max_chars_per_line": 120,
             "max_lines": 2,
-            "line_delay": 0.2,
         },
     )
 
     rows = _dialogue_rows(ass)
-    assert len(rows) >= 2
-    start_0 = _parse_ass_time(rows[0][0])
-    start_1 = _parse_ass_time(rows[1][0])
-    # Source word starts are 0.0, 0.8; per-event delay should push the second start.
-    assert start_0 == 0.0
-    assert start_1 > 0.8
+    # 3 words = 3 events for highlight_box
+    assert len(rows) == 3
+    # Should contain \bord tags for the box effect
+    assert any(r"\bord" in row[2] for row in rows)
 
 
 def test_top_position_anchor_uses_video_bounds_margin():

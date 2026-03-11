@@ -390,6 +390,11 @@ def _animation_tag(
         # Start blurred, resolve to sharp
         return rf"{{\blur4\t(0,{glow_ms},\blur0)}}"
 
+    if animation_type == "typewriter":
+        # Snap in from zero width to full width (horizontal scale)
+        tw_ms = max(1, duration_ms or 80)
+        return rf"{{\fscx0\t(0,{tw_ms},\fscx100)}}"
+
     # "karaoke" and "none" return empty - karaoke is handled via \kf tags
     return ""
 
@@ -411,6 +416,153 @@ def _karaoke_text(
     return r"\N".join(lines)
 
 
+def _highlight_text_for_word(
+    page: list[list[WordToken]],
+    active_word_idx: int,
+    *,
+    case_mode: str,
+    cleanup_punctuation: bool,
+    highlight_color: str,
+    primary_color: str,
+) -> str:
+    """Build page text with the active word in highlight_color and others in primary_color.
+
+    This produces the TikTok/CapCut style where all words are visible but the
+    currently-spoken word stands out with a different color.
+    """
+    flat_words = [w for line in page for w in line]
+    # Build a mapping from flat index to (line_idx, word_in_line_idx)
+    word_flat_idx = 0
+    ass_lines: list[str] = []
+    for line_words in page:
+        fragments: list[str] = []
+        for word in line_words:
+            token = _apply_text_case(word.word, case_mode)
+            if cleanup_punctuation:
+                token = _clean_text(token, True)
+            escaped = _escape_ass_text(token)
+            if word_flat_idx == active_word_idx:
+                fragments.append(rf"{{\c{highlight_color}}}{escaped}{{\c{primary_color}}}")
+            else:
+                fragments.append(escaped)
+            word_flat_idx += 1
+        ass_lines.append(" ".join(fragments))
+    return r"\N".join(ass_lines)
+
+
+def _highlight_box_text_for_word(
+    page: list[list[WordToken]],
+    active_word_idx: int,
+    *,
+    case_mode: str,
+    cleanup_punctuation: bool,
+    highlight_color: str,
+    primary_color: str,
+    outline_color: str,
+    box_outline_size: int,
+    base_outline_size: int,
+) -> str:
+    """Build page text where the active word gets a thick colored outline (box effect).
+
+    Uses a large \\bord + \\3c on the active word to create a rounded-rectangle
+    highlight behind it, mimicking the popular "boxed word" TikTok caption style.
+    """
+    word_flat_idx = 0
+    ass_lines: list[str] = []
+    box_size = max(box_outline_size, base_outline_size + 6)
+    for line_words in page:
+        fragments: list[str] = []
+        for word in line_words:
+            token = _apply_text_case(word.word, case_mode)
+            if cleanup_punctuation:
+                token = _clean_text(token, True)
+            escaped = _escape_ass_text(token)
+            if word_flat_idx == active_word_idx:
+                # Active word: highlight color text + thick colored outline as box
+                fragments.append(
+                    rf"{{\c{highlight_color}\3c{highlight_color}\bord{box_size}\shad0}}"
+                    rf"{escaped}"
+                    rf"{{\c{primary_color}\3c{outline_color}\bord{base_outline_size}\shad0}}"
+                )
+            else:
+                fragments.append(escaped)
+            word_flat_idx += 1
+        ass_lines.append(" ".join(fragments))
+    return r"\N".join(ass_lines)
+
+
+def _build_highlight_events(
+    pages: list[list[list[WordToken]]],
+    segment: SegmentToken,
+    preset: dict[str, Any],
+    *,
+    case_mode: str,
+    cleanup_punctuation: bool,
+    animation_tag: str,
+    line_delay: float,
+    use_box: bool = False,
+) -> list[DialogueEvent]:
+    """Generate per-word events where all words are visible but the active word is highlighted.
+
+    When *use_box* is True the active word gets a thick colored outline (box effect).
+    Otherwise only the text color changes.
+    """
+    highlight_color = str(preset.get("highlight_color") or preset.get("secondary_color") or "&H0000FFFF")
+    primary_color = str(preset.get("primary_color") or "&H00FFFFFF")
+    outline_color = str(preset.get("outline_color") or "&H00000000")
+    box_outline_size = _to_int(preset.get("highlight_box_size"), 14)
+    base_outline_size = _to_int(preset.get("outline"), 3)
+
+    events: list[DialogueEvent] = []
+
+    for page in pages:
+        flat_words = [w for line in page for w in line]
+        if not flat_words:
+            continue
+
+        page_start, page_end = _page_start_end(page, segment)
+
+        for word_idx, word in enumerate(flat_words):
+            event_start = word.start
+            if word_idx + 1 < len(flat_words):
+                event_end = flat_words[word_idx + 1].start
+            else:
+                event_end = page_end
+
+            if event_end <= event_start:
+                event_end = event_start + _MIN_EVENT_DURATION_SECONDS
+
+            if use_box:
+                text = _highlight_box_text_for_word(
+                    page, word_idx,
+                    case_mode=case_mode,
+                    cleanup_punctuation=cleanup_punctuation,
+                    highlight_color=highlight_color,
+                    primary_color=primary_color,
+                    outline_color=outline_color,
+                    box_outline_size=box_outline_size,
+                    base_outline_size=base_outline_size,
+                )
+            else:
+                text = _highlight_text_for_word(
+                    page, word_idx,
+                    case_mode=case_mode,
+                    cleanup_punctuation=cleanup_punctuation,
+                    highlight_color=highlight_color,
+                    primary_color=primary_color,
+                )
+
+            if text:
+                events.append(DialogueEvent(
+                    start=event_start,
+                    end=event_end,
+                    text=text,
+                    animation_tag=animation_tag if word_idx == 0 else "",
+                ))
+
+    return events
+
+
 def _static_text(
     page: list[list[WordToken]],
     *,
@@ -425,75 +577,6 @@ def _static_text(
     ]
     lines = [line for line in lines if line]
     return r"\N".join(lines)
-
-
-def _build_word_by_word_events(
-    pages: list[list[list[WordToken]]],
-    segment: SegmentToken,
-    preset: dict[str, Any],
-    *,
-    case_mode: str,
-    cleanup_punctuation: bool,
-    animation_tag: str,
-    line_delay: float,
-    event_index: int,
-) -> list[DialogueEvent]:
-    """Generate accumulating word-by-word events for each page."""
-    events: list[DialogueEvent] = []
-    generated_events = 0
-
-    for page in pages:
-        flat_words = [word for line in page for word in line]
-        if not flat_words:
-            continue
-
-        page_start, page_end = _page_start_end(page, segment)
-
-        for word_idx, word in enumerate(flat_words):
-            # Use page-scoped word_idx instead of global event_offset to
-            # prevent cumulative timing drift across the entire clip.
-            event_start = word.start + (word_idx * line_delay)
-            # Event lasts until next word starts or page ends
-            if word_idx + 1 < len(flat_words):
-                event_end = flat_words[word_idx + 1].start + (word_idx * line_delay)
-            else:
-                event_end = page_end + (word_idx * line_delay)
-
-            if event_end <= event_start:
-                event_end = event_start + _MIN_EVENT_DURATION_SECONDS
-
-            # Preserve wrapped page lines while accumulating words.
-            remaining_words = word_idx + 1
-            line_parts: list[str] = []
-            for line_words in page:
-                if remaining_words <= 0:
-                    break
-                take = min(len(line_words), remaining_words)
-                if take <= 0:
-                    continue
-                token = _line_text(
-                    line_words[:take],
-                    case_mode=case_mode,
-                    cleanup_punctuation=cleanup_punctuation,
-                )
-                escaped = _escape_ass_text(token)
-                if escaped:
-                    line_parts.append(escaped)
-                remaining_words -= take
-
-            text = r"\N".join(line_parts)
-            if not text:
-                continue
-
-            events.append(DialogueEvent(
-                start=event_start,
-                end=event_end,
-                text=text,
-                animation_tag=animation_tag,
-            ))
-            generated_events += 1
-
-    return events
 
 
 def _build_events(
@@ -516,7 +599,7 @@ def _build_events(
     )
     line_delay = max(0.0, _to_float(preset.get("line_delay"), animation_delay))
     style = str(preset.get("style", "grouped")).strip().lower()
-    if style not in {"grouped", "word_by_word", "karaoke"}:
+    if style not in {"grouped", "karaoke", "highlight", "highlight_box"}:
         style = "grouped"
     wants_word_highlight = bool(preset.get("word_highlight", False))
     animation_tag = _animation_tag(preset, play_res=play_res)
@@ -532,18 +615,18 @@ def _build_events(
         if not pages:
             continue
 
-        if style == "word_by_word":
-            # Each word appears individually with animation
-            word_events = _build_word_by_word_events(
+        if style in ("highlight", "highlight_box"):
+            # All words visible; active word gets color swap or box highlight.
+            highlight_events = _build_highlight_events(
                 pages, segment, preset,
                 case_mode=case_mode,
                 cleanup_punctuation=cleanup_punctuation,
                 animation_tag=animation_tag,
                 line_delay=line_delay,
-                event_index=event_index,
+                use_box=(style == "highlight_box"),
             )
-            events.extend(word_events)
-            event_index += len(word_events)
+            events.extend(highlight_events)
+            event_index += len(highlight_events)
         elif style == "karaoke" or (wants_word_highlight and bool(words)):
             # All words visible but use \kf tags for progressive fill.
             # Use segment-scoped page_idx to prevent cumulative drift.

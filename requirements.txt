@@ -19,5 +19,7 @@ gunicorn==23.0.0
 slowapi==0.1.9
 PyJWT[crypto]==2.10.1
 sentry-sdk[fastapi,rq]==2.22.0
+mediapipe==0.10.21
+opencv-python-headless==4.11.0.86
 pip-audit==2.8.0
 pytest==8.3.4

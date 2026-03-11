@@ -1,5 +1,7 @@
 """High-level clip generation orchestration."""
 
+from __future__ import annotations
+
 import logging
 import os
 from typing import Any
@@ -17,6 +19,7 @@ from services.clips.constants import (
 from services.clips.ffmpeg_ops import (
     concat_intro_outro,
     compose_clip,
+    safe_remove,
 )
 from services.clips.layout import compute_layout, compute_video_position, wrap_title
 from services.clips.models import ClipGenerationResult
@@ -78,6 +81,10 @@ class ClipGenerator:
         intro_file_path: str | None = None,
         outro_file_path: str | None = None,
         overlay_file_path: str | None = None,
+        # -- reframe (speaker tracking) --
+        reframe_enabled: bool = False,
+        reframe_smoothing: float = 0.08,
+        reframe_padding: float = 0.3,
         # -- misc --
         blur_strength: int = 20,
         output_quality: str = "medium",
@@ -140,11 +147,56 @@ class ClipGenerator:
             source_height=src_h,
         )
 
+        # Optional speaker reframe: crop the source to follow the face.
+        effective_video_path = video_path
+        if reframe_enabled:
+            try:
+                from services.reframe.reframer import reframe_video as _reframe
+
+                reframed_path = os.path.join(self.temp_dir, f"{clip_id}_reframed.mp4")
+                reframe_ok = _reframe(
+                    video_path,
+                    reframed_path,
+                    smoothing=reframe_smoothing,
+                    face_padding=reframe_padding,
+                    output_quality=output_quality,
+                )
+                if reframe_ok:
+                    effective_video_path = reframed_path
+                    intermediates.append(reframed_path)
+                    # Re-probe the reframed video for updated resolution.
+                    src_w, src_h = _probe_video_resolution(reframed_path)
+                    layout = compute_layout(
+                        reframed_path,
+                        video_width_pct,
+                        video_position_y,
+                        video_custom_x,
+                        video_custom_y,
+                        video_custom_width,
+                        title_font_size,
+                        title_padding_x,
+                        title_position_y,
+                        title_custom_x,
+                        title_custom_y,
+                        title_custom_width,
+                        canvas_aspect_ratio,
+                        video_scale_mode,
+                        len(title_lines),
+                        source_width=src_w,
+                        source_height=src_h,
+                    )
+                    logger.info("[%s] Reframe applied — using reframed source", clip_id)
+                else:
+                    logger.info("[%s] Reframe skipped (no faces / unavailable)", clip_id)
+            except Exception:
+                logger.exception("[%s] Reframe failed — continuing with original source", clip_id)
+                safe_remove(os.path.join(self.temp_dir, f"{clip_id}_reframed.mp4"))
+
         # If intro/outro concat runs afterward, keep this pass high-fidelity.
         overlay_qp = qp if not (has_intro or has_outro) else intermediate_quality_preset(qp)
         composited_path = os.path.join(self.temp_dir, f"{clip_id}_composited.mp4")
         compose_clip(
-            video_path,
+            effective_video_path,
             composited_path,
             style=background_style,
             canvas_w=layout["canvas_w"],

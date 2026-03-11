@@ -101,7 +101,7 @@ def transcript_has_word_timing_in_window(
     return False
 
 
-_WORD_LEVEL_STYLES = {"word_by_word", "karaoke"}
+_WORD_LEVEL_STYLES = {"karaoke", "highlight", "highlight_box"}
 
 
 def needs_whisper_retranscription(
@@ -111,7 +111,7 @@ def needs_whisper_retranscription(
     """Return True when the clip needs Whisper for accurate word timing.
 
     Conditions:
-    1. The caption style requires word-level timing (word_by_word or karaoke).
+    1. The caption style requires word-level timing (karaoke, highlight, or highlight_box).
     2. The transcript is not already Whisper-backed and has no usable word timings.
     """
     if caption_style.strip().lower() not in _WORD_LEVEL_STYLES:

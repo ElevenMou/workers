@@ -15,7 +15,7 @@ from services.caption_renderer import (
 )
 from services.captions.positioning import compute_video_anchored_margin_v
 
-_STYLE_MODES = {"grouped", "word_by_word", "karaoke"}
+_STYLE_MODES = {"grouped", "karaoke", "highlight", "highlight_box"}
 
 
 def resolve_caption_style_mode(cap_cfg: dict[str, Any]) -> str:

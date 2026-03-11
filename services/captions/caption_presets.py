@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Literal, Mapping, TypedDict
 
-AnimationType = Literal["none", "fade", "pop", "slide_up", "bounce", "glow", "karaoke"]
+AnimationType = Literal["none", "fade", "pop", "slide_up", "bounce", "glow", "karaoke", "typewriter"]
 
 
 class CaptionAnimation(TypedDict):
@@ -96,7 +96,7 @@ class CaptionPreset:
         self.safe_area = bool(safe_area)
         self.description = str(description)
         normalized_style = str(style).strip().lower()
-        if normalized_style not in {"grouped", "word_by_word", "karaoke"}:
+        if normalized_style not in {"grouped", "karaoke", "highlight", "highlight_box"}:
             normalized_style = "grouped"
         self.style = normalized_style
 
@@ -155,6 +155,7 @@ ANIMATION_OPTIONS: tuple[AnimationType, ...] = (
     "bounce",
     "glow",
     "karaoke",
+    "typewriter",
 )
 
 ANIMATION_ALIASES: dict[str, AnimationType] = {
@@ -176,6 +177,8 @@ ANIMATION_ALIASES: dict[str, AnimationType] = {
     "neon": "glow",
     "karaoke": "karaoke",
     "word_highlight": "karaoke",
+    "typewriter": "typewriter",
+    "type": "typewriter",
 }
 
 _WHITE = "&H00FFFFFF"
@@ -211,12 +214,15 @@ def _normalize_animation_config(animation: Mapping[str, Any] | None) -> CaptionA
     }
 
 
+_VALID_STYLE_MODES = {"grouped", "karaoke", "highlight", "highlight_box"}
+
+
 def _normalize_style_mode(style: Any, default: str = "grouped") -> str:
     token = str(style or "").strip().lower()
-    if token in {"grouped", "word_by_word", "karaoke"}:
+    if token in _VALID_STYLE_MODES:
         return token
     fallback = str(default or "grouped").strip().lower()
-    if fallback in {"grouped", "word_by_word", "karaoke"}:
+    if fallback in _VALID_STYLE_MODES:
         return fallback
     return "grouped"
 
@@ -257,7 +263,7 @@ PRESETS: dict[str, CaptionPreset] = {
     "mrbeast": CaptionPreset(
         name="mrbeast",
         display_name="MrBeast",
-        description="Bold impact style, one word at a time.",
+        description="Bold impact style with highlighted active word.",
         font_name="Montserrat-Black",
         font_size=80,
         primary_color=_WHITE,
@@ -274,13 +280,13 @@ PRESETS: dict[str, CaptionPreset] = {
         position="bottom",
         max_words_per_line=3,
         animation={"type": "pop", "duration": 0.2, "delay_between_words": 0.05},
-        word_highlight=False,
-        highlight_color=_WHITE,
+        word_highlight=True,
+        highlight_color="&H0000FFFF",
         background_box=False,
         background_padding=0,
         uppercase=True,
         safe_area=True,
-        style="word_by_word",
+        style="highlight",
     ),
     "clean": CaptionPreset(
         name="clean",
@@ -733,7 +739,7 @@ PRESETS: dict[str, CaptionPreset] = {
     "focus": CaptionPreset(
         name="focus",
         display_name="Focus",
-        description="One word at a time, big bold impact.",
+        description="Bold highlight style, big impact words.",
         font_name="Montserrat-Black",
         font_size=80,
         primary_color=_WHITE,
@@ -750,13 +756,13 @@ PRESETS: dict[str, CaptionPreset] = {
         position="bottom",
         max_words_per_line=3,
         animation={"type": "pop", "duration": 0.2, "delay_between_words": 0.05},
-        word_highlight=False,
-        highlight_color=_WHITE,
+        word_highlight=True,
+        highlight_color="&H0000FFFF",
         background_box=False,
         background_padding=0,
         uppercase=True,
         safe_area=True,
-        style="word_by_word",
+        style="highlight",
     ),
     "whisper": CaptionPreset(
         name="whisper",
@@ -785,6 +791,149 @@ PRESETS: dict[str, CaptionPreset] = {
         uppercase=False,
         safe_area=True,
         style="grouped",
+    ),
+    # ------------------------------------------------------------------
+    # Highlight-style presets (TikTok / CapCut word-level highlighting)
+    # ------------------------------------------------------------------
+    "tiktok": CaptionPreset(
+        name="tiktok",
+        display_name="TikTok",
+        description="Viral TikTok style: all words visible, active word pops in yellow.",
+        font_name="Montserrat-Black",
+        font_size=72,
+        primary_color=_WHITE,
+        secondary_color="&H0000FFFF",
+        outline_color=_BLACK,
+        back_color=_SEMI_BLACK,
+        bold=True,
+        italic=False,
+        outline_size=5,
+        shadow_size=0,
+        alignment=2,
+        margin_v=80,
+        margin_h=60,
+        position="bottom",
+        max_words_per_line=3,
+        animation={"type": "pop", "duration": 0.12, "delay_between_words": 0.0},
+        word_highlight=True,
+        highlight_color="&H0000FFFF",
+        background_box=False,
+        background_padding=0,
+        uppercase=True,
+        safe_area=True,
+        style="highlight",
+    ),
+    "tiktok_box": CaptionPreset(
+        name="tiktok_box",
+        display_name="TikTok Box",
+        description="TikTok style with colored box behind the active word.",
+        font_name="Montserrat-Black",
+        font_size=72,
+        primary_color=_WHITE,
+        secondary_color="&H0000FFFF",
+        outline_color=_BLACK,
+        back_color=_SEMI_BLACK,
+        bold=True,
+        italic=False,
+        outline_size=4,
+        shadow_size=0,
+        alignment=2,
+        margin_v=80,
+        margin_h=60,
+        position="bottom",
+        max_words_per_line=3,
+        animation={"type": "pop", "duration": 0.12, "delay_between_words": 0.0},
+        word_highlight=True,
+        highlight_color="&H0000FFFF",
+        background_box=False,
+        background_padding=0,
+        uppercase=True,
+        safe_area=True,
+        style="highlight_box",
+    ),
+    "capcut": CaptionPreset(
+        name="capcut",
+        display_name="CapCut",
+        description="CapCut-inspired: green highlight on active word, clean look.",
+        font_name="Poppins-Bold",
+        font_size=68,
+        primary_color=_WHITE,
+        secondary_color="&H0000FF00",
+        outline_color=_BLACK,
+        back_color=_SEMI_BLACK,
+        bold=True,
+        italic=False,
+        outline_size=4,
+        shadow_size=0,
+        alignment=2,
+        margin_v=100,
+        margin_h=60,
+        position="bottom",
+        max_words_per_line=3,
+        animation={"type": "none", "duration": 0.0, "delay_between_words": 0.0},
+        word_highlight=True,
+        highlight_color="&H0000FF00",
+        background_box=False,
+        background_padding=0,
+        uppercase=True,
+        safe_area=True,
+        style="highlight",
+    ),
+    "viral_box": CaptionPreset(
+        name="viral_box",
+        display_name="Viral Box",
+        description="White text with red box behind active word. Maximum punch.",
+        font_name="Montserrat-Black",
+        font_size=76,
+        primary_color=_WHITE,
+        secondary_color="&H000000FF",
+        outline_color=_BLACK,
+        back_color=_SEMI_BLACK,
+        bold=True,
+        italic=False,
+        outline_size=4,
+        shadow_size=0,
+        alignment=2,
+        margin_v=80,
+        margin_h=50,
+        position="bottom",
+        max_words_per_line=3,
+        animation={"type": "bounce", "duration": 0.18, "delay_between_words": 0.0},
+        word_highlight=True,
+        highlight_color="&H000000FF",
+        background_box=False,
+        background_padding=0,
+        uppercase=True,
+        safe_area=True,
+        style="highlight_box",
+    ),
+    "podcast_highlight": CaptionPreset(
+        name="podcast_highlight",
+        display_name="Podcast Highlight",
+        description="Clean podcast look with subtle orange highlight on spoken word.",
+        font_name="Inter-Bold",
+        font_size=56,
+        primary_color=_WHITE,
+        secondary_color="&H0000A5FF",
+        outline_color=_BLACK,
+        back_color=_SEMI_BLACK,
+        bold=True,
+        italic=False,
+        outline_size=3,
+        shadow_size=1,
+        alignment=2,
+        margin_v=100,
+        margin_h=70,
+        position="bottom",
+        max_words_per_line=4,
+        animation={"type": "fade", "duration": 0.15, "delay_between_words": 0.0},
+        word_highlight=True,
+        highlight_color="&H0000A5FF",
+        background_box=False,
+        background_padding=0,
+        uppercase=False,
+        safe_area=True,
+        style="highlight",
     ),
 }
 
@@ -821,7 +970,7 @@ LEGACY_ALIASES: dict[str, str] = {
     "gaming": "energetic",
     "animated": "karaoke_gold",
     "grouped": "clean",
-    "word_by_word": "focus",
+    "word_by_word": "highlight",
     "static": "podcast",
     "uppercase": "contrast",
     "lowercase": "clean",
@@ -1017,7 +1166,7 @@ def resolve_preset(
     style_name = _normalize_style_mode(base.get("style"), default="grouped")
     base["style"] = style_name
     uses_karaoke_fill = style_name == "karaoke" or (
-        bool(base.get("word_highlight")) and style_name != "word_by_word"
+        bool(base.get("word_highlight")) and style_name not in {"highlight", "highlight_box"}
     )
     if uses_karaoke_fill:
         # ASS karaoke (\k/\kf) fills from Secondary -> Primary.
@@ -1045,7 +1194,7 @@ def resolve_caption_preset(preset: str | None) -> dict[str, Any]:
     animation = cfg.get("animation") or {"type": "none", "duration": 0.0, "delay_between_words": 0.0}
     style_name = str(cfg.get("style", "grouped")).strip().lower()
     uses_karaoke_fill = style_name == "karaoke" or (
-        bool(cfg.get("word_highlight")) and style_name != "word_by_word"
+        bool(cfg.get("word_highlight")) and style_name not in {"highlight", "highlight_box"}
     )
     # resolve_preset maps colors for ASS karaoke semantics (Primary=highlight, Secondary=base).
     # For frontend template payload keep semantic fields:
