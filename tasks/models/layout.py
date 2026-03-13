@@ -11,6 +11,7 @@ class VideoLayout(TypedDict, total=False):
     customWidth: int
     canvasAspectRatio: str
     videoScaleMode: str
+    blurBrightness: float
 
 
 class TitleLayout(TypedDict, total=False):
@@ -23,11 +24,15 @@ class TitleLayout(TypedDict, total=False):
     strokeColor: str
     barEnabled: bool
     barColor: str
+    barOpacity: float
     paddingX: int
     positionY: str
     customX: int
     customY: int
     customWidth: int
+    shadowSize: int
+    letterSpacing: int
+    fadeInMs: int
 
 
 class CaptionLayout(TypedDict, total=False):
@@ -71,6 +76,7 @@ DEFAULT_VIDEO_LAYOUT: VideoLayout = {
     "customWidth": 1080,
     "canvasAspectRatio": "9:16",
     "videoScaleMode": "fit",
+    "blurBrightness": -0.15,
 }
 DEFAULT_TITLE_LAYOUT: TitleLayout = {
     "show": True,
@@ -82,11 +88,15 @@ DEFAULT_TITLE_LAYOUT: TitleLayout = {
     "strokeColor": "#000000",
     "barEnabled": False,
     "barColor": "#000000",
+    "barOpacity": 1.0,
     "paddingX": 16,
     "positionY": "above_video",
     "customX": 0,
     "customY": 0,
     "customWidth": 1080,
+    "shadowSize": 2,
+    "letterSpacing": 0,
+    "fadeInMs": 300,
 }
 DEFAULT_CAPTION_LAYOUT: CaptionLayout = {
     "show": False,
@@ -135,6 +145,9 @@ class OverlayLayout(TypedDict, total=False):
     widthPx: int
     x: int
     y: int
+    opacity: float
+    fadeInMs: int
+    fadeOutMs: int
 
 
 DEFAULT_INTRO_LAYOUT: IntroOutroLayout = {
@@ -155,6 +168,9 @@ DEFAULT_OVERLAY_LAYOUT: OverlayLayout = {
     "widthPx": 200,
     "x": 0,
     "y": 0,
+    "opacity": 1.0,
+    "fadeInMs": 0,
+    "fadeOutMs": 0,
 }
 
 

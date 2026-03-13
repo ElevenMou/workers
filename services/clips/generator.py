@@ -87,7 +87,12 @@ class ClipGenerator:
         reframe_center_bias: float = 0.6,
         # -- misc --
         blur_strength: int = 20,
+        blur_brightness: float = -0.15,
         output_quality: str = "medium",
+        title_shadow_size: int = 2,
+        title_letter_spacing: int = 0,
+        title_fade_in_ms: int = 300,
+        title_bar_opacity: float = 1.0,
     ) -> ClipGenerationResult:
         """Generate final clip with title and optional captions.
 
@@ -250,6 +255,11 @@ class ClipGenerator:
             background_image_path=background_image_path,
             start_time=compose_start_time,
             end_time=compose_end_time,
+            blur_brightness=blur_brightness,
+            title_shadow_size=title_shadow_size,
+            title_letter_spacing=title_letter_spacing,
+            title_fade_in_ms=title_fade_in_ms,
+            title_bar_opacity=title_bar_opacity,
         )
         intermediates.append(composited_path)
 

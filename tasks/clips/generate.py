@@ -752,7 +752,12 @@ def generate_clip_task(job_data: GenerateClipJob):
             reframe_center_bias=float(vid_cfg.get("reframeCenterBias", 0.6)),
             # misc
             blur_strength=blur_strength,
+            blur_brightness=float(vid_cfg.get("blurBrightness", -0.15)),
             output_quality=output_quality,
+            title_shadow_size=int(title_cfg.get("shadowSize", 2)),
+            title_letter_spacing=int(title_cfg.get("letterSpacing", 0)),
+            title_fade_in_ms=int(title_cfg.get("fadeInMs", 300)),
+            title_bar_opacity=float(title_cfg.get("barOpacity", 1.0)),
         )
 
         if not _is_latest_generate_job_for_clip(job_id=job_id, clip_id=clip_id):

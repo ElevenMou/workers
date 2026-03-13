@@ -21,7 +21,7 @@ _FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "1200"))
 
 _VALID_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 _VALID_COLOR_WITH_OPACITY = re.compile(
-    r"^(?:#[0-9a-fA-F]{6}|[a-zA-Z]+)@[0-9.]+$"
+    r"^(?:#[0-9a-fA-F]{6,8}|[a-zA-Z]+)@[0-9.]+$"
 )
 
 
@@ -207,14 +207,23 @@ def _build_title_ass(
     title_text_y: int,
     title_area_x: int,
     title_area_w: int,
+    title_shadow_size: int = 2,
+    title_letter_spacing: int = 0,
+    title_fade_in_ms: int = 300,
 ) -> str | None:
     if not title_lines:
         return None
 
     font_name = title_font_family or "Montserrat-Bold"
+    # ASS bold flag: -1 = on, 0 = off.  Enable bold unless the font file
+    # already carries a bold weight (avoids double-bolding).
     bold_flag = 0 if "bold" in font_name.lower() else -1
     primary = _hex_to_ass_color(title_font_color, "&H00FFFFFF")
     outline = _hex_to_ass_color(title_stroke_color, "&H00000000")
+    # Semi-transparent black shadow behind text for depth / readability.
+    back_color = "&H80000000"
+    shadow = max(0, int(title_shadow_size))
+    spacing = max(0, int(title_letter_spacing))
     line_height = int(title_font_size * TITLE_LINE_HEIGHT_RATIO)
 
     # Middle alignment matches CSS ``top-1/2 -translate-y-1/2`` centering.
@@ -229,6 +238,11 @@ def _build_title_ass(
     num_lines = len(title_lines)
     total_block_h = (num_lines - 1) * line_height
     first_line_y = title_text_y - total_block_h // 2
+
+    # Build fade-in animation tag (smooth appearance).
+    fade_tag = ""
+    if title_fade_in_ms > 0:
+        fade_tag = rf"\fad({max(1, int(title_fade_in_ms))},0)"
 
     lines: list[str] = [
         "[Script Info]",
@@ -245,8 +259,8 @@ def _build_title_ass(
         (
             "Style: Title,"
             f"{font_name},{title_font_size},{primary},{primary},"
-            f"{outline},&HFF000000,{bold_flag},0,0,0,100,100,0,0,1,"
-            f"{max(0, int(title_stroke_width))},0,5,0,0,0,1"
+            f"{outline},{back_color},{bold_flag},0,0,0,100,100,{spacing},0,1,"
+            f"{max(0, int(title_stroke_width))},{shadow},5,0,0,0,1"
         ),
         "",
         "[Events]",
@@ -257,7 +271,7 @@ def _build_title_ass(
     end = _ass_time(max(0.1, duration_seconds))
     for idx, line in enumerate(title_lines):
         y = max(0, int(first_line_y + idx * line_height))
-        tag = rf"{{{align_tag}\pos({x},{y})}}"
+        tag = rf"{{{align_tag}{fade_tag}\pos({x},{y})}}"
         lines.append(f"Dialogue: 0,{start},{end},Title,,0,0,0,,{tag}{_ass_escape(line)}")
 
     path = Path(output_path)
@@ -378,6 +392,7 @@ def create_portrait_background(
     *,
     background_color: str = "#000000",
     background_image_path: str | None = None,
+    blur_brightness: float = 0.0,
 ) -> None:
     """Create canvas composition with source video over background."""
     logger.info(
@@ -409,11 +424,17 @@ def create_portrait_background(
     if style == "blur":
         bg_temp = output_path + ".bg.mp4"
 
-        (
+        bg_stream = (
             ffmpeg.input(input_path)
             .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="increase", flags="lanczos")
             .filter("crop", canvas_w, canvas_h)
             .filter("boxblur", blur_strength)
+        )
+        effective_brightness = max(-0.5, min(0.0, float(blur_brightness)))
+        if effective_brightness < -0.01:
+            bg_stream = bg_stream.filter("eq", brightness=effective_brightness)
+        (
+            bg_stream
             .output(bg_temp, **_ffmpeg_thread_args())
             .overwrite_output()
             .run(quiet=True)
@@ -543,6 +564,10 @@ def add_overlays(
     qp: QualityPreset,
     overlay_file_path: str | None = None,
     overlay_cfg: dict | None = None,
+    title_shadow_size: int = 2,
+    title_letter_spacing: int = 0,
+    title_fade_in_ms: int = 300,
+    title_bar_opacity: float = 1.0,
 ) -> None:
     """Draw title/text/captions in a single encode pass."""
     logger.info(
@@ -561,12 +586,17 @@ def add_overlays(
     temp_files: list[str] = []
     if title_show and title_lines:
         if title_bar_enabled:
+            clamped_opacity = max(0.0, min(1.0, float(title_bar_opacity)))
+            if clamped_opacity < 1.0:
+                bar_color_str = f"{_sanitize_color(title_bar_color)}@{clamped_opacity:.2f}"
+            else:
+                bar_color_str = _sanitize_color(title_bar_color)
             stream = stream.drawbox(
                 x=max(0, int(title_bar_x)),
                 y=title_bar_y,
                 width=max(2, int(title_bar_w)),
                 height=title_bar_h,
-                color=_sanitize_color(title_bar_color),
+                color=bar_color_str,
                 t="fill",
             )
         try:
@@ -594,6 +624,9 @@ def add_overlays(
                 title_text_y=title_text_y,
                 title_area_x=title_bar_x,
                 title_area_w=title_bar_w,
+                title_shadow_size=title_shadow_size,
+                title_letter_spacing=title_letter_spacing,
+                title_fade_in_ms=title_fade_in_ms,
             )
             if title_ass_path:
                 temp_files.append(title_ass_path)
@@ -633,7 +666,14 @@ def add_overlays(
         overlay_x = max(0, int(overlay_cfg.get("x", 0)))
         overlay_y = max(0, int(overlay_cfg.get("y", 0)))
         overlay_w = max(1, min(1920, int(overlay_cfg.get("widthPx", 200))))
+        overlay_opacity = max(0.0, min(1.0, float(overlay_cfg.get("opacity", 1.0))))
+
         overlay_input = ffmpeg.input(overlay_file_path).filter("scale", overlay_w, -1)
+        if overlay_opacity < 0.99:
+            overlay_input = overlay_input.filter(
+                "colorchannelmixer",
+                **{"aa": overlay_opacity},
+            )
         stream = ffmpeg.filter([stream, overlay_input], "overlay", overlay_x, overlay_y)
 
     try:
@@ -703,6 +743,11 @@ def compose_clip(
     background_image_path: str | None = None,
     start_time: float | None = None,
     end_time: float | None = None,
+    blur_brightness: float = 0.0,
+    title_shadow_size: int = 2,
+    title_letter_spacing: int = 0,
+    title_fade_in_ms: int = 300,
+    title_bar_opacity: float = 1.0,
 ) -> None:
     """Compose background, source video, title/captions, and overlay in one pass.
 
@@ -756,6 +801,14 @@ def compose_clip(
             .filter("crop", canvas_w, canvas_h)
             .filter("boxblur", blur_strength)
         )
+        # Dim the blurred background for better text/overlay readability.
+        # blur_brightness: 0.0 = no change, -0.15 = subtle darken (default).
+        effective_brightness = max(-0.5, min(0.0, float(blur_brightness)))
+        if effective_brightness < -0.01:
+            background = background.filter(
+                "eq",
+                brightness=effective_brightness,
+            )
         stream = ffmpeg.filter([background, foreground], "overlay", vid_x, vid_y)
     elif style == "solid_color":
         safe_color = _sanitize_color(background_color)
@@ -793,12 +846,18 @@ def compose_clip(
     temp_files: list[str] = []
     if title_show and title_lines:
         if title_bar_enabled:
+            # Support semi-transparent title bars via ``color@opacity`` syntax.
+            clamped_opacity = max(0.0, min(1.0, float(title_bar_opacity)))
+            if clamped_opacity < 1.0:
+                bar_color_str = f"{_sanitize_color(title_bar_color)}@{clamped_opacity:.2f}"
+            else:
+                bar_color_str = _sanitize_color(title_bar_color)
             stream = stream.drawbox(
                 x=max(0, int(title_bar_x)),
                 y=title_bar_y,
                 width=max(2, int(title_bar_w)),
                 height=title_bar_h,
-                color=_sanitize_color(title_bar_color),
+                color=bar_color_str,
                 t="fill",
             )
         try:
@@ -818,6 +877,9 @@ def compose_clip(
                 title_text_y=title_text_y,
                 title_area_x=title_bar_x,
                 title_area_w=title_bar_w,
+                title_shadow_size=title_shadow_size,
+                title_letter_spacing=title_letter_spacing,
+                title_fade_in_ms=title_fade_in_ms,
             )
             if title_ass_path:
                 temp_files.append(title_ass_path)
@@ -857,7 +919,32 @@ def compose_clip(
         overlay_x = max(0, int(overlay_cfg.get("x", 0)))
         overlay_y = max(0, int(overlay_cfg.get("y", 0)))
         overlay_w = max(1, min(1920, int(overlay_cfg.get("widthPx", 200))))
+        overlay_opacity = max(0.0, min(1.0, float(overlay_cfg.get("opacity", 1.0))))
+        overlay_fade_in_ms = max(0, int(overlay_cfg.get("fadeInMs", 0)))
+        overlay_fade_out_ms = max(0, int(overlay_cfg.get("fadeOutMs", 0)))
+
         overlay_input = ffmpeg.input(overlay_file_path).filter("scale", overlay_w, -1)
+
+        # Apply opacity reduction if less than full.
+        if overlay_opacity < 0.99:
+            overlay_input = overlay_input.filter(
+                "colorchannelmixer",
+                **{"aa": overlay_opacity},
+            )
+
+        # Apply fade-in / fade-out on the overlay image.
+        if overlay_fade_in_ms > 0 or overlay_fade_out_ms > 0:
+            fade_parts: list = []
+            if overlay_fade_in_ms > 0:
+                overlay_input = overlay_input.filter(
+                    "fade", type="in", st=0, d=overlay_fade_in_ms / 1000.0, alpha=1,
+                )
+            if overlay_fade_out_ms > 0 and duration_seconds > 0:
+                fade_out_start = max(0.0, duration_seconds - (overlay_fade_out_ms / 1000.0))
+                overlay_input = overlay_input.filter(
+                    "fade", type="out", st=fade_out_start, d=overlay_fade_out_ms / 1000.0, alpha=1,
+                )
+
         stream = ffmpeg.filter([stream, overlay_input], "overlay", overlay_x, overlay_y)
 
     audio_stream = source.audio if _media_has_audio(input_path) else None
