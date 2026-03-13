@@ -46,6 +46,11 @@ class DialogueEvent:
     animation_tag: str
 
 
+_DEFAULT_STYLE_NAME = "Default"
+_HIGHLIGHT_WORD_STYLE_NAME = "HighlightWord"
+_HIGHLIGHT_BOX_STYLE_NAME = "HighlightBox"
+
+
 def _to_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -394,6 +399,25 @@ def _animation_tag(
     return ""
 
 
+def _override_block(*tags: str) -> str:
+    pieces: list[str] = []
+    for tag in tags:
+        token = str(tag or "").strip()
+        if not token:
+            continue
+        if token.startswith("{") and token.endswith("}"):
+            token = token[1:-1]
+        if token:
+            pieces.append(token)
+    if not pieces:
+        return ""
+    return "{" + "".join(pieces) + "}"
+
+
+def _style_switch(style_name: str, *, animation_tag: str = "") -> str:
+    return _override_block(rf"\r{style_name}", animation_tag)
+
+
 def _karaoke_text(
     page: list[list[WordToken]],
     *,
@@ -417,17 +441,15 @@ def _highlight_text_for_word(
     *,
     case_mode: str,
     cleanup_punctuation: bool,
-    highlight_color: str,
-    primary_color: str,
+    animation_tag: str,
 ) -> str:
-    """Build page text with the active word in highlight_color and others in primary_color.
+    """Build page text with the active word rendered via the highlight style.
 
-    This produces the TikTok/CapCut style where all words are visible but the
-    currently-spoken word stands out with a different color.
+    ASS style resets let us swap the active word into a dedicated highlight
+    style while keeping the rest of the line on the default style.
     """
-    flat_words = [w for line in page for w in line]
-    # Build a mapping from flat index to (line_idx, word_in_line_idx)
     word_flat_idx = 0
+    current_style = _DEFAULT_STYLE_NAME
     ass_lines: list[str] = []
     for line_words in page:
         fragments: list[str] = []
@@ -436,8 +458,16 @@ def _highlight_text_for_word(
             if cleanup_punctuation:
                 token = _clean_text(token, True)
             escaped = _escape_ass_text(token)
-            if word_flat_idx == active_word_idx:
-                fragments.append(rf"{{\c{highlight_color}}}{escaped}{{\c{primary_color}}}")
+            next_style = (
+                _HIGHLIGHT_WORD_STYLE_NAME
+                if word_flat_idx == active_word_idx
+                else _DEFAULT_STYLE_NAME
+            )
+            if next_style != current_style:
+                fragments.append(
+                    _style_switch(next_style, animation_tag=animation_tag) + escaped
+                )
+                current_style = next_style
             else:
                 fragments.append(escaped)
             word_flat_idx += 1
@@ -451,20 +481,17 @@ def _highlight_box_text_for_word(
     *,
     case_mode: str,
     cleanup_punctuation: bool,
-    highlight_color: str,
-    primary_color: str,
-    outline_color: str,
-    box_outline_size: int,
-    base_outline_size: int,
+    animation_tag: str,
 ) -> str:
-    """Build page text where the active word gets a thick colored outline (box effect).
+    """Build page text where the active word switches into an opaque-box style.
 
-    Uses a large \\bord + \\3c on the active word to create a rounded-rectangle
-    highlight behind it, mimicking the popular "boxed word" TikTok caption style.
+    In ASS, opaque boxes are style-level behavior rather than inline overrides,
+    so the active word is wrapped in a dedicated style reset instead of a
+    synthetic \\bord / \\3c outline hack.
     """
     word_flat_idx = 0
+    current_style = _DEFAULT_STYLE_NAME
     ass_lines: list[str] = []
-    box_size = max(box_outline_size, base_outline_size + 6)
     for line_words in page:
         fragments: list[str] = []
         for word in line_words:
@@ -472,13 +499,16 @@ def _highlight_box_text_for_word(
             if cleanup_punctuation:
                 token = _clean_text(token, True)
             escaped = _escape_ass_text(token)
-            if word_flat_idx == active_word_idx:
-                # Active word: highlight color text + thick colored outline as box
+            next_style = (
+                _HIGHLIGHT_BOX_STYLE_NAME
+                if word_flat_idx == active_word_idx
+                else _DEFAULT_STYLE_NAME
+            )
+            if next_style != current_style:
                 fragments.append(
-                    rf"{{\c{highlight_color}\3c{highlight_color}\bord{box_size}\shad0}}"
-                    rf"{escaped}"
-                    rf"{{\c{primary_color}\3c{outline_color}\bord{base_outline_size}\shad0}}"
+                    _style_switch(next_style, animation_tag=animation_tag) + escaped
                 )
+                current_style = next_style
             else:
                 fragments.append(escaped)
             word_flat_idx += 1
@@ -499,15 +529,9 @@ def _build_highlight_events(
 ) -> list[DialogueEvent]:
     """Generate per-word events where all words are visible but the active word is highlighted.
 
-    When *use_box* is True the active word gets a thick colored outline (box effect).
-    Otherwise only the text color changes.
+    When *use_box* is True the active word switches into an ASS opaque-box style
+    with a real background box. Otherwise only the text color changes.
     """
-    highlight_color = str(preset.get("highlight_color") or preset.get("secondary_color") or "&H0000FFFF")
-    primary_color = str(preset.get("primary_color") or "&H00FFFFFF")
-    outline_color = str(preset.get("outline_color") or "&H00000000")
-    box_outline_size = _to_int(preset.get("highlight_box_size"), 14)
-    base_outline_size = _to_int(preset.get("outline"), 3)
-
     events: list[DialogueEvent] = []
 
     for page in pages:
@@ -527,24 +551,21 @@ def _build_highlight_events(
             if event_end <= event_start:
                 event_end = event_start + _MIN_EVENT_DURATION_SECONDS
 
+            word_animation_tag = animation_tag if word_idx == 0 else ""
+
             if use_box:
                 text = _highlight_box_text_for_word(
                     page, word_idx,
                     case_mode=case_mode,
                     cleanup_punctuation=cleanup_punctuation,
-                    highlight_color=highlight_color,
-                    primary_color=primary_color,
-                    outline_color=outline_color,
-                    box_outline_size=box_outline_size,
-                    base_outline_size=base_outline_size,
+                    animation_tag=word_animation_tag,
                 )
             else:
                 text = _highlight_text_for_word(
                     page, word_idx,
                     case_mode=case_mode,
                     cleanup_punctuation=cleanup_punctuation,
-                    highlight_color=highlight_color,
-                    primary_color=primary_color,
+                    animation_tag=word_animation_tag,
                 )
 
             if text:
@@ -552,7 +573,7 @@ def _build_highlight_events(
                     start=event_start,
                     end=event_end,
                     text=text,
-                    animation_tag=animation_tag if word_idx == 0 else "",
+                    animation_tag="",
                 ))
 
     return events
@@ -655,16 +676,26 @@ def _build_events(
 
 
 def _style_line(
+    style_name: str,
     preset: CaptionPreset,
     *,
     play_res: tuple[int, int],
+    primary_color: str | None = None,
+    secondary_color: str | None = None,
+    outline_color: str | None = None,
+    back_color: str | None = None,
+    border_style: int | None = None,
+    outline_size: int | None = None,
+    shadow_size: int | None = None,
 ) -> str:
     alignment, margin_v = _resolve_alignment_and_margin(preset, play_res)
     margin_l = _to_int(preset.get("margin_l"), _to_int(preset.get("safe_margin_x"), 56))
     margin_r = _to_int(preset.get("margin_r"), _to_int(preset.get("safe_margin_x"), 56))
     base_outline = max(0, _to_int(preset.get("outline"), 3))
     base_shadow = max(0, _to_int(preset.get("shadow"), 1))
-    border_style = 3 if bool(preset.get("background_box", False)) else 1
+    resolved_border_style = border_style if border_style is not None else (
+        3 if bool(preset.get("background_box", False)) else 1
+    )
     bold_flag = -1 if bool(preset.get("bold", True)) else 0
     italic_flag = -1 if bool(preset.get("italic", False)) else 0
     underline_flag = -1 if bool(preset.get("underline", False)) else 0
@@ -674,19 +705,60 @@ def _style_line(
     # Scale outline and shadow proportionally to font size change.
     base_font_size = max(1, _to_int(preset.get("font_size"), 64))
     size_ratio = font_size / base_font_size
-    outline = max(0, int(round(base_outline * size_ratio)))
-    shadow = max(0, int(round(base_shadow * size_ratio)))
+    resolved_outline = max(
+        0,
+        int(round((outline_size if outline_size is not None else base_outline) * size_ratio)),
+    )
+    resolved_shadow = max(
+        0,
+        int(round((shadow_size if shadow_size is not None else base_shadow) * size_ratio)),
+    )
 
     return (
-        "Style: Default,"
+        f"Style: {style_name},"
         f"{preset.get('font_name', 'Montserrat-Bold')},{font_size},"
-        f"{preset.get('primary_color', '&H00FFFFFF')},"
-        f"{preset.get('secondary_color', '&H0000C8FF')},"
-        f"{preset.get('outline_color', '&H00000000')},"
-        f"{preset.get('back_color', '&H80000000')},"
+        f"{primary_color or preset.get('primary_color', '&H00FFFFFF')},"
+        f"{secondary_color or preset.get('secondary_color', '&H0000C8FF')},"
+        f"{outline_color or preset.get('outline_color', '&H00000000')},"
+        f"{back_color or preset.get('back_color', '&H80000000')},"
         f"{bold_flag},{italic_flag},{underline_flag},0,100,100,0,0,"
-        f"{border_style},{outline},{shadow},{alignment},{margin_l},{margin_r},{margin_v},1"
+        f"{resolved_border_style},{resolved_outline},{resolved_shadow},{alignment},"
+        f"{margin_l},{margin_r},{margin_v},1"
     )
+
+
+def _style_lines(
+    preset: CaptionPreset,
+    *,
+    play_res: tuple[int, int],
+) -> list[str]:
+    highlight_color = str(preset.get("highlight_color") or preset.get("primary_color") or "&H00FFFFFF")
+    base_primary = str(preset.get("primary_color") or "&H00FFFFFF")
+    base_secondary = str(preset.get("secondary_color") or highlight_color)
+    base_outline = max(0, _to_int(preset.get("outline"), 3))
+    highlight_box_outline = max(base_outline, _to_int(preset.get("highlight_box_size"), 4))
+
+    return [
+        _style_line(_DEFAULT_STYLE_NAME, preset, play_res=play_res),
+        _style_line(
+            _HIGHLIGHT_WORD_STYLE_NAME,
+            preset,
+            play_res=play_res,
+            primary_color=highlight_color,
+        ),
+        _style_line(
+            _HIGHLIGHT_BOX_STYLE_NAME,
+            preset,
+            play_res=play_res,
+            primary_color=base_primary,
+            secondary_color=base_secondary,
+            outline_color=highlight_color,
+            back_color=highlight_color,
+            border_style=3,
+            outline_size=highlight_box_outline,
+            shadow_size=0,
+        ),
+    ]
 
 
 def _play_res(video_aspect_ratio: str) -> tuple[int, int]:
@@ -719,11 +791,11 @@ def generate_ass_content(
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding",
-        _style_line(preset, play_res=play_res),
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
+    lines[10:10] = _style_lines(preset, play_res=play_res)
 
     for event in events:
         start = format_ass_timestamp(event.start)

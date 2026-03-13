@@ -125,6 +125,8 @@ def run():
     )
     assert highlight_ass.count("Dialogue:") == len(transcript["segments"][0]["words"])
     assert r"{\k" not in highlight_ass
+    assert "Style: HighlightWord," in highlight_ass
+    assert r"{\rHighlightWord" in highlight_ass
 
     highlight_box_ass = generate_ass_content(
         transcript,
@@ -137,7 +139,8 @@ def run():
         },
     )
     assert highlight_box_ass.count("Dialogue:") == len(transcript["segments"][0]["words"])
-    assert r"\bord" in highlight_box_ass
+    assert "Style: HighlightBox," in highlight_box_ass
+    assert r"{\rHighlightBox" in highlight_box_ass
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         out_path = os.path.join(tmp_dir, "captions.ass")

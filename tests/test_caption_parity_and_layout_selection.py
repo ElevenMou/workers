@@ -53,11 +53,12 @@ def _parse_ass_time(timestamp: str) -> float:
     )
 
 
-def _style_row(ass_text: str) -> list[str]:
+def _style_row(ass_text: str, style_name: str = "Default") -> list[str]:
+    prefix = f"Style: {style_name},"
     for line in ass_text.splitlines():
-        if line.startswith("Style: Default,"):
+        if line.startswith(prefix):
             return line.split(",")
-    raise AssertionError("ASS style row not found")
+    raise AssertionError(f"ASS style row not found for {style_name}")
 
 
 def test_caption_override_precedence_for_chars_lines_and_delay():
@@ -255,8 +256,51 @@ def test_highlight_box_produces_per_word_events():
     rows = _dialogue_rows(ass)
     # 3 words = 3 events for highlight_box
     assert len(rows) == 3
-    # Should contain \bord tags for the box effect
-    assert any(r"\bord" in row[2] for row in rows)
+    assert "Style: HighlightBox," in ass
+    assert any(r"{\rHighlightBox" in row[2] for row in rows)
+    assert all(r"\bord" not in row[2] for row in rows)
+
+
+def test_highlight_styles_use_dedicated_style_switches():
+    transcript = _sample_transcript()
+
+    highlight_ass = generate_ass_content(
+        transcript,
+        "clean",
+        overrides={
+            "style": "highlight",
+            "word_highlight": True,
+            "max_chars_per_line": 120,
+            "max_lines": 2,
+            "animation": "pop",
+        },
+    )
+    highlight_rows = _dialogue_rows(highlight_ass)
+    assert "Style: HighlightWord," in highlight_ass
+    assert highlight_rows
+    assert r"{\rHighlightWord" in highlight_rows[0][2]
+    assert r"{\rDefault" in highlight_rows[0][2]
+    assert r"\t(0," in highlight_rows[0][2]
+    assert r"{\c" not in highlight_rows[0][2]
+
+    highlight_box_ass = generate_ass_content(
+        transcript,
+        "clean",
+        overrides={
+            "style": "highlight_box",
+            "word_highlight": True,
+            "max_chars_per_line": 120,
+            "max_lines": 2,
+            "animation": "pop",
+        },
+    )
+    highlight_box_style = _style_row(highlight_box_ass, "HighlightBox")
+    highlight_box_rows = _dialogue_rows(highlight_box_ass)
+    assert highlight_box_style[15] == "3"
+    assert highlight_box_rows
+    assert r"{\rHighlightBox" in highlight_box_rows[0][2]
+    assert r"{\rDefault" in highlight_box_rows[0][2]
+    assert r"\t(0," in highlight_box_rows[0][2]
 
 
 def test_top_position_anchor_uses_video_bounds_margin():
