@@ -84,7 +84,7 @@ class ClipGenerator:
         # -- reframe (speaker tracking) --
         reframe_enabled: bool = False,
         reframe_smoothing: float = 0.08,
-        reframe_padding: float = 0.3,
+        reframe_center_bias: float = 0.6,
         # -- misc --
         blur_strength: int = 20,
         output_quality: str = "medium",
@@ -168,7 +168,7 @@ class ClipGenerator:
                     video_path,
                     reframed_path,
                     smoothing=reframe_smoothing,
-                    face_padding=reframe_padding,
+                    center_bias=reframe_center_bias,
                     output_quality=output_quality,
                     start_time=start_time,
                     end_time=end_time,

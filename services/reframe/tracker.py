@@ -42,6 +42,8 @@ def smooth_trajectory(
     *,
     smoothing: float = _DEFAULT_SMOOTHING,
     dead_zone: float = _DEFAULT_DEAD_ZONE,
+    center_bias: float = 0.6,
+    crop_to_source_ratio: float = 1.0,
 ) -> list[CropKeyframe]:
     """Produce per-frame smooth crop centers from sparse face detections.
 
@@ -56,7 +58,14 @@ def smooth_trajectory(
     smoothing:
         EMA alpha factor (0=no movement, 1=instant snap).
     dead_zone:
-        Minimum movement threshold to trigger a center update.
+        Base minimum movement threshold to trigger a center update.
+    center_bias:
+        Blend factor toward frame center (0.0 = track face exactly,
+        1.0 = ignore face and keep crop centred). Default 0.6 gives
+        natural "camera operator" framing.
+    crop_to_source_ratio:
+        Ratio of crop size to source size (0..1). Used to scale the
+        dead zone so that smaller crops don't stutter.
 
     Returns a list of :class:`CropKeyframe` — one per output frame.
     """
@@ -73,10 +82,12 @@ def smooth_trajectory(
     # Build a dense raw-target array by interpolating between detections.
     raw_cx = np.full(total_frames, 0.5, dtype=np.float64)
     raw_cy = np.full(total_frames, 0.5, dtype=np.float64)
+    raw_conf = np.full(total_frames, 1.0, dtype=np.float64)
 
     det_frames = [int(round(d.timestamp * fps)) for d in detections]
     det_cx = [d.center_x for d in detections]
     det_cy = [d.center_y for d in detections]
+    det_conf = [d.confidence for d in detections]
 
     # Fill by linear interpolation between detection keyframes.
     for i in range(len(detections) - 1):
@@ -89,14 +100,24 @@ def smooth_trajectory(
             t = (f - f_start) / span
             raw_cx[f] = _lerp(det_cx[i], det_cx[i + 1], t)
             raw_cy[f] = _lerp(det_cy[i], det_cy[i + 1], t)
+            raw_conf[f] = _lerp(det_conf[i], det_conf[i + 1], t)
 
     # Extend first/last detection to edges.
     first_f = max(0, det_frames[0])
     last_f = min(total_frames - 1, det_frames[-1])
     raw_cx[:first_f] = det_cx[0]
     raw_cy[:first_f] = det_cy[0]
+    raw_conf[:first_f] = det_conf[0]
     raw_cx[last_f + 1:] = det_cx[-1]
     raw_cy[last_f + 1:] = det_cy[-1]
+    raw_conf[last_f + 1:] = det_conf[-1]
+
+    # Apply center bias: blend face positions toward frame center.
+    # 0.0 = track face exactly, 1.0 = always centre.
+    bias = max(0.0, min(1.0, center_bias))
+    if bias > 0.0:
+        raw_cx = raw_cx * (1.0 - bias) + 0.5 * bias
+        raw_cy = raw_cy * (1.0 - bias) + 0.5 * bias
 
     # Apply exponential moving average for smoothing.
     smooth_cx = np.empty(total_frames, dtype=np.float64)
@@ -105,7 +126,8 @@ def smooth_trajectory(
     smooth_cy[0] = raw_cy[0]
 
     alpha = max(0.01, min(1.0, smoothing))
-    dz = max(0.0, dead_zone)
+    # Scale dead zone by crop-to-source ratio so smaller crops don't stutter.
+    dz = max(0.001, dead_zone * max(0.1, crop_to_source_ratio))
 
     for f in range(1, total_frames):
         dx = raw_cx[f] - smooth_cx[f - 1]
@@ -114,8 +136,12 @@ def smooth_trajectory(
             smooth_cx[f] = smooth_cx[f - 1]
             smooth_cy[f] = smooth_cy[f - 1]
         else:
-            smooth_cx[f] = smooth_cx[f - 1] + alpha * dx
-            smooth_cy[f] = smooth_cy[f - 1] + alpha * dy
+            # Weight alpha by detection confidence — low-confidence
+            # detections move the crop less.
+            conf = max(0.1, min(1.0, raw_conf[f]))
+            effective_alpha = alpha * conf
+            smooth_cx[f] = smooth_cx[f - 1] + effective_alpha * dx
+            smooth_cy[f] = smooth_cy[f - 1] + effective_alpha * dy
 
     # Clamp to [0, 1].
     smooth_cx = np.clip(smooth_cx, 0.0, 1.0)
@@ -130,10 +156,13 @@ def smooth_trajectory(
         for f in range(total_frames)
     ]
     logger.info(
-        "Trajectory smoothing: %d keyframes from %d detections (alpha=%.3f)",
+        "Trajectory smoothing: %d keyframes from %d detections "
+        "(alpha=%.3f, center_bias=%.2f, crop_ratio=%.3f)",
         len(keyframes),
         len(detections),
         alpha,
+        bias,
+        crop_to_source_ratio,
     )
     return keyframes
 

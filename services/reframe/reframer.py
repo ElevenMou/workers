@@ -23,11 +23,23 @@ logger = logging.getLogger(__name__)
 
 # Target crop aspect ratio for portrait reframe (width:height).
 _DEFAULT_CROP_ASPECT = (9, 16)
-# Padding around the face as a fraction of the crop box.
-# 0.3 = face takes up ~70% of the crop width → comfortable headroom.
-_DEFAULT_FACE_PADDING = 0.3
-# Maximum allowed crop movement per frame (prevents jarring jumps).
+# Centre bias: 0.0 = crop locks onto the face, 1.0 = crop stays centred on
+# the frame and ignores the face entirely.  A moderate default (0.6) keeps the
+# subject in view without an aggressive "zoom into face" effect.
+_DEFAULT_CENTER_BIAS = 0.6
 _FFMPEG_TIMEOUT_SECONDS = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "1200"))
+
+
+def _parse_frame_rate(value: str) -> float:
+    """Safely parse ffprobe r_frame_rate like ``'30000/1001'`` or ``'30'``."""
+    parts = value.strip().split("/")
+    try:
+        if len(parts) == 2:
+            num, den = float(parts[0]), float(parts[1])
+            return num / den if den != 0 else 30.0
+        return float(parts[0])
+    except (ValueError, ZeroDivisionError):
+        return 30.0
 
 
 def _probe_video(path: str) -> dict[str, Any]:
@@ -39,7 +51,7 @@ def _probe_video(path: str) -> dict[str, Any]:
     return {
         "width": int(v_stream["width"]),
         "height": int(v_stream["height"]),
-        "fps": float(eval(v_stream.get("r_frame_rate", "30/1"))),
+        "fps": _parse_frame_rate(v_stream.get("r_frame_rate", "30/1")),
         "duration": float(probe.get("format", {}).get("duration", 0)),
     }
 
@@ -69,7 +81,7 @@ def reframe_video(
     output_path: str,
     *,
     crop_aspect: tuple[int, int] = _DEFAULT_CROP_ASPECT,
-    face_padding: float = _DEFAULT_FACE_PADDING,
+    center_bias: float = _DEFAULT_CENTER_BIAS,
     smoothing: float = 0.08,
     sample_fps: float = 3.0,
     output_quality: str = "high",
@@ -119,19 +131,9 @@ def reframe_video(
         logger.info("No faces detected — skipping reframe for %s", input_path)
         return False
 
-    # Step 2: Smooth trajectory.
-    keyframes = smooth_trajectory(
-        detections,
-        segment_duration,
-        fps,
-        smoothing=smoothing,
-    )
-    if not keyframes:
-        return False
-
-    # Step 3: Compute crop dimensions.
-    # The crop box should be as large as possible while maintaining the target
-    # aspect ratio and fitting within the source.
+    # Step 2: Compute crop dimensions.
+    # The crop box is as large as possible while maintaining the target
+    # aspect ratio and fitting within the source — no shrinkage applied.
     crop_ar = crop_aspect[0] / crop_aspect[1]  # e.g. 9/16 = 0.5625
     src_ar = src_w / src_h
 
@@ -144,14 +146,22 @@ def reframe_video(
         crop_w = src_w
         crop_h = int(round(crop_w / crop_ar))
 
-    # Apply face padding: shrink the crop so the face has headroom.
-    padding_factor = max(0.0, min(0.6, face_padding))
-    crop_w = max(2, int(crop_w * (1.0 - padding_factor)))
-    crop_h = max(2, int(crop_h * (1.0 - padding_factor)))
-
     # Ensure even dimensions (H.264).
     crop_w -= crop_w % 2
     crop_h -= crop_h % 2
+
+    # Step 3: Smooth trajectory with center bias.
+    crop_ratio = min(crop_w / src_w, crop_h / src_h)
+    keyframes = smooth_trajectory(
+        detections,
+        segment_duration,
+        fps,
+        smoothing=smoothing,
+        center_bias=center_bias,
+        crop_to_source_ratio=crop_ratio,
+    )
+    if not keyframes:
+        return False
 
     if crop_w >= src_w and crop_h >= src_h:
         logger.info("Crop box equals source size — skipping reframe")

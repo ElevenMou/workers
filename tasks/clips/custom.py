@@ -830,7 +830,7 @@ def custom_clip_task(job_data: CustomClipJob):
             # reframe (speaker tracking)
             reframe_enabled=bool(vid_cfg.get("reframeEnabled", False)),
             reframe_smoothing=float(vid_cfg.get("reframeSmoothing", 0.08)),
-            reframe_padding=float(vid_cfg.get("reframePadding", 0.3)),
+            reframe_center_bias=float(vid_cfg.get("reframeCenterBias", 0.6)),
             # misc
             blur_strength=blur_strength,
             output_quality=output_quality,

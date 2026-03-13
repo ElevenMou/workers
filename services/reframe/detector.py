@@ -15,7 +15,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_SAMPLE_FPS = 3.0  # analyse ~3 frames per second for efficiency
+_SAMPLE_FPS = 5.0  # analyse ~5 frames per second for better motion capture
 _MIN_DETECTION_CONFIDENCE = 0.5
 
 
