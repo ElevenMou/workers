@@ -24,6 +24,24 @@ _MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024
 _MAX_UPLOAD_CHUNKS = 1000
 
 
+def _read_json_payload(response: httpx.Response) -> dict:
+    try:
+        payload = response.json()
+    except ValueError:
+        return {"raw": response.text}
+
+    return payload if isinstance(payload, dict) else {"raw": payload}
+
+
+def _read_oauth_error_message(payload: dict, fallback: str) -> str:
+    return str(
+        payload.get("error_description")
+        or payload.get("message")
+        or payload.get("error")
+        or fallback
+    )
+
+
 def _tiktok_client_key() -> str:
     value = (os.getenv("TIKTOK_CLIENT_KEY") or "").strip()
     if not value:
@@ -44,6 +62,9 @@ def refresh_access_token(account: SocialAccountContext) -> PublicationResult | N
 
     response = httpx.post(
         f"{_TIKTOK_BASE}/v2/oauth/token/",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
         data={
             "client_key": _tiktok_client_key(),
             "client_secret": _tiktok_client_secret(),
@@ -52,10 +73,11 @@ def refresh_access_token(account: SocialAccountContext) -> PublicationResult | N
         },
         timeout=30.0,
     )
-    payload = response.json()
-    if response.status_code >= 400:
+    payload = _read_json_payload(response)
+    # TikTok OAuth failures can come back as an error body, so inspect the payload too.
+    if response.status_code >= 400 or payload.get("error"):
         raise SocialProviderError(
-            payload.get("error_description") or payload.get("message") or "TikTok token refresh failed.",
+            _read_oauth_error_message(payload, "TikTok token refresh failed."),
             code="tiktok_token_refresh_failed",
             refresh_required=True,
             provider_payload=payload,
@@ -66,7 +88,7 @@ def refresh_access_token(account: SocialAccountContext) -> PublicationResult | N
     refresh_token = payload.get("refresh_token") or account.tokens.refresh_token
     if not access_token:
         raise SocialProviderError(
-            "TikTok token refresh did not return an access token.",
+            _read_oauth_error_message(payload, "TikTok token refresh did not return an access token."),
             code="tiktok_token_refresh_missing_access_token",
             refresh_required=True,
             provider_payload=payload,
@@ -97,7 +119,7 @@ def _authorized_post(path: str, *, token: str, json_body: dict) -> dict:
         json=json_body,
         timeout=60.0,
     )
-    payload = response.json()
+    payload = _read_json_payload(response)
     if response.status_code >= 400:
         error = payload.get("error") or {}
         error_code = str(error.get("code") or "tiktok_api_error")
