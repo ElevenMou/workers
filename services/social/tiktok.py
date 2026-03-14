@@ -359,26 +359,14 @@ def publish_video(
     chunk_size, total_chunk_count = _plan_file_upload(media.file_size)
 
     caption = publication.caption or ""
-    try:
-        init_payload = _init_video_publish(
-            account=account,
-            caption=caption,
-            privacy_level=privacy_level,
-            media=media,
-            chunk_size=chunk_size,
-            total_chunk_count=total_chunk_count,
-        )
-    except SocialProviderError as exc:
-        if exc.code != "unaudited_client_can_only_post_to_private_accounts" or privacy_level == "SELF_ONLY":
-            raise
-        init_payload = _init_video_publish(
-            account=account,
-            caption=caption,
-            privacy_level="SELF_ONLY",
-            media=media,
-            chunk_size=chunk_size,
-            total_chunk_count=total_chunk_count,
-        )
+    init_payload = _init_video_publish(
+        account=account,
+        caption=caption,
+        privacy_level=privacy_level,
+        media=media,
+        chunk_size=chunk_size,
+        total_chunk_count=total_chunk_count,
+    )
 
     data = init_payload.get("data") or {}
     publish_id = data.get("publish_id")
