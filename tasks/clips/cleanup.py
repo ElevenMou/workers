@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from utils.media_storage import delete_local_generated_clip
 from utils.supabase_client import assert_response_ok, supabase
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,8 @@ def cleanup_expired_clip_assets(batch_size: int = 100) -> dict[str, int]:
 
         try:
             if paths:
+                for path in paths:
+                    delete_local_generated_clip(path, logger=logger)
                 supabase.storage.from_("generated-clips").remove(paths)
                 removed_files += len(paths)
         except Exception as exc:

@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+ENVIRONMENT = (os.getenv("ENVIRONMENT", "development") or "development").strip().lower()
+IS_PRODUCTION = ENVIRONMENT in {"production", "prod"}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -89,6 +91,35 @@ RAW_VIDEO_CACHE_DIR = os.getenv(
     "RAW_VIDEO_CACHE_DIR", f"{TEMP_DIR.rstrip('/')}/cache/raw"
 )
 MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", 500))
+MEDIA_STORAGE_PROVIDER = (
+    str(os.getenv("MEDIA_STORAGE_PROVIDER", "local")).strip().lower() or "local"
+)
+if MEDIA_STORAGE_PROVIDER not in {"local", "supabase"}:
+    logger.warning(
+        "Invalid MEDIA_STORAGE_PROVIDER=%r; defaulting to local",
+        MEDIA_STORAGE_PROVIDER,
+    )
+    MEDIA_STORAGE_PROVIDER = "local"
+LOCAL_MEDIA_ROOT = os.getenv(
+    "LOCAL_MEDIA_ROOT",
+    f"{TEMP_DIR.rstrip('/')}/media",
+)
+WORKER_PUBLIC_BASE_URL = (
+    str(
+        os.getenv("WORKER_PUBLIC_BASE_URL")
+        or ("" if IS_PRODUCTION else "http://localhost:8001")
+    )
+    .strip()
+    .rstrip("/")
+)
+WORKER_MEDIA_SIGNING_SECRET = str(
+    os.getenv("WORKER_MEDIA_SIGNING_SECRET")
+    or ("" if IS_PRODUCTION else "dev-worker-media-secret")
+).strip()
+WORKER_INTERNAL_API_TOKEN = str(
+    os.getenv("WORKER_INTERNAL_API_TOKEN")
+    or ("" if IS_PRODUCTION else "dev-worker-internal-token")
+).strip()
 
 # ---------------------------------------------------------------------------
 # Workers - concurrency & timeouts
@@ -296,6 +327,13 @@ def validate_env(extra: list[str] | None = None):
     missing = [v for v in required if not os.getenv(v)]
     if not any(os.getenv(name) for name in _ANALYZER_API_KEYS):
         missing.append("OPENAI_API_KEY or ANTHROPIC_API_KEY")
+    if MEDIA_STORAGE_PROVIDER == "local":
+        if not WORKER_PUBLIC_BASE_URL:
+            missing.append("WORKER_PUBLIC_BASE_URL")
+        if not WORKER_MEDIA_SIGNING_SECRET:
+            missing.append("WORKER_MEDIA_SIGNING_SECRET")
+        if not WORKER_INTERNAL_API_TOKEN:
+            missing.append("WORKER_INTERNAL_API_TOKEN")
     if missing:
         logger.error("Missing required environment variables: %s", ", ".join(missing))
         raise SystemExit(1)

@@ -9,6 +9,11 @@ from typing import Any
 
 import ffmpeg
 
+from utils.media_storage import (
+    delete_local_generated_clip,
+    prefer_local_media_storage,
+    store_local_generated_clip,
+)
 from utils.supabase_client import (
     assert_response_ok,
     supabase,
@@ -182,6 +187,12 @@ def upload_clip_with_replace(
     logger,
     allow_reencode: bool = True,
 ) -> int:
+    if prefer_local_media_storage():
+        return store_local_generated_clip(
+            local_clip_path=local_clip_path,
+            storage_path=storage_path,
+        )
+
     source_path = str(local_clip_path)
     candidate_path = source_path
     original_size = os.path.getsize(candidate_path)
@@ -381,6 +392,17 @@ def best_effort_cleanup_uploaded_artifacts(
     logger,
 ) -> None:
     """Delete uploaded files and clear DB pointers after partial failure."""
+    if storage_path:
+        try:
+            delete_local_generated_clip(storage_path, logger=logger)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to delete local clip artifact %s: %s",
+                job_id,
+                storage_path,
+                exc,
+            )
+
     if storage_path:
         try:
             supabase.storage.from_("generated-clips").remove([storage_path])

@@ -99,6 +99,7 @@ services:
       retries: 3
       start_period: 10s
     volumes:
+      - video_data:/tmp/video_clipper
       - type: bind
         source: ${YTDLP_COOKIES_SECRET_DIR:-./secrets}
         target: /run/secrets

@@ -235,3 +235,17 @@ class CancelClipPublicationResponse(BaseModel):
 
 class RetryClipPublicationResponse(BaseModel):
     publication: ClipPublicationResponse
+
+
+class DeleteClipStorageRequest(BaseModel):
+    storagePaths: list[str] = Field(default_factory=list, max_length=500)
+
+
+class DeleteVideoStorageRequest(BaseModel):
+    rawVideoPaths: list[str] = Field(default_factory=list, max_length=500)
+    rawVideoStoragePaths: list[str] = Field(default_factory=list, max_length=500)
+
+
+class DeleteStorageResponse(BaseModel):
+    requested: int = 0
+    removed: int = 0

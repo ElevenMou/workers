@@ -15,6 +15,7 @@ def test_upload_clip_disallow_reencode_fails_before_preupload_optimization(
     clip_path.write_bytes(b"x" * 64)
     reencode_called = {"value": False}
 
+    monkeypatch.setattr(lifecycle_helpers, "prefer_local_media_storage", lambda: False)
     monkeypatch.setattr(
         lifecycle_helpers,
         "_get_generated_clips_bucket_limit_bytes",
@@ -51,6 +52,7 @@ def test_upload_clip_disallow_reencode_fails_on_payload_too_large_without_retry(
     clip_path.write_bytes(b"x" * 64)
     reencode_called = {"value": False}
 
+    monkeypatch.setattr(lifecycle_helpers, "prefer_local_media_storage", lambda: False)
     monkeypatch.setattr(
         lifecycle_helpers,
         "_get_generated_clips_bucket_limit_bytes",

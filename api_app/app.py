@@ -16,6 +16,7 @@ from api_app.rate_limit import limiter
 from api_app.routers.captions import router as captions_router
 from api_app.routers.clips import router as clips_router
 from api_app.routers.health import router as health_router
+from api_app.routers.media import router as media_router
 from api_app.routers.publishing import router as publishing_router
 from api_app.routers.videos import router as videos_router
 from api_app.routers.workers import router as workers_router
@@ -138,6 +139,7 @@ app.include_router(captions_router)
 app.include_router(videos_router)
 app.include_router(clips_router)
 app.include_router(publishing_router)
+app.include_router(media_router)
 
 # Versioned routes (v1 prefix) — mirrors root for forward-compatibility.
 app.include_router(health_router, prefix="/v1")
@@ -146,3 +148,4 @@ app.include_router(captions_router, prefix="/v1")
 app.include_router(videos_router, prefix="/v1")
 app.include_router(clips_router, prefix="/v1")
 app.include_router(publishing_router, prefix="/v1")
+app.include_router(media_router, prefix="/v1")
