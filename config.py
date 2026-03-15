@@ -8,6 +8,8 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 ENVIRONMENT = (os.getenv("ENVIRONMENT", "development") or "development").strip().lower()
 IS_PRODUCTION = ENVIRONMENT in {"production", "prod"}
+IS_DOCKER_RUNTIME = os.path.exists("/.dockerenv")
+ALLOW_DEVELOPMENT_MEDIA_DEFAULTS = not IS_PRODUCTION and not IS_DOCKER_RUNTIME
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -107,18 +109,18 @@ LOCAL_MEDIA_ROOT = os.getenv(
 WORKER_PUBLIC_BASE_URL = (
     str(
         os.getenv("WORKER_PUBLIC_BASE_URL")
-        or ("" if IS_PRODUCTION else "http://localhost:8001")
+        or ("" if not ALLOW_DEVELOPMENT_MEDIA_DEFAULTS else "http://localhost:8001")
     )
     .strip()
     .rstrip("/")
 )
 WORKER_MEDIA_SIGNING_SECRET = str(
     os.getenv("WORKER_MEDIA_SIGNING_SECRET")
-    or ("" if IS_PRODUCTION else "dev-worker-media-secret")
+    or ("" if not ALLOW_DEVELOPMENT_MEDIA_DEFAULTS else "dev-worker-media-secret")
 ).strip()
 WORKER_INTERNAL_API_TOKEN = str(
     os.getenv("WORKER_INTERNAL_API_TOKEN")
-    or ("" if IS_PRODUCTION else "dev-worker-internal-token")
+    or ("" if not ALLOW_DEVELOPMENT_MEDIA_DEFAULTS else "dev-worker-internal-token")
 ).strip()
 
 # ---------------------------------------------------------------------------

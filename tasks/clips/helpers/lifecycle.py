@@ -5,11 +5,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 import ffmpeg
 
 from utils.media_storage import (
+    GENERATED_CLIPS_BUCKET,
     delete_local_generated_clip,
     prefer_local_media_storage,
     store_local_generated_clip,
@@ -27,8 +29,9 @@ _VIDEO_UPLOAD_OPTIONS = {
     "x-upsert": "true",
 }
 _DETAIL_VALUE_TYPES = (str, int, float, bool)
+_BUCKET_LIMIT_CACHE_TTL_SECONDS = 300  # 5 minutes
 _BUCKET_LIMIT_UNSET = object()
-_generated_clips_bucket_limit_bytes: int | None | object = _BUCKET_LIMIT_UNSET
+_bucket_limit_cache: dict[str, object] = {"value": _BUCKET_LIMIT_UNSET, "fetched_at": 0.0}
 _UPLOAD_REENCODE_STEPS: tuple[tuple[int, str, str], ...] = (
     # crf, preset, audio bitrate
     (15, "veryslow", "192k"),
@@ -94,7 +97,7 @@ def _upload_with_duplicate_replace(
 ) -> None:
     with open(local_clip_path, "rb") as file_obj:
         try:
-            supabase.storage.from_("generated-clips").upload(
+            supabase.storage.from_(GENERATED_CLIPS_BUCKET).upload(
                 storage_path,
                 file_obj,
                 file_options=_VIDEO_UPLOAD_OPTIONS,
@@ -109,9 +112,9 @@ def _upload_with_duplicate_replace(
                 job_id,
                 storage_path,
             )
-            supabase.storage.from_("generated-clips").remove([storage_path])
+            supabase.storage.from_(GENERATED_CLIPS_BUCKET).remove([storage_path])
             file_obj.seek(0)
-            supabase.storage.from_("generated-clips").upload(
+            supabase.storage.from_(GENERATED_CLIPS_BUCKET).upload(
                 storage_path,
                 file_obj,
                 file_options=_VIDEO_UPLOAD_OPTIONS,
@@ -148,15 +151,18 @@ def _reencode_clip_for_upload(
 
 
 def _get_generated_clips_bucket_limit_bytes(*, job_id: str, logger) -> int | None:
-    global _generated_clips_bucket_limit_bytes
-    if _generated_clips_bucket_limit_bytes is not _BUCKET_LIMIT_UNSET:
-        return _generated_clips_bucket_limit_bytes
+    now = time.monotonic()
+    cached_value = _bucket_limit_cache["value"]
+    cached_at = float(_bucket_limit_cache["fetched_at"])
+    if cached_value is not _BUCKET_LIMIT_UNSET and (now - cached_at) < _BUCKET_LIMIT_CACHE_TTL_SECONDS:
+        return cached_value  # type: ignore[return-value]
 
     try:
-        bucket = supabase.storage.get_bucket("generated-clips")
+        bucket = supabase.storage.get_bucket(GENERATED_CLIPS_BUCKET)
         raw_limit = getattr(bucket, "file_size_limit", None)
         parsed_limit = int(raw_limit) if raw_limit else None
-        _generated_clips_bucket_limit_bytes = parsed_limit
+        _bucket_limit_cache["value"] = parsed_limit
+        _bucket_limit_cache["fetched_at"] = now
         if parsed_limit:
             logger.info(
                 "[%s] Detected generated-clips bucket size limit: %d bytes",
@@ -175,7 +181,8 @@ def _get_generated_clips_bucket_limit_bytes(*, job_id: str, logger) -> int | Non
             job_id,
             exc,
         )
-        _generated_clips_bucket_limit_bytes = None
+        _bucket_limit_cache["value"] = None
+        _bucket_limit_cache["fetched_at"] = now
         return None
 
 
@@ -198,102 +205,27 @@ def upload_clip_with_replace(
     original_size = os.path.getsize(candidate_path)
     bucket_limit_bytes = _get_generated_clips_bucket_limit_bytes(job_id=job_id, logger=logger)
     attempt = 0
+    optimization_files: list[str] = []
 
-    # If we know the bucket cap and the original file is already above it,
-    # skip the guaranteed first upload failure and optimize first.
-    if bucket_limit_bytes and original_size > bucket_limit_bytes:
-        if not allow_reencode:
-            raise RuntimeError(
-                "Generated clip exceeds storage upload size limit "
-                f"(size={original_size} bytes, limit={bucket_limit_bytes} bytes) "
-                "and quality-preserving mode disables upload re-encoding. "
-                "Increase generated-clips bucket file-size limit."
-            )
-
-        logger.warning(
-            "[%s] Original clip exceeds bucket limit (size=%d limit=%d). "
-            "Applying size optimization before upload.",
-            job_id,
-            original_size,
-            bucket_limit_bytes,
-        )
-        step_crf, step_preset, step_audio_bitrate = _UPLOAD_REENCODE_STEPS[attempt]
-        output_path = str(
-            Path(local_clip_path).with_name(
-                f"{Path(local_clip_path).stem}.upload_opt_{attempt + 1}.mp4"
-            )
-        )
-        _reencode_clip_for_upload(
-            # Always encode from original source for best retained quality.
-            input_path=source_path,
-            output_path=output_path,
-            crf=step_crf,
-            preset=step_preset,
-            audio_bitrate=step_audio_bitrate,
-        )
-        optimized_size = os.path.getsize(output_path)
-        logger.warning(
-            "[%s] Pre-upload optimization applied (attempt=%d crf=%d preset=%s audio=%s size=%d->%d bytes)",
-            job_id,
-            attempt + 1,
-            step_crf,
-            step_preset,
-            step_audio_bitrate,
-            original_size,
-            optimized_size,
-        )
-        candidate_path = output_path
-        attempt += 1
-
-    while True:
-        try:
-            _upload_with_duplicate_replace(
-                local_clip_path=candidate_path,
-                storage_path=storage_path,
-                job_id=job_id,
-                logger=logger,
-            )
-            final_size = os.path.getsize(candidate_path)
-            if attempt > 0:
-                logger.warning(
-                    "[%s] Upload succeeded after size optimization (%d -> %d bytes, attempts=%d)",
-                    job_id,
-                    original_size,
-                    final_size,
-                    attempt,
-                )
-            return final_size
-        except Exception as exc:
-            if not _is_payload_too_large_storage_error(exc):
-                raise
-
+    try:
+        # If we know the bucket cap and the original file is already above it,
+        # skip the guaranteed first upload failure and optimize first.
+        if bucket_limit_bytes and original_size > bucket_limit_bytes:
             if not allow_reencode:
-                current_size = os.path.getsize(candidate_path)
-                limit_suffix = (
-                    f" limit={bucket_limit_bytes} bytes"
-                    if isinstance(bucket_limit_bytes, int) and bucket_limit_bytes > 0
-                    else ""
-                )
                 raise RuntimeError(
-                    "Generated clip exceeds storage upload size limit during upload "
-                    f"(size={current_size} bytes{limit_suffix}) and quality-preserving mode "
-                    "disables fallback re-encoding. Increase generated-clips bucket file-size limit."
-                ) from exc
-
-            if attempt >= len(_UPLOAD_REENCODE_STEPS):
-                raise RuntimeError(
-                    "Generated clip exceeds storage upload size limit after optimization attempts. "
-                    "Increase storage bucket size limit or reduce output quality/duration."
-                ) from exc
-
-            if attempt == 0:
-                logger.warning(
-                    "[%s] Original clip is too large for storage bucket (size=%d bytes). "
-                    "To preserve full quality, increase generated-clips bucket file-size limit.",
-                    job_id,
-                    os.path.getsize(source_path),
+                    "Generated clip exceeds storage upload size limit "
+                    f"(size={original_size} bytes, limit={bucket_limit_bytes} bytes) "
+                    "and quality-preserving mode disables upload re-encoding. "
+                    "Increase generated-clips bucket file-size limit."
                 )
 
+            logger.warning(
+                "[%s] Original clip exceeds bucket limit (size=%d limit=%d). "
+                "Applying size optimization before upload.",
+                job_id,
+                original_size,
+                bucket_limit_bytes,
+            )
             step_crf, step_preset, step_audio_bitrate = _UPLOAD_REENCODE_STEPS[attempt]
             output_path = str(
                 Path(local_clip_path).with_name(
@@ -301,27 +233,112 @@ def upload_clip_with_replace(
                 )
             )
             _reencode_clip_for_upload(
-                # Always encode from the original render to avoid cumulative
-                # quality loss across multiple fallback attempts.
+                # Always encode from original source for best retained quality.
                 input_path=source_path,
                 output_path=output_path,
                 crf=step_crf,
                 preset=step_preset,
                 audio_bitrate=step_audio_bitrate,
             )
+            optimization_files.append(output_path)
             optimized_size = os.path.getsize(output_path)
             logger.warning(
-                "[%s] Upload payload too large. Retrying with smaller encode (attempt=%d crf=%d preset=%s audio=%s size=%d->%d bytes)",
+                "[%s] Pre-upload optimization applied (attempt=%d crf=%d preset=%s audio=%s size=%d->%d bytes)",
                 job_id,
                 attempt + 1,
                 step_crf,
                 step_preset,
                 step_audio_bitrate,
-                os.path.getsize(candidate_path),
+                original_size,
                 optimized_size,
             )
             candidate_path = output_path
             attempt += 1
+
+        while True:
+            try:
+                _upload_with_duplicate_replace(
+                    local_clip_path=candidate_path,
+                    storage_path=storage_path,
+                    job_id=job_id,
+                    logger=logger,
+                )
+                final_size = os.path.getsize(candidate_path)
+                if attempt > 0:
+                    logger.warning(
+                        "[%s] Upload succeeded after size optimization (%d -> %d bytes, attempts=%d)",
+                        job_id,
+                        original_size,
+                        final_size,
+                        attempt,
+                    )
+                return final_size
+            except Exception as exc:
+                if not _is_payload_too_large_storage_error(exc):
+                    raise
+
+                if not allow_reencode:
+                    current_size = os.path.getsize(candidate_path)
+                    limit_suffix = (
+                        f" limit={bucket_limit_bytes} bytes"
+                        if isinstance(bucket_limit_bytes, int) and bucket_limit_bytes > 0
+                        else ""
+                    )
+                    raise RuntimeError(
+                        "Generated clip exceeds storage upload size limit during upload "
+                        f"(size={current_size} bytes{limit_suffix}) and quality-preserving mode "
+                        "disables fallback re-encoding. Increase generated-clips bucket file-size limit."
+                    ) from exc
+
+                if attempt >= len(_UPLOAD_REENCODE_STEPS):
+                    raise RuntimeError(
+                        "Generated clip exceeds storage upload size limit after optimization attempts. "
+                        "Increase storage bucket size limit or reduce output quality/duration."
+                    ) from exc
+
+                if attempt == 0:
+                    logger.warning(
+                        "[%s] Original clip is too large for storage bucket (size=%d bytes). "
+                        "To preserve full quality, increase generated-clips bucket file-size limit.",
+                        job_id,
+                        os.path.getsize(source_path),
+                    )
+
+                step_crf, step_preset, step_audio_bitrate = _UPLOAD_REENCODE_STEPS[attempt]
+                output_path = str(
+                    Path(local_clip_path).with_name(
+                        f"{Path(local_clip_path).stem}.upload_opt_{attempt + 1}.mp4"
+                    )
+                )
+                _reencode_clip_for_upload(
+                    # Always encode from the original render to avoid cumulative
+                    # quality loss across multiple fallback attempts.
+                    input_path=source_path,
+                    output_path=output_path,
+                    crf=step_crf,
+                    preset=step_preset,
+                    audio_bitrate=step_audio_bitrate,
+                )
+                optimization_files.append(output_path)
+                optimized_size = os.path.getsize(output_path)
+                logger.warning(
+                    "[%s] Upload payload too large. Retrying with smaller encode (attempt=%d crf=%d preset=%s audio=%s size=%d->%d bytes)",
+                    job_id,
+                    attempt + 1,
+                    step_crf,
+                    step_preset,
+                    step_audio_bitrate,
+                    os.path.getsize(candidate_path),
+                    optimized_size,
+                )
+                candidate_path = output_path
+                attempt += 1
+    finally:
+        for opt_file in optimization_files:
+            try:
+                os.remove(opt_file)
+            except OSError:
+                pass
 
 
 def _sanitize_detail_params(detail_params: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -405,7 +422,7 @@ def best_effort_cleanup_uploaded_artifacts(
 
     if storage_path:
         try:
-            supabase.storage.from_("generated-clips").remove([storage_path])
+            supabase.storage.from_(GENERATED_CLIPS_BUCKET).remove([storage_path])
         except Exception as exc:
             logger.warning(
                 "[%s] Failed to delete uploaded clip artifact %s: %s",

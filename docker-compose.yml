@@ -64,6 +64,12 @@ services:
     deploy:
       replicas: ${API_REPLICAS:-1}
     environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-local}
+      - LOCAL_MEDIA_ROOT=${LOCAL_MEDIA_ROOT:-/tmp/video_clipper/media}
+      - WORKER_PUBLIC_BASE_URL=${WORKER_PUBLIC_BASE_URL:-}
+      - WORKER_MEDIA_SIGNING_SECRET=${WORKER_MEDIA_SIGNING_SECRET:-}
+      - WORKER_INTERNAL_API_TOKEN=${WORKER_INTERNAL_API_TOKEN:-}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
@@ -125,6 +131,12 @@ services:
       retries: 3
       start_period: 60s
     environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-local}
+      - LOCAL_MEDIA_ROOT=${LOCAL_MEDIA_ROOT:-/tmp/video_clipper/media}
+      - WORKER_PUBLIC_BASE_URL=${WORKER_PUBLIC_BASE_URL:-}
+      - WORKER_MEDIA_SIGNING_SECRET=${WORKER_MEDIA_SIGNING_SECRET:-}
+      - WORKER_INTERNAL_API_TOKEN=${WORKER_INTERNAL_API_TOKEN:-}
       - YTDLP_COOKIES_FILE=/tmp/video_clipper/yt-dlp/cookies.txt
       - YTDLP_PROXY=${YTDLP_PROXY:-}
       - YTDLP_PROXY_LIST=${YTDLP_PROXY_LIST:-}
@@ -194,6 +206,12 @@ services:
       retries: 3
       start_period: 60s
     environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-local}
+      - LOCAL_MEDIA_ROOT=${LOCAL_MEDIA_ROOT:-/tmp/video_clipper/media}
+      - WORKER_PUBLIC_BASE_URL=${WORKER_PUBLIC_BASE_URL:-}
+      - WORKER_MEDIA_SIGNING_SECRET=${WORKER_MEDIA_SIGNING_SECRET:-}
+      - WORKER_INTERNAL_API_TOKEN=${WORKER_INTERNAL_API_TOKEN:-}
       - YTDLP_COOKIES_FILE=/tmp/video_clipper/yt-dlp/cookies.txt
       - YTDLP_PROXY=${YTDLP_PROXY:-}
       - YTDLP_PROXY_LIST=${YTDLP_PROXY_LIST:-}
@@ -263,6 +281,12 @@ services:
       retries: 3
       start_period: 30s
     environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-local}
+      - LOCAL_MEDIA_ROOT=${LOCAL_MEDIA_ROOT:-/tmp/video_clipper/media}
+      - WORKER_PUBLIC_BASE_URL=${WORKER_PUBLIC_BASE_URL:-}
+      - WORKER_MEDIA_SIGNING_SECRET=${WORKER_MEDIA_SIGNING_SECRET:-}
+      - WORKER_INTERNAL_API_TOKEN=${WORKER_INTERNAL_API_TOKEN:-}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis
@@ -310,6 +334,12 @@ services:
       retries: 3
       start_period: 30s
     environment:
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-local}
+      - LOCAL_MEDIA_ROOT=${LOCAL_MEDIA_ROOT:-/tmp/video_clipper/media}
+      - WORKER_PUBLIC_BASE_URL=${WORKER_PUBLIC_BASE_URL:-}
+      - WORKER_MEDIA_SIGNING_SECRET=${WORKER_MEDIA_SIGNING_SECRET:-}
+      - WORKER_INTERNAL_API_TOKEN=${WORKER_INTERNAL_API_TOKEN:-}
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - REDIS_HOST=redis

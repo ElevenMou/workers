@@ -24,7 +24,7 @@ from config import (
 )
 from utils.supabase_client import supabase
 
-_GENERATED_CLIPS_BUCKET = "generated-clips"
+GENERATED_CLIPS_BUCKET = "generated-clips"
 _LOCAL_CLIP_CONTENT_TYPE = "video/mp4"
 _LOCAL_CLIP_UPLOAD_OPTIONS = {
     "content-type": _LOCAL_CLIP_CONTENT_TYPE,
@@ -194,7 +194,7 @@ def build_worker_clip_url(
 
 
 def resolve_generated_clip_local_path(storage_path: str) -> str:
-    return resolve_local_bucket_path(_GENERATED_CLIPS_BUCKET, storage_path)
+    return resolve_local_bucket_path(GENERATED_CLIPS_BUCKET, storage_path)
 
 
 def resolve_generated_clip_path(
@@ -220,8 +220,8 @@ def resolve_generated_clip_path(
         return None
 
     try:
-        payload = supabase.storage.from_(_GENERATED_CLIPS_BUCKET).download(
-            _normalize_bucket_relative_path(storage_path, _GENERATED_CLIPS_BUCKET)
+        payload = supabase.storage.from_(GENERATED_CLIPS_BUCKET).download(
+            _normalize_bucket_relative_path(storage_path, GENERATED_CLIPS_BUCKET)
         )
     except Exception as exc:
         if logger is not None:
@@ -258,7 +258,7 @@ def delete_local_generated_clip(storage_path: str, *, logger=None) -> bool:
 
     try:
         os.remove(local_path)
-        _best_effort_remove_empty_parent_dirs(_bucket_root(_GENERATED_CLIPS_BUCKET), local_path)
+        _best_effort_remove_empty_parent_dirs(_bucket_root(GENERATED_CLIPS_BUCKET), local_path)
     except OSError as exc:
         if logger is not None:
             logger.warning("Failed to delete local generated clip %s: %s", local_path, exc)
@@ -317,8 +317,8 @@ def create_signed_clip_url_from_supabase(
     expires_in_seconds: int = 3600,
 ) -> str | None:
     try:
-        payload = supabase.storage.from_(_GENERATED_CLIPS_BUCKET).create_signed_url(
-            _normalize_bucket_relative_path(storage_path, _GENERATED_CLIPS_BUCKET),
+        payload = supabase.storage.from_(GENERATED_CLIPS_BUCKET).create_signed_url(
+            _normalize_bucket_relative_path(storage_path, GENERATED_CLIPS_BUCKET),
             expires_in_seconds,
         )
     except Exception:
