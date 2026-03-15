@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from config import MEDIA_STORAGE_PROVIDER, MINIO_LAYOUTS_BUCKET
 from utils.supabase_client import assert_response_ok, supabase
 
 
@@ -281,7 +282,12 @@ def maybe_download_media_files(
             return None
         dest = os.path.join(work_dir, local_name)
         try:
-            file_bytes = supabase.storage.from_("layouts").download(storage_path.strip())
+            if MEDIA_STORAGE_PROVIDER == "minio":
+                from utils.minio_client import download_object
+
+                file_bytes = download_object(MINIO_LAYOUTS_BUCKET, storage_path.strip())
+            else:
+                file_bytes = supabase.storage.from_("layouts").download(storage_path.strip())
             with open(dest, "wb") as f:
                 f.write(file_bytes)
             logger.info("[%s] Downloaded %s from storage: %s", job_id, label, storage_path)
@@ -318,7 +324,12 @@ def maybe_download_layout_background_image(
 
     bg_image_path = os.path.join(work_dir, "bg_image.jpg")
     try:
-        file_bytes = supabase.storage.from_("layouts").download(bg_image_storage_path)
+        if MEDIA_STORAGE_PROVIDER == "minio":
+            from utils.minio_client import download_object
+
+            file_bytes = download_object(MINIO_LAYOUTS_BUCKET, bg_image_storage_path)
+        else:
+            file_bytes = supabase.storage.from_("layouts").download(bg_image_storage_path)
         with open(bg_image_path, "wb") as f:
             f.write(file_bytes)
         logger.info(

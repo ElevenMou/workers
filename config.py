@@ -143,6 +143,12 @@ MINIO_CLIPS_BUCKET = (
 MINIO_RAW_VIDEOS_BUCKET = (
     os.getenv("MINIO_RAW_VIDEOS_BUCKET") or "raw-videos"
 ).strip()
+MINIO_AVATARS_BUCKET = (
+    os.getenv("MINIO_AVATARS_BUCKET") or "avatars"
+).strip()
+MINIO_LAYOUTS_BUCKET = (
+    os.getenv("MINIO_LAYOUTS_BUCKET") or "layouts"
+).strip()
 
 # ---------------------------------------------------------------------------
 # Workers - concurrency & timeouts

@@ -9,8 +9,10 @@ from minio import Minio
 
 from config import (
     MINIO_ACCESS_KEY,
+    MINIO_AVATARS_BUCKET,
     MINIO_CLIPS_BUCKET,
     MINIO_ENDPOINT,
+    MINIO_LAYOUTS_BUCKET,
     MINIO_PUBLIC_ENDPOINT,
     MINIO_RAW_VIDEOS_BUCKET,
     MINIO_REGION,
@@ -76,10 +78,26 @@ def get_minio_public_client() -> Minio:
 def ensure_buckets() -> None:
     """Create required buckets if they don't exist."""
     client = get_minio_client()
-    for bucket_name in (MINIO_CLIPS_BUCKET, MINIO_RAW_VIDEOS_BUCKET):
+    for bucket_name in (
+        MINIO_CLIPS_BUCKET,
+        MINIO_RAW_VIDEOS_BUCKET,
+        MINIO_AVATARS_BUCKET,
+        MINIO_LAYOUTS_BUCKET,
+    ):
         if not client.bucket_exists(bucket_name):
             client.make_bucket(bucket_name, location=MINIO_REGION)
             logger.info("Created MinIO bucket: %s", bucket_name)
+
+
+def download_object(bucket: str, object_name: str) -> bytes:
+    """Download an object from MinIO and return its contents as bytes."""
+    client = get_minio_client()
+    response = client.get_object(bucket, object_name)
+    try:
+        return response.read()
+    finally:
+        response.close()
+        response.release_conn()
 
 
 def presigned_get_url(

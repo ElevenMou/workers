@@ -35,6 +35,8 @@ services:
       mc alias set clipry http://minio:9000 $${MINIO_ACCESS_KEY:-minioadmin} $${MINIO_SECRET_KEY:-minioadmin};
       mc mb --ignore-existing clipry/generated-clips;
       mc mb --ignore-existing clipry/raw-videos;
+      mc mb --ignore-existing clipry/avatars;
+      mc mb --ignore-existing clipry/layouts;
       echo 'MinIO buckets ready';
       "
     environment:
@@ -43,22 +45,9 @@ services:
     restart: "no"
 
   # ---------- Cloudflare Tunnel for MinIO (storage.clipscut.pro) ----------
-  # Exposes MinIO's S3 API to the internet via Cloudflare Tunnel.
-  # Create the tunnel once:
-  #   cloudflared tunnel create clipscut-storage
-  #   cloudflared tunnel route dns clipscut-storage storage.clipscut.pro
-  # Then set CLOUDFLARED_STORAGE_TOKEN in your .env to the tunnel token.
-  cloudflared-storage:
-    image: cloudflare/cloudflared:latest
-    command: tunnel run
-    environment:
-      - TUNNEL_TOKEN=${CLOUDFLARED_STORAGE_TOKEN:-}
-    depends_on:
-      minio:
-        condition: service_healthy
-    restart: unless-stopped
-    mem_limit: ${CLOUDFLARED_STORAGE_MEM_LIMIT:-256m}
-    cpus: ${CLOUDFLARED_STORAGE_CPU_LIMIT:-0.5}
+  # Run on the host (not in Docker) to avoid pulling the cloudflared image:
+  #   cloudflared tunnel run clipscut-storage
+  # The tunnel must route storage.clipscut.pro -> http://localhost:9000
 
   # ---------- Caddy (TLS termination + load balancer) ----------
   # Automatically provisions Let's Encrypt certificates for CADDY_DOMAIN.
