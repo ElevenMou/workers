@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from config import (
-    RAW_VIDEO_STORAGE_BUCKET,
+    MINIO_RAW_VIDEOS_BUCKET,
     RAW_VIDEO_CACHE_DIR,
     SOURCE_VIDEO_LOCK_TTL_SECONDS,
     SOURCE_VIDEO_LOCK_WAIT_SECONDS,
@@ -21,8 +21,8 @@ from services.video_downloader import VideoDownloader
 from tasks.clips.helpers.media import probe_video_size
 from utils.redis_client import get_redis_connection
 from utils.media_storage import (
-    get_media_storage_provider,
     preferred_source_video_order,
+    upload_raw_video,
 )
 from utils.supabase_client import supabase
 
@@ -30,7 +30,7 @@ _VIDEO_RAW_TTL_HOURS = 24
 _WAIT_STAGE_NOTIFY_INTERVAL_SECONDS = 5.0
 _WAIT_POLL_INTERVAL_SECONDS = 1.0
 _UNSET_SOURCE_MAX_HEIGHT = object()
-_RAW_VIDEO_STORAGE_BUCKET = RAW_VIDEO_STORAGE_BUCKET
+_RAW_VIDEO_STORAGE_BUCKET = MINIO_RAW_VIDEOS_BUCKET
 
 
 @dataclass(slots=True)
@@ -129,8 +129,7 @@ def upload_raw_video_to_storage(
     job_id: str,
 ) -> tuple[str | None, str | None]:
     """Upload canonical raw source into private storage and return path + hash."""
-    provider = get_media_storage_provider()
-    return provider.upload_raw_video(
+    return upload_raw_video(
         video_id=video_id,
         local_video_path=local_video_path,
         logger=logger,
@@ -161,34 +160,23 @@ def _resolve_storage_video_path(
             return cached_existing
 
     try:
-        payload = supabase.storage.from_(_RAW_VIDEO_STORAGE_BUCKET).download(raw_video_storage_path)
+        from utils.minio_client import get_minio_client
+
+        client = get_minio_client()
+        object_name = str(raw_video_storage_path).strip().replace("\\", "/").lstrip("/")
+        bucket_prefix = f"{_RAW_VIDEO_STORAGE_BUCKET}/"
+        if object_name.startswith(bucket_prefix):
+            object_name = object_name[len(bucket_prefix) :]
+        tmp_path = f"{cache_path}.tmp"
+        Path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+        client.fget_object(_RAW_VIDEO_STORAGE_BUCKET, object_name, tmp_path)
+        os.replace(tmp_path, cache_path)
     except Exception as exc:
         logger.warning(
             "[%s] Could not download canonical raw source %s/%s: %s",
             job_id,
             _RAW_VIDEO_STORAGE_BUCKET,
             raw_video_storage_path,
-            exc,
-        )
-        return None
-
-    if payload is None:
-        return None
-
-    try:
-        if isinstance(payload, (bytes, bytearray)):
-            data = bytes(payload)
-        else:
-            data = payload.read()
-        tmp_path = f"{cache_path}.tmp"
-        with open(tmp_path, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp_path, cache_path)
-    except Exception as exc:
-        logger.warning(
-            "[%s] Failed to materialize canonical raw source to local cache for %s: %s",
-            job_id,
-            video_id,
             exc,
         )
         return None

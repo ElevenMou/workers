@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from datetime import timedelta
 
 from minio import Minio
@@ -24,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 _client: Minio | None = None
 _public_client: Minio | None = None
+_storage_initialized = False
 
 
 def get_minio_client() -> Minio:
@@ -75,18 +78,78 @@ def get_minio_public_client() -> Minio:
     return _public_client
 
 
+def _bucket_policy(*, bucket_name: str, public_read: bool) -> str:
+    statements: list[dict[str, object]] = []
+    if public_read:
+        statements.append(
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": ["*"]},
+                "Action": ["s3:GetObject"],
+                "Resource": [f"arn:aws:s3:::{bucket_name}/*"],
+            }
+        )
+
+    return json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": statements,
+        }
+    )
+
+
+def _ensure_bucket_policy(client: Minio, bucket_name: str, *, public_read: bool) -> None:
+    desired_policy = _bucket_policy(bucket_name=bucket_name, public_read=public_read)
+    try:
+        current_policy = client.get_bucket_policy(bucket_name)
+    except Exception:
+        current_policy = None
+
+    if current_policy == desired_policy:
+        return
+
+    client.set_bucket_policy(bucket_name, desired_policy)
+    logger.info(
+        "Applied MinIO bucket policy for %s (public_read=%s)",
+        bucket_name,
+        public_read,
+    )
+
+
 def ensure_buckets() -> None:
     """Create required buckets if they don't exist."""
     client = get_minio_client()
-    for bucket_name in (
-        MINIO_CLIPS_BUCKET,
-        MINIO_RAW_VIDEOS_BUCKET,
-        MINIO_AVATARS_BUCKET,
-        MINIO_LAYOUTS_BUCKET,
-    ):
+    bucket_specs = (
+        (MINIO_CLIPS_BUCKET, False),
+        (MINIO_RAW_VIDEOS_BUCKET, False),
+        (MINIO_AVATARS_BUCKET, True),
+        (MINIO_LAYOUTS_BUCKET, False),
+    )
+    for bucket_name, public_read in bucket_specs:
         if not client.bucket_exists(bucket_name):
             client.make_bucket(bucket_name, location=MINIO_REGION)
             logger.info("Created MinIO bucket: %s", bucket_name)
+        _ensure_bucket_policy(client, bucket_name, public_read=public_read)
+
+
+def initialize_minio_storage() -> None:
+    """Ensure MinIO buckets and policies exist exactly once per process."""
+    global _storage_initialized
+    if _storage_initialized:
+        return
+
+    if str(os.getenv("MINIO_SKIP_STARTUP_READINESS") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        logger.info("Skipping MinIO startup readiness checks")
+        _storage_initialized = True
+        return
+
+    ensure_buckets()
+    _storage_initialized = True
 
 
 def download_object(bucket: str, object_name: str) -> bytes:

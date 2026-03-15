@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timezone
 
-from config import RAW_VIDEO_STORAGE_BUCKET
+from utils.media_storage import delete_local_raw_video, delete_raw_video_from_storage
 from utils.supabase_client import assert_response_ok, supabase
 
 logger = logging.getLogger(__name__)
@@ -33,28 +32,21 @@ def cleanup_expired_raw_videos(batch_size: int = 100) -> dict[str, int]:
         raw_video_path = row.get("raw_video_path")
         raw_video_storage_path = row.get("raw_video_storage_path")
 
-        path_cleared = False
-        if raw_video_path:
-            try:
-                if os.path.isfile(raw_video_path):
-                    os.remove(raw_video_path)
-                    removed += 1
-                path_cleared = True
-            except OSError as exc:
-                logger.warning(
-                    "Failed to delete expired raw video path %s for %s: %s",
-                    raw_video_path,
-                    video_id,
-                    exc,
-                )
-        else:
-            path_cleared = True
+        path_removed = delete_local_raw_video(
+            raw_video_path,
+            raw_video_storage_path=raw_video_storage_path,
+            logger=logger,
+        )
+        removed += path_removed
+        path_cleared = path_removed > 0 or not raw_video_path
 
         storage_cleared = False
         if raw_video_storage_path:
             try:
-                supabase.storage.from_(RAW_VIDEO_STORAGE_BUCKET).remove([raw_video_storage_path])
-                storage_cleared = True
+                storage_cleared = delete_raw_video_from_storage(
+                    raw_video_storage_path,
+                    logger=logger,
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to delete expired canonical raw video %s for %s: %s",

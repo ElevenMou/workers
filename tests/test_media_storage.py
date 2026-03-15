@@ -1,19 +1,13 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import api_app.routers.media as media_router
 import utils.media_storage as media_storage
+import utils.minio_client as minio_client
 
 
-def test_preferred_source_video_order_changes_with_provider(monkeypatch):
-    monkeypatch.setattr(media_storage, "MEDIA_STORAGE_PROVIDER", "local")
-    assert media_storage.get_media_storage_provider().name == "local"
-    assert media_storage.preferred_source_video_order() == ("local", "storage")
-
-    monkeypatch.setattr(media_storage, "MEDIA_STORAGE_PROVIDER", "supabase")
-    assert media_storage.get_media_storage_provider().name == "supabase"
+def test_preferred_source_video_order_is_minio_first():
     assert media_storage.preferred_source_video_order() == ("storage", "local")
 
 
@@ -45,45 +39,45 @@ def test_resolve_generated_clip_path_prefers_existing_local_file(tmp_path, monke
     local_path = media_storage.resolve_generated_clip_local_path("clips/local-first.mp4")
     media_storage._write_bytes_atomically(local_path, b"local-bytes")
 
-    download_calls = []
-
-    class _UnexpectedStorage:
-        def download(self, _path):
-            download_calls.append(_path)
+    class _UnexpectedMinioClient:
+        def fget_object(self, *_args, **_kwargs):
             raise AssertionError("remote download should not be used when local file exists")
 
     monkeypatch.setattr(
-        media_storage,
-        "supabase",
-        SimpleNamespace(storage=SimpleNamespace(from_=lambda _bucket: _UnexpectedStorage())),
+        minio_client,
+        "get_minio_client",
+        lambda: _UnexpectedMinioClient(),
     )
 
     resolved_path = media_storage.resolve_generated_clip_path("clips/local-first.mp4")
 
     assert resolved_path == local_path
-    assert download_calls == []
 
 
-def test_resolve_generated_clip_path_materializes_supabase_fallback(tmp_path, monkeypatch):
+def test_resolve_generated_clip_path_materializes_minio_object(tmp_path, monkeypatch):
     monkeypatch.setattr(media_storage, "LOCAL_MEDIA_ROOT", str(tmp_path / "media"))
+    download_calls: list[tuple[str, str, str]] = []
 
-    download_calls: list[str] = []
-
-    class _FakeStorage:
-        def download(self, path):
-            download_calls.append(path)
-            return b"remote-bytes"
+    class _FakeMinioClient:
+        def fget_object(self, bucket, object_name, file_path):
+            download_calls.append((bucket, object_name, file_path))
+            with open(file_path, "wb") as handle:
+                handle.write(b"remote-bytes")
 
     monkeypatch.setattr(
-        media_storage,
-        "supabase",
-        SimpleNamespace(storage=SimpleNamespace(from_=lambda _bucket: _FakeStorage())),
+        minio_client,
+        "get_minio_client",
+        lambda: _FakeMinioClient(),
     )
 
-    resolved_path = media_storage.resolve_generated_clip_path("generated-clips/clips/remote.mp4")
+    resolved_path = media_storage.resolve_generated_clip_path(
+        "generated-clips/clips/remote.mp4"
+    )
 
     assert resolved_path is not None
-    assert download_calls == ["clips/remote.mp4"]
+    assert download_calls == [
+        ("generated-clips", "clips/remote.mp4", resolved_path)
+    ]
     with open(resolved_path, "rb") as handle:
         assert handle.read() == b"remote-bytes"
 

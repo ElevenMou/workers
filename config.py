@@ -94,14 +94,17 @@ RAW_VIDEO_CACHE_DIR = os.getenv(
 )
 MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", 500))
 MEDIA_STORAGE_PROVIDER = (
-    str(os.getenv("MEDIA_STORAGE_PROVIDER", "local")).strip().lower() or "local"
+    str(os.getenv("MEDIA_STORAGE_PROVIDER", "minio")).strip().lower() or "minio"
 )
-if MEDIA_STORAGE_PROVIDER not in {"local", "supabase", "minio"}:
-    logger.warning(
-        "Invalid MEDIA_STORAGE_PROVIDER=%r; defaulting to local",
+# Local disk is still used for temporary caches/workdirs, but MinIO is the
+# only supported object-storage backend.
+if MEDIA_STORAGE_PROVIDER != "minio":
+    logger.error(
+        "Unsupported MEDIA_STORAGE_PROVIDER=%r. MinIO is the only supported "
+        "object-storage backend.",
         MEDIA_STORAGE_PROVIDER,
     )
-    MEDIA_STORAGE_PROVIDER = "local"
+    raise SystemExit(1)
 LOCAL_MEDIA_ROOT = os.getenv(
     "LOCAL_MEDIA_ROOT",
     f"{TEMP_DIR.rstrip('/')}/media",
@@ -356,20 +359,16 @@ def validate_env(extra: list[str] | None = None):
     missing = [v for v in required if not os.getenv(v)]
     if not any(os.getenv(name) for name in _ANALYZER_API_KEYS):
         missing.append("OPENAI_API_KEY or ANTHROPIC_API_KEY")
-    if MEDIA_STORAGE_PROVIDER == "local":
-        if not WORKER_PUBLIC_BASE_URL:
-            missing.append("WORKER_PUBLIC_BASE_URL")
-        if not WORKER_MEDIA_SIGNING_SECRET:
-            missing.append("WORKER_MEDIA_SIGNING_SECRET")
-        if not WORKER_INTERNAL_API_TOKEN:
-            missing.append("WORKER_INTERNAL_API_TOKEN")
-    if MEDIA_STORAGE_PROVIDER == "minio":
-        if not MINIO_ENDPOINT:
-            missing.append("MINIO_ENDPOINT")
-        if not MINIO_ACCESS_KEY:
-            missing.append("MINIO_ACCESS_KEY")
-        if not MINIO_SECRET_KEY:
-            missing.append("MINIO_SECRET_KEY")
+    if not MINIO_ENDPOINT:
+        missing.append("MINIO_ENDPOINT")
+    if not MINIO_ACCESS_KEY:
+        missing.append("MINIO_ACCESS_KEY")
+    if not MINIO_SECRET_KEY:
+        missing.append("MINIO_SECRET_KEY")
+    if not MINIO_PUBLIC_ENDPOINT:
+        missing.append("MINIO_PUBLIC_ENDPOINT")
+    if not WORKER_INTERNAL_API_TOKEN:
+        missing.append("WORKER_INTERNAL_API_TOKEN")
     if missing:
         logger.error("Missing required environment variables: %s", ", ".join(missing))
         raise SystemExit(1)

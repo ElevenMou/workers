@@ -481,8 +481,10 @@ def run_supervisor() -> int:
         set_group_worker_scale_target,
         set_worker_scale_target,
     )
+    from utils.minio_client import initialize_minio_storage
 
     validate_env()
+    initialize_minio_storage()
 
     signal.signal(signal.SIGTERM, _sigterm_handler)
     logger.info("SIGTERM handler registered for graceful Docker shutdown")

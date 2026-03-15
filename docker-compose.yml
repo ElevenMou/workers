@@ -115,7 +115,7 @@ services:
       replicas: ${API_REPLICAS:-1}
     environment:
       - ENVIRONMENT=${ENVIRONMENT:-development}
-      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-local}
+      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-minio}
       - LOCAL_MEDIA_ROOT=${LOCAL_MEDIA_ROOT:-/tmp/video_clipper/media}
       - WORKER_PUBLIC_BASE_URL=${WORKER_PUBLIC_BASE_URL:-}
       - WORKER_MEDIA_SIGNING_SECRET=${WORKER_MEDIA_SIGNING_SECRET:-}
@@ -188,7 +188,7 @@ services:
       start_period: 60s
     environment:
       - ENVIRONMENT=${ENVIRONMENT:-development}
-      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-local}
+      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-minio}
       - LOCAL_MEDIA_ROOT=${LOCAL_MEDIA_ROOT:-/tmp/video_clipper/media}
       - WORKER_PUBLIC_BASE_URL=${WORKER_PUBLIC_BASE_URL:-}
       - WORKER_MEDIA_SIGNING_SECRET=${WORKER_MEDIA_SIGNING_SECRET:-}
@@ -269,7 +269,7 @@ services:
       start_period: 60s
     environment:
       - ENVIRONMENT=${ENVIRONMENT:-development}
-      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-local}
+      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-minio}
       - LOCAL_MEDIA_ROOT=${LOCAL_MEDIA_ROOT:-/tmp/video_clipper/media}
       - WORKER_PUBLIC_BASE_URL=${WORKER_PUBLIC_BASE_URL:-}
       - WORKER_MEDIA_SIGNING_SECRET=${WORKER_MEDIA_SIGNING_SECRET:-}
@@ -350,7 +350,7 @@ services:
       start_period: 30s
     environment:
       - ENVIRONMENT=${ENVIRONMENT:-development}
-      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-local}
+      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-minio}
       - LOCAL_MEDIA_ROOT=${LOCAL_MEDIA_ROOT:-/tmp/video_clipper/media}
       - WORKER_PUBLIC_BASE_URL=${WORKER_PUBLIC_BASE_URL:-}
       - WORKER_MEDIA_SIGNING_SECRET=${WORKER_MEDIA_SIGNING_SECRET:-}
@@ -409,7 +409,7 @@ services:
       start_period: 30s
     environment:
       - ENVIRONMENT=${ENVIRONMENT:-development}
-      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-local}
+      - MEDIA_STORAGE_PROVIDER=${MEDIA_STORAGE_PROVIDER:-minio}
       - LOCAL_MEDIA_ROOT=${LOCAL_MEDIA_ROOT:-/tmp/video_clipper/media}
       - WORKER_PUBLIC_BASE_URL=${WORKER_PUBLIC_BASE_URL:-}
       - WORKER_MEDIA_SIGNING_SECRET=${WORKER_MEDIA_SIGNING_SECRET:-}

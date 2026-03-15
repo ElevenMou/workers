@@ -9,12 +9,9 @@ from pathlib import Path
 
 from services.social.base import PublicationMedia
 from utils.media_storage import (
-    build_worker_clip_url,
-    create_signed_clip_url_from_supabase,
-    prefer_local_media_storage,
+    create_signed_clip_url as create_minio_signed_clip_url,
     resolve_generated_clip_path,
 )
-from utils.supabase_client import supabase
 
 
 def _clip_id_from_storage_path(storage_path: str) -> str | None:
@@ -27,16 +24,9 @@ def _clip_id_from_storage_path(storage_path: str) -> str | None:
 
 def create_signed_clip_url(storage_path: str, *, expires_in_seconds: int = 3600) -> str | None:
     clip_id = _clip_id_from_storage_path(storage_path)
-    if prefer_local_media_storage() and clip_id:
-        worker_url = build_worker_clip_url(
-            clip_id,
-            expires_in_seconds=expires_in_seconds,
-        )
-        if worker_url:
-            return worker_url
-
-    return create_signed_clip_url_from_supabase(
+    return create_minio_signed_clip_url(
         storage_path,
+        clip_id=clip_id,
         expires_in_seconds=expires_in_seconds,
     )
 
@@ -46,10 +36,7 @@ def download_clip_to_path(storage_path: str, *, work_dir: str) -> str:
     if resolved_path:
         return resolved_path
 
-    raw = supabase.storage.from_("generated-clips").download(storage_path)
-    target_path = Path(work_dir) / "publication.mp4"
-    target_path.write_bytes(raw)
-    return str(target_path)
+    raise RuntimeError(f"Could not materialize clip from MinIO: {storage_path}")
 
 
 def probe_media(local_path: str) -> tuple[int | None, int | None, float | None]:

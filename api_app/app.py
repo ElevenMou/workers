@@ -22,6 +22,7 @@ from api_app.routers.videos import router as videos_router
 from api_app.routers.workers import router as workers_router
 from config import validate_env
 from utils.logging_config import correlation_id_var, generate_correlation_id, setup_logging
+from utils.minio_client import initialize_minio_storage
 
 setup_logging(component="api")
 
@@ -132,6 +133,7 @@ app.add_middleware(RequestSizeLimitMiddleware)
 app.add_middleware(RequestTimeoutMiddleware)
 app.add_middleware(CorrelationIdMiddleware)
 validate_env()
+initialize_minio_storage()
 
 app.include_router(health_router)
 app.include_router(workers_router)
