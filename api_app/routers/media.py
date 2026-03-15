@@ -19,7 +19,11 @@ from config import WORKER_INTERNAL_API_TOKEN
 from utils.media_storage import (
     delete_local_generated_clip,
     delete_local_raw_video,
+    delete_minio_generated_clip,
+    delete_minio_raw_video,
+    prefer_minio_media_storage,
     resolve_generated_clip_path,
+    resolve_minio_generated_clip_path,
     verify_signed_worker_media_request,
 )
 from utils.supabase_client import assert_response_ok, supabase
@@ -180,6 +184,13 @@ def _verify_signed_media_access(*, relative_path: str, expires: int, signature: 
 
 def _resolve_clip_media_path(clip_id: str) -> str:
     storage_path = _load_clip_storage_path(clip_id)
+
+    # Try MinIO first when it's the active provider.
+    if prefer_minio_media_storage():
+        resolved_path = resolve_minio_generated_clip_path(storage_path)
+        if resolved_path and os.path.isfile(resolved_path):
+            return resolved_path
+
     resolved_path = resolve_generated_clip_path(storage_path)
     if not resolved_path or not os.path.isfile(resolved_path):
         raise HTTPException(
@@ -234,6 +245,8 @@ def delete_clip_storage(
     removed = 0
     for storage_path in payload.storagePaths:
         if delete_local_generated_clip(storage_path):
+            removed += 1
+        if prefer_minio_media_storage() and delete_minio_generated_clip(storage_path):
             removed += 1
     return DeleteStorageResponse(requested=len(payload.storagePaths), removed=removed)
 

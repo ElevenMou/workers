@@ -96,7 +96,7 @@ MAX_VIDEO_SIZE_MB = int(os.getenv("MAX_VIDEO_SIZE_MB", 500))
 MEDIA_STORAGE_PROVIDER = (
     str(os.getenv("MEDIA_STORAGE_PROVIDER", "local")).strip().lower() or "local"
 )
-if MEDIA_STORAGE_PROVIDER not in {"local", "supabase"}:
+if MEDIA_STORAGE_PROVIDER not in {"local", "supabase", "minio"}:
     logger.warning(
         "Invalid MEDIA_STORAGE_PROVIDER=%r; defaulting to local",
         MEDIA_STORAGE_PROVIDER,
@@ -121,6 +121,27 @@ WORKER_MEDIA_SIGNING_SECRET = str(
 WORKER_INTERNAL_API_TOKEN = str(
     os.getenv("WORKER_INTERNAL_API_TOKEN")
     or ("" if not ALLOW_DEVELOPMENT_MEDIA_DEFAULTS else "dev-worker-internal-token")
+).strip()
+
+# ---------------------------------------------------------------------------
+# MinIO (S3-compatible object storage)
+# ---------------------------------------------------------------------------
+MINIO_ENDPOINT = (
+    os.getenv("MINIO_ENDPOINT")
+    or ("" if not ALLOW_DEVELOPMENT_MEDIA_DEFAULTS else "localhost:9000")
+).strip()
+MINIO_ACCESS_KEY = (os.getenv("MINIO_ACCESS_KEY") or "").strip()
+MINIO_SECRET_KEY = (os.getenv("MINIO_SECRET_KEY") or "").strip()
+MINIO_SECURE = _env_bool("MINIO_SECURE", False)
+MINIO_REGION = (os.getenv("MINIO_REGION") or "us-east-1").strip()
+# Public-facing endpoint for presigned URLs served to browsers.
+# Falls back to MINIO_ENDPOINT if unset.
+MINIO_PUBLIC_ENDPOINT = (os.getenv("MINIO_PUBLIC_ENDPOINT") or "").strip()
+MINIO_CLIPS_BUCKET = (
+    os.getenv("MINIO_CLIPS_BUCKET") or "generated-clips"
+).strip()
+MINIO_RAW_VIDEOS_BUCKET = (
+    os.getenv("MINIO_RAW_VIDEOS_BUCKET") or "raw-videos"
 ).strip()
 
 # ---------------------------------------------------------------------------
@@ -336,6 +357,13 @@ def validate_env(extra: list[str] | None = None):
             missing.append("WORKER_MEDIA_SIGNING_SECRET")
         if not WORKER_INTERNAL_API_TOKEN:
             missing.append("WORKER_INTERNAL_API_TOKEN")
+    if MEDIA_STORAGE_PROVIDER == "minio":
+        if not MINIO_ENDPOINT:
+            missing.append("MINIO_ENDPOINT")
+        if not MINIO_ACCESS_KEY:
+            missing.append("MINIO_ACCESS_KEY")
+        if not MINIO_SECRET_KEY:
+            missing.append("MINIO_SECRET_KEY")
     if missing:
         logger.error("Missing required environment variables: %s", ", ".join(missing))
         raise SystemExit(1)

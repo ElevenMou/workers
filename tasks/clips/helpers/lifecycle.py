@@ -13,8 +13,11 @@ import ffmpeg
 from utils.media_storage import (
     GENERATED_CLIPS_BUCKET,
     delete_local_generated_clip,
+    delete_minio_generated_clip,
     prefer_local_media_storage,
+    prefer_minio_media_storage,
     store_local_generated_clip,
+    store_minio_generated_clip,
 )
 from utils.supabase_client import (
     assert_response_ok,
@@ -196,6 +199,12 @@ def upload_clip_with_replace(
 ) -> int:
     if prefer_local_media_storage():
         return store_local_generated_clip(
+            local_clip_path=local_clip_path,
+            storage_path=storage_path,
+        )
+
+    if prefer_minio_media_storage():
+        return store_minio_generated_clip(
             local_clip_path=local_clip_path,
             storage_path=storage_path,
         )
@@ -415,6 +424,17 @@ def best_effort_cleanup_uploaded_artifacts(
         except Exception as exc:
             logger.warning(
                 "[%s] Failed to delete local clip artifact %s: %s",
+                job_id,
+                storage_path,
+                exc,
+            )
+
+    if storage_path and prefer_minio_media_storage():
+        try:
+            delete_minio_generated_clip(storage_path, logger=logger)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to delete MinIO clip artifact %s: %s",
                 job_id,
                 storage_path,
                 exc,

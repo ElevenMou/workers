@@ -17,6 +17,8 @@ from urllib.parse import urlencode
 from config import (
     LOCAL_MEDIA_ROOT,
     MEDIA_STORAGE_PROVIDER,
+    MINIO_CLIPS_BUCKET,
+    MINIO_RAW_VIDEOS_BUCKET,
     RAW_VIDEO_CACHE_DIR,
     RAW_VIDEO_STORAGE_BUCKET,
     WORKER_MEDIA_SIGNING_SECRET,
@@ -436,18 +438,85 @@ class SupabaseStorageProvider:
         return storage_path, file_hash
 
 
+@dataclass(slots=True)
+class MinioStorageProvider:
+    name: str = "minio"
+
+    def build_clip_url(
+        self,
+        clip_id: str,
+        *,
+        storage_path: str | None,
+        download: bool = False,
+        expires_in_seconds: int = 3600,
+    ) -> str | None:
+        if not storage_path:
+            return None
+
+        from utils.minio_client import presigned_get_url
+
+        object_name = _normalize_bucket_relative_path(storage_path, MINIO_CLIPS_BUCKET)
+        response_headers: dict[str, str] | None = None
+        if download:
+            response_headers = {
+                "response-content-disposition": f'attachment; filename="clip-{clip_id}.mp4"',
+            }
+        return presigned_get_url(
+            MINIO_CLIPS_BUCKET,
+            object_name,
+            expires_seconds=expires_in_seconds,
+            response_headers=response_headers,
+        )
+
+    def upload_raw_video(
+        self,
+        *,
+        video_id: str,
+        local_video_path: str,
+        logger,
+        job_id: str,
+    ) -> tuple[str | None, str | None]:
+        from utils.minio_client import get_minio_client
+
+        storage_path = _normalize_bucket_relative_path(
+            f"raw/{video_id}.mp4", MINIO_RAW_VIDEOS_BUCKET
+        )
+        file_hash = _sha256_file(local_video_path)
+        client = get_minio_client()
+        client.fput_object(
+            MINIO_RAW_VIDEOS_BUCKET,
+            storage_path,
+            local_video_path,
+            content_type="video/mp4",
+        )
+        logger.info(
+            "[%s] Uploaded raw source to MinIO %s/%s",
+            job_id,
+            MINIO_RAW_VIDEOS_BUCKET,
+            storage_path,
+        )
+        return storage_path, file_hash
+
+
 _LOCAL_PROVIDER = LocalDiskStorageProvider()
 _SUPABASE_PROVIDER = SupabaseStorageProvider()
+_MINIO_PROVIDER = MinioStorageProvider()
 
 
 def get_media_storage_provider() -> MediaStorageProvider:
     if MEDIA_STORAGE_PROVIDER == "supabase":
         return _SUPABASE_PROVIDER
+    if MEDIA_STORAGE_PROVIDER == "minio":
+        return _MINIO_PROVIDER
     return _LOCAL_PROVIDER
 
 
 def prefer_local_media_storage() -> bool:
     return get_media_storage_provider().name == "local"
+
+
+def prefer_minio_media_storage() -> bool:
+    return get_media_storage_provider().name == "minio"
 
 
 def preferred_source_video_order() -> tuple[str, str]:
@@ -462,4 +531,94 @@ def store_local_generated_clip(
     target_path = resolve_generated_clip_local_path(storage_path)
     _copy_file_atomically(local_clip_path, target_path)
     return os.path.getsize(target_path)
+
+
+def store_minio_generated_clip(
+    *,
+    local_clip_path: str,
+    storage_path: str,
+) -> int:
+    """Upload a generated clip to MinIO and return the file size."""
+    from utils.minio_client import get_minio_client
+
+    object_name = _normalize_bucket_relative_path(storage_path, MINIO_CLIPS_BUCKET)
+    client = get_minio_client()
+    result = client.fput_object(
+        MINIO_CLIPS_BUCKET,
+        object_name,
+        local_clip_path,
+        content_type=_LOCAL_CLIP_CONTENT_TYPE,
+    )
+    return result.size if hasattr(result, "size") and result.size else os.path.getsize(local_clip_path)
+
+
+def delete_minio_generated_clip(storage_path: str, *, logger=None) -> bool:
+    """Delete a generated clip from MinIO."""
+    try:
+        from utils.minio_client import get_minio_client
+
+        object_name = _normalize_bucket_relative_path(storage_path, MINIO_CLIPS_BUCKET)
+        client = get_minio_client()
+        client.remove_object(MINIO_CLIPS_BUCKET, object_name)
+        return True
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("Failed to delete MinIO clip %s: %s", storage_path, exc)
+        return False
+
+
+def delete_minio_raw_video(storage_path: str, *, logger=None) -> bool:
+    """Delete a raw video from MinIO."""
+    try:
+        from utils.minio_client import get_minio_client
+
+        object_name = _normalize_bucket_relative_path(
+            storage_path, MINIO_RAW_VIDEOS_BUCKET
+        )
+        client = get_minio_client()
+        client.remove_object(MINIO_RAW_VIDEOS_BUCKET, object_name)
+        return True
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("Failed to delete MinIO raw video %s: %s", storage_path, exc)
+        return False
+
+
+def resolve_minio_generated_clip_path(
+    storage_path: str | None,
+    *,
+    logger=None,
+) -> str | None:
+    """Download a clip from MinIO to local cache and return the local path."""
+    if not storage_path:
+        return None
+
+    try:
+        local_path = resolve_generated_clip_local_path(storage_path)
+    except ValueError as exc:
+        if logger is not None:
+            logger.warning("Invalid MinIO clip storage path %s: %s", storage_path, exc)
+        return None
+
+    # Return local cache if already materialized.
+    if os.path.isfile(local_path):
+        return local_path
+
+    try:
+        from utils.minio_client import get_minio_client
+
+        object_name = _normalize_bucket_relative_path(
+            storage_path, MINIO_CLIPS_BUCKET
+        )
+        client = get_minio_client()
+        _ensure_parent_dir(local_path)
+        client.fget_object(MINIO_CLIPS_BUCKET, object_name, local_path)
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(
+                "Failed to download clip %s from MinIO: %s", storage_path, exc
+            )
+        return None
+
+    return local_path if os.path.isfile(local_path) else None
 
