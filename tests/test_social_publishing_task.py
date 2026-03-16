@@ -8,6 +8,71 @@ from services.social.base import SocialProviderError
 from tasks.publishing import publish as publish_task_module
 
 
+def test_publish_clip_task_skips_canceled_publication_without_provider_call(tmp_path, monkeypatch):
+    job_updates: list[tuple[tuple, dict]] = []
+    clip_loads: list[str] = []
+    account_loads: list[str] = []
+    provider_calls: list[dict] = []
+
+    def _fake_create_work_dir(_folder_name: str) -> str:
+        work_dir = tmp_path / "publication-workdir"
+        work_dir.mkdir(exist_ok=True)
+        return str(work_dir)
+
+    monkeypatch.setattr(publish_task_module, "create_work_dir", _fake_create_work_dir)
+    monkeypatch.setattr(publish_task_module, "configure_job_scope", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        publish_task_module,
+        "update_job_status",
+        lambda *args, **kwargs: job_updates.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        publish_task_module,
+        "_load_publication_row",
+        lambda _publication_id: {
+            "id": "publication-1",
+            "clip_id": "clip-1",
+            "social_account_id": "account-1",
+            "status": "canceled",
+            "canceled_at": "2026-03-16T12:00:00+00:00",
+            "scheduled_for": "2026-03-16T12:00:00+00:00",
+            "caption_snapshot": "Caption",
+            "youtube_title_snapshot": None,
+        },
+    )
+    monkeypatch.setattr(
+        publish_task_module,
+        "_load_clip_row",
+        lambda _clip_id: clip_loads.append(_clip_id),
+    )
+    monkeypatch.setattr(
+        publish_task_module,
+        "_load_social_account",
+        lambda _account_id: account_loads.append(_account_id),
+    )
+    monkeypatch.setattr(
+        publish_task_module,
+        "publish_to_provider",
+        lambda **kwargs: provider_calls.append(kwargs),
+    )
+
+    publish_task_module.publish_clip_task(
+        {
+            "jobId": "job-1",
+            "publicationId": "publication-1",
+            "clipId": "clip-1",
+            "userId": "user-1",
+        }
+    )
+
+    assert clip_loads == []
+    assert account_loads == []
+    assert provider_calls == []
+    assert job_updates[-1][0][1] == "completed"
+    assert job_updates[-1][1]["result_data"]["stage"] == "canceled"
+    assert not Path(tmp_path / "publication-workdir").exists()
+
+
 def test_publish_clip_task_fails_disconnected_account_without_provider_call(tmp_path, monkeypatch):
     updates: list[tuple[str, dict]] = []
     provider_calls: list[dict] = []

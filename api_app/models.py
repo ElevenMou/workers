@@ -222,6 +222,15 @@ class ClipPublicationResponse(BaseModel):
     remotePostUrl: Optional[str] = None
     lastError: Optional[str] = None
     attemptCount: int = 0
+    captionSnapshot: Optional[str] = None
+    youtubeTitleSnapshot: Optional[str] = None
+    queuedAt: Optional[str] = None
+    startedAt: Optional[str] = None
+    publishedAt: Optional[str] = None
+    failedAt: Optional[str] = None
+    canceledAt: Optional[str] = None
+    createdAt: Optional[str] = None
+    accountDisplayName: Optional[str] = None
 
 
 class CreateClipPublicationsResponse(BaseModel):

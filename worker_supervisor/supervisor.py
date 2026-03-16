@@ -8,6 +8,7 @@ import socket
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 
 _shutdown_requested = False
 
@@ -189,6 +190,90 @@ def _run_maintenance_loop(
     from utils.redis_client import QueueFullError, enqueue_job
     from utils.supabase_client import assert_response_ok, supabase
 
+    def _utc_now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _mark_dispatch_failed(publication_id: str, message: str) -> None:
+        failure_payload = {
+            "status": "failed",
+            "failed_at": _utc_now_iso(),
+            "last_error": message,
+            "result_payload": {"provider_error_code": "publishing_access_revoked"},
+            "updated_at": _utc_now_iso(),
+        }
+        response = (
+            supabase.table("clip_publications")
+            .update(failure_payload)
+            .eq("id", publication_id)
+            .eq("status", "queued")
+            .execute()
+        )
+        assert_response_ok(response, f"Failed to mark publication {publication_id} as blocked")
+
+    def _resolve_dispatch_priority_and_access(batch: dict) -> tuple[str, bool, str | None]:
+        sub_resp = (
+            supabase.table("subscriptions")
+            .select("tier, status, interval")
+            .eq("user_id", batch["billing_owner_user_id"])
+            .limit(1)
+            .execute()
+        )
+        assert_response_ok(
+            sub_resp,
+            f"Failed to load subscription for {batch['billing_owner_user_id']}",
+        )
+        subscription_rows = sub_resp.data or []
+        sub_row = subscription_rows[0] if subscription_rows else {}
+        interval = str(sub_row.get("interval") or "month")
+        tier = str(sub_row.get("tier") or "free")
+        subscription_status = str(sub_row.get("status") or "active")
+
+        plan_resp = (
+            supabase.table("pricing_tiers")
+            .select("priority_processing, allow_social_publishing")
+            .eq("tier", tier)
+            .eq("interval", interval)
+            .eq("active", True)
+            .limit(1)
+            .execute()
+        )
+        assert_response_ok(
+            plan_resp,
+            f"Failed to load pricing tier for {batch['billing_owner_user_id']}",
+        )
+        plan_rows = plan_resp.data or []
+        plan_row = plan_rows[0] if plan_rows else {}
+        priority_processing = bool(
+            plan_row.get("priority_processing")
+            if plan_rows
+            else tier in {"pro", "enterprise"}
+        )
+        allow_social_publishing = bool(
+            plan_row.get("allow_social_publishing")
+            if plan_rows
+            else tier in {"basic", "pro", "enterprise"}
+        )
+
+        if subscription_status == "past_due":
+            return (
+                tier,
+                priority_processing,
+                "Your subscription is past due. Update billing before publishing clips.",
+            )
+        if batch.get("team_id") and tier not in {"pro", "enterprise"}:
+            return (
+                tier,
+                priority_processing,
+                "This team workspace is read-only because the owner is below the Pro tier.",
+            )
+        if not allow_social_publishing:
+            return (
+                tier,
+                priority_processing,
+                "Social publishing is available on paid plans only.",
+            )
+        return tier, priority_processing, None
+
     lock = _MaintenanceLeaderLock(
         startup_conn,
         ttl_seconds=leader_lock_ttl_seconds,
@@ -302,39 +387,10 @@ def _run_maintenance_loop(
                         )
                         batch = batch_resp.data
 
-                        sub_resp = (
-                            supabase.table("subscriptions")
-                            .select("tier, status, interval")
-                            .eq("user_id", batch["billing_owner_user_id"])
-                            .limit(1)
-                            .execute()
-                        )
-                        assert_response_ok(
-                            sub_resp,
-                            f"Failed to load subscription for {batch['billing_owner_user_id']}",
-                        )
-                        subscription_rows = sub_resp.data or []
-                        sub_row = subscription_rows[0] if subscription_rows else {}
-                        interval = str(sub_row.get("interval") or "month")
-                        tier = str(sub_row.get("tier") or "free")
-
-                        plan_resp = (
-                            supabase.table("pricing_tiers")
-                            .select("priority_processing")
-                            .eq("tier", tier)
-                            .eq("interval", interval)
-                            .eq("active", True)
-                            .limit(1)
-                            .execute()
-                        )
-                        assert_response_ok(
-                            plan_resp,
-                            f"Failed to load pricing tier for {batch['billing_owner_user_id']}",
-                        )
-                        plan_rows = plan_resp.data or []
-                        priority_processing = bool(
-                            plan_rows[0].get("priority_processing") if plan_rows else False
-                        )
+                        tier, priority_processing, access_error = _resolve_dispatch_priority_and_access(batch)
+                        if access_error:
+                            _mark_dispatch_failed(publication["id"], access_error)
+                            continue
 
                         queue_name = (
                             SOCIAL_PRIORITY_QUEUE if priority_processing else SOCIAL_QUEUE

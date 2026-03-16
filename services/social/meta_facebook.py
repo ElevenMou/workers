@@ -1,4 +1,4 @@
-"""Facebook Reels publishing integration for connected Pages."""
+"""Facebook publishing integration for connected Pages."""
 
 from __future__ import annotations
 
@@ -112,8 +112,8 @@ def _publishing_complete(status_payload: dict) -> bool:
 
 
 def _is_reel_eligible(media: PublicationMedia) -> bool:
-    """Return True if the clip meets Facebook Reels requirements (<=90s, 9:16)."""
-    if media.duration_seconds is None or media.duration_seconds > 90.0:
+    """Return True if the clip meets Facebook Reel requirements (<=60s, 9:16)."""
+    if media.duration_seconds is None or media.duration_seconds > 60.0:
         return False
     if media.width is None or media.height is None:
         return False
@@ -128,9 +128,9 @@ def _validate_reel_media(media: PublicationMedia) -> None:
             "Facebook Reels publishing requires a clip duration.",
             code="facebook_reels_missing_duration",
         )
-    if media.duration_seconds > 90.0:
+    if media.duration_seconds > 60.0:
         raise SocialProviderError(
-            "Facebook Reels requires clips that are 90 seconds or shorter.",
+            "Facebook Reels requires clips that are 60 seconds or shorter.",
             code="facebook_reels_duration_exceeded",
         )
     if media.width is None or media.height is None:

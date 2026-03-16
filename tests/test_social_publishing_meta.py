@@ -29,41 +29,6 @@ class _FakeResponse:
         return self._payload
 
 
-class _FakeSupabaseResponse:
-    def __init__(self, data):
-        self.data = data
-        self.error = None
-
-
-class _FakeInsertQuery:
-    def __init__(self, store: "_FakePublishingSupabase", table_name: str):
-        self.store = store
-        self.table_name = table_name
-        self.payload = None
-
-    def insert(self, payload):
-        self.payload = payload
-        return self
-
-    def execute(self):
-        if self.table_name == "clip_publish_batches":
-            self.store.batch_payload = self.payload
-            return _FakeSupabaseResponse([self.payload])
-        if self.table_name == "clip_publications":
-            self.store.publication_payloads = list(self.payload)
-            return _FakeSupabaseResponse(self.payload)
-        raise AssertionError(f"Unexpected insert table: {self.table_name}")
-
-
-class _FakePublishingSupabase:
-    def __init__(self):
-        self.batch_payload = None
-        self.publication_payloads = None
-
-    def table(self, name: str):
-        return _FakeInsertQuery(self, name)
-
-
 def _future_timestamp() -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
 
@@ -107,12 +72,13 @@ def _media(tmp_path, *, width: int = 1080, height: int = 1920, duration_seconds:
     )
 
 
-def test_create_clip_publications_rejects_facebook_reels_over_60_seconds(client, monkeypatch):
-    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
-        id="user-id",
-        email=None,
-        claims={},
-    )
+def _mock_create_publish_flow(
+    monkeypatch,
+    *,
+    clip_duration_seconds: float,
+    accounts: list[dict],
+    publications: list[dict],
+) -> None:
     monkeypatch.setattr(
         publishing_router,
         "_resolve_publish_access",
@@ -124,7 +90,6 @@ def test_create_clip_publications_rejects_facebook_reels_over_60_seconds(client,
             tier="pro",
         ),
     )
-    monkeypatch.setattr(publishing_router, "_load_existing_batch", lambda **_kwargs: (None, []))
     monkeypatch.setattr(
         publishing_router,
         "_load_workspace_clip",
@@ -132,7 +97,7 @@ def test_create_clip_publications_rejects_facebook_reels_over_60_seconds(client,
             "id": "clip-1",
             "video_id": "video-1",
             "title": "Clip title",
-            "duration_seconds": 61,
+            "duration_seconds": clip_duration_seconds,
             "status": "completed",
             "storage_path": "clips/clip-1.mp4",
         },
@@ -140,11 +105,81 @@ def test_create_clip_publications_rejects_facebook_reels_over_60_seconds(client,
     monkeypatch.setattr(
         publishing_router,
         "_load_social_accounts_for_workspace",
-        lambda **_kwargs: [
+        lambda **_kwargs: accounts,
+    )
+    monkeypatch.setattr(
+        publishing_router,
+        "_create_or_load_batch",
+        lambda **_kwargs: (
+            {
+                "id": "batch-1",
+                "clip_id": "clip-1",
+                "publish_mode": "schedule",
+                "scheduled_timezone": "UTC",
+                "caption": "Caption",
+                "youtube_title": None,
+                "scheduled_for": _future_timestamp(),
+            },
+            True,
+        ),
+    )
+    monkeypatch.setattr(publishing_router, "_load_batch_publications", lambda _batch_id: [])
+    monkeypatch.setattr(
+        publishing_router,
+        "_assert_no_duplicate_active_publications",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        publishing_router,
+        "_ensure_batch_publications",
+        lambda **_kwargs: publications,
+    )
+    monkeypatch.setattr(
+        publishing_router,
+        "_ensure_dispatch_jobs_for_publications",
+        lambda **_kwargs: None,
+    )
+
+
+def test_create_clip_publications_allows_long_facebook_page_requests(client, monkeypatch):
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    _mock_create_publish_flow(
+        monkeypatch,
+        clip_duration_seconds=61,
+        accounts=[
             {
                 "id": "account-1",
                 "provider": "facebook_page",
                 "status": "active",
+            }
+        ],
+        publications=[
+            {
+                "id": "publication-1",
+                "batch_id": "batch-1",
+                "clip_id": "clip-1",
+                "social_account_id": "account-1",
+                "provider": "facebook_page",
+                "status": "scheduled",
+                "scheduled_for": _future_timestamp(),
+                "scheduled_timezone": "UTC",
+                "caption_snapshot": "Caption",
+                "youtube_title_snapshot": None,
+                "remote_post_id": None,
+                "remote_post_url": None,
+                "last_error": None,
+                "attempt_count": 0,
+                "queued_at": None,
+                "started_at": None,
+                "published_at": None,
+                "failed_at": None,
+                "canceled_at": None,
+                "created_at": _future_timestamp(),
+                "social_account": {"display_name": "Page One"},
             }
         ],
     )
@@ -162,8 +197,10 @@ def test_create_clip_publications_rejects_facebook_reels_over_60_seconds(client,
         },
     )
 
-    assert response.status_code == 400
-    assert "60 seconds or shorter" in response.json()["detail"]
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["publications"][0]["provider"] == "facebook_page"
+    assert payload["publications"][0]["accountDisplayName"] == "Page One"
 
 
 def test_create_clip_publications_allows_non_facebook_longer_clips(client, monkeypatch):
@@ -172,43 +209,42 @@ def test_create_clip_publications_allows_non_facebook_longer_clips(client, monke
         email=None,
         claims={},
     )
-    monkeypatch.setattr(
-        publishing_router,
-        "_resolve_publish_access",
-        lambda _user_id: SimpleNamespace(
-            workspace_team_id=None,
-            billing_owner_user_id=None,
-            priority_processing=False,
-            workspace_role="owner",
-            tier="pro",
-        ),
-    )
-    monkeypatch.setattr(publishing_router, "_load_existing_batch", lambda **_kwargs: (None, []))
-    monkeypatch.setattr(
-        publishing_router,
-        "_load_workspace_clip",
-        lambda **_kwargs: {
-            "id": "clip-1",
-            "video_id": "video-1",
-            "title": "Clip title",
-            "duration_seconds": 120,
-            "status": "completed",
-            "storage_path": "clips/clip-1.mp4",
-        },
-    )
-    monkeypatch.setattr(
-        publishing_router,
-        "_load_social_accounts_for_workspace",
-        lambda **_kwargs: [
+    _mock_create_publish_flow(
+        monkeypatch,
+        clip_duration_seconds=120,
+        accounts=[
             {
                 "id": "account-2",
                 "provider": "instagram_business",
                 "status": "active",
             }
         ],
+        publications=[
+            {
+                "id": "publication-2",
+                "batch_id": "batch-1",
+                "clip_id": "clip-1",
+                "social_account_id": "account-2",
+                "provider": "instagram_business",
+                "status": "scheduled",
+                "scheduled_for": _future_timestamp(),
+                "scheduled_timezone": "UTC",
+                "caption_snapshot": "Caption",
+                "youtube_title_snapshot": None,
+                "remote_post_id": None,
+                "remote_post_url": None,
+                "last_error": None,
+                "attempt_count": 0,
+                "queued_at": None,
+                "started_at": None,
+                "published_at": None,
+                "failed_at": None,
+                "canceled_at": None,
+                "created_at": _future_timestamp(),
+                "social_account": {"display_name": "IG One"},
+            }
+        ],
     )
-    fake_supabase = _FakePublishingSupabase()
-    monkeypatch.setattr(publishing_router, "supabase", fake_supabase)
 
     response = client.post(
         "/publishing",
@@ -226,32 +262,41 @@ def test_create_clip_publications_allows_non_facebook_longer_clips(client, monke
     assert response.status_code == 200
     payload = response.json()
     assert payload["publications"][0]["provider"] == "instagram_business"
-    assert fake_supabase.batch_payload is not None
-    assert fake_supabase.publication_payloads is not None
+    assert payload["publications"][0]["accountDisplayName"] == "IG One"
 
 
-def test_facebook_reels_publish_validates_duration(tmp_path):
-    with pytest.raises(SocialProviderError) as exc:
-        meta_facebook.publish_video(
-            account=_facebook_account(),
-            publication=_publication_context(),
-            media=_media(tmp_path, duration_seconds=61.0),
-        )
+def test_facebook_publish_falls_back_to_page_video_for_longer_clips(tmp_path, monkeypatch):
+    def _fake_post(url: str, **kwargs):
+        assert url.endswith("/page-1/videos")
+        return _FakeResponse(payload={"id": "video-123"})
 
-    assert exc.value.code == "facebook_reels_duration_exceeded"
-    assert exc.value.refresh_required is False
+    monkeypatch.setattr(meta_facebook.httpx, "post", _fake_post)
+
+    result = meta_facebook.publish_video(
+        account=_facebook_account(),
+        publication=_publication_context(),
+        media=_media(tmp_path, duration_seconds=61.0),
+    )
+
+    assert result.remote_post_id == "video-123"
+    assert result.result_payload["publish_target"] == "facebook_page_video"
 
 
-def test_facebook_reels_publish_validates_aspect_ratio(tmp_path):
-    with pytest.raises(SocialProviderError) as exc:
-        meta_facebook.publish_video(
-            account=_facebook_account(),
-            publication=_publication_context(),
-            media=_media(tmp_path, width=1080, height=1080),
-        )
+def test_facebook_publish_falls_back_to_page_video_for_non_vertical_clips(tmp_path, monkeypatch):
+    def _fake_post(url: str, **kwargs):
+        assert url.endswith("/page-1/videos")
+        return _FakeResponse(payload={"id": "video-456"})
 
-    assert exc.value.code == "facebook_reels_invalid_aspect_ratio"
-    assert exc.value.refresh_required is False
+    monkeypatch.setattr(meta_facebook.httpx, "post", _fake_post)
+
+    result = meta_facebook.publish_video(
+        account=_facebook_account(),
+        publication=_publication_context(),
+        media=_media(tmp_path, width=1080, height=1080),
+    )
+
+    assert result.remote_post_id == "video-456"
+    assert result.result_payload["publish_target"] == "facebook_page_video"
 
 
 def test_facebook_reels_publish_happy_path(tmp_path, monkeypatch):

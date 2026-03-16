@@ -234,6 +234,34 @@ def _provider_error_payload(error: SocialProviderError | Exception) -> dict:
     return payload
 
 
+def _is_publication_canceled(publication: dict) -> bool:
+    return (
+        str(publication.get("status") or "") == "canceled"
+        or publication.get("canceled_at") is not None
+    )
+
+
+def _complete_publication_job_as_skipped(
+    *,
+    job_id: str,
+    publication_id: str,
+    stage: str,
+    detail_key: str | None = None,
+    extra_result_data: dict | None = None,
+) -> None:
+    logger.info("[%s] Skipping publication %s during %s", job_id, publication_id, stage)
+    update_job_status(
+        job_id,
+        "completed",
+        100,
+        result_data=build_progress_result_data(
+            stage=stage,
+            detail_key=detail_key,
+            extra_result_data=extra_result_data,
+        ),
+    )
+
+
 def _mark_publication_retrying(publication_id: str, error: SocialProviderError | Exception) -> None:
     payload = {
         "status": "queued",
@@ -300,6 +328,15 @@ def publish_clip_task(job_data: PublishClipJob) -> None:
         )
 
         publication = _load_publication_row(publication_id)
+        if _is_publication_canceled(publication):
+            _complete_publication_job_as_skipped(
+                job_id=job_id,
+                publication_id=publication_id,
+                stage="canceled",
+                detail_key="publication_canceled",
+            )
+            return
+
         clip = _load_clip_row(str(publication["clip_id"]))
         social_account = _load_social_account(str(publication["social_account_id"]))
 
@@ -310,16 +347,45 @@ def publish_clip_task(job_data: PublishClipJob) -> None:
             )
         _assert_social_account_ready_for_publish(social_account)
 
-        _best_effort_update_publication(
-            publication_id,
-            {
-                "status": "publishing",
-                "started_at": _utc_now_iso(),
-                "attempt_count": int(publication.get("attempt_count") or 0) + 1,
-                "last_error": None,
-                "updated_at": _utc_now_iso(),
-            },
+        started_at = _utc_now_iso()
+        transition_resp = (
+            supabase.table("clip_publications")
+            .update(
+                {
+                    "status": "publishing",
+                    "started_at": started_at,
+                    "attempt_count": int(publication.get("attempt_count") or 0) + 1,
+                    "last_error": None,
+                    "updated_at": started_at,
+                }
+            )
+            .eq("id", publication_id)
+            .eq("status", "queued")
+            .is_("canceled_at", "null")
+            .execute()
         )
+        assert_response_ok(
+            transition_resp,
+            f"Failed to transition publication {publication_id} to publishing",
+        )
+        publication = _load_publication_row(publication_id)
+        if _is_publication_canceled(publication):
+            _complete_publication_job_as_skipped(
+                job_id=job_id,
+                publication_id=publication_id,
+                stage="canceled",
+                detail_key="publication_canceled",
+            )
+            return
+        if str(publication.get("status") or "") != "publishing":
+            _complete_publication_job_as_skipped(
+                job_id=job_id,
+                publication_id=publication_id,
+                stage="skipped",
+                detail_key="publication_skipped",
+                extra_result_data={"publication_status": publication.get("status")},
+            )
+            return
 
         update_job_status(
             job_id,
