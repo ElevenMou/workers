@@ -23,6 +23,7 @@ from api_app.models import (
     RetryClipPublicationResponse,
 )
 from utils.supabase_client import supabase
+from utils.media_storage import GeneratedClipStorageError, ensure_generated_clip_available
 
 router = APIRouter()
 _SOCIAL_PRIORITY_QUEUE = "social-publishing-priority"
@@ -204,6 +205,39 @@ def _validate_provider_specific_constraints(*, clip: dict, social_accounts: list
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Instagram Reels requires clips that are 15 minutes or shorter.",
         )
+
+
+def _assert_clip_storage_ready_for_publish(clip: dict) -> None:
+    storage_path = str(clip.get("storage_path") or "").strip()
+    if not storage_path:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Clip asset is missing from storage. Regenerate the clip before publishing.",
+        )
+
+    try:
+        ensure_generated_clip_available(storage_path)
+    except GeneratedClipStorageError as exc:
+        storage_location = (
+            f"{exc.bucket}/{exc.object_name}"
+            if exc.object_name
+            else storage_path
+        )
+        if exc.reason in {"invalid_storage_path", "missing_object"}:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Clip asset is missing from storage ({storage_location}). "
+                    "Regenerate the clip before publishing."
+                ),
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"Clip storage is temporarily unavailable while checking {storage_location}. "
+                "Please retry shortly."
+            ),
+        ) from exc
 
 
 def _load_existing_batch(
@@ -536,6 +570,7 @@ def create_clip_publications(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only completed clips with generated assets can be published.",
         )
+    _assert_clip_storage_ready_for_publish(clip)
 
     social_accounts = _load_social_accounts_for_workspace(
         social_account_ids=payload.socialAccountIds,
@@ -695,6 +730,7 @@ def retry_clip_publication(
         user_id=user_id,
         workspace_team_id=access_context.workspace_team_id,
     )
+    _assert_clip_storage_ready_for_publish(clip)
     queued_at = _utc_now().isoformat()
     update_resp = (
         supabase.table("clip_publications")

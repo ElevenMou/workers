@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import shutil
 import traceback
 from datetime import datetime, timezone
@@ -232,6 +233,18 @@ def _provider_error_payload(error: SocialProviderError | Exception) -> dict:
     if error.provider_payload:
         payload["provider_payload"] = error.provider_payload
     return payload
+
+
+def _provider_payload_preview(payload: dict | None, *, limit: int = 2000) -> str:
+    if not payload:
+        return "{}"
+    try:
+        rendered = json.dumps(payload, sort_keys=True, default=str)
+    except Exception:
+        rendered = str(payload)
+    if len(rendered) <= limit:
+        return rendered
+    return f"{rendered[:limit]}..."
 
 
 def _is_publication_canceled(publication: dict) -> bool:
@@ -476,7 +489,18 @@ def publish_clip_task(job_data: PublishClipJob) -> None:
             ),
         )
     except Exception as exc:
-        logger.error("[%s] Social publication failed: %s", job_id, exc)
+        if isinstance(exc, SocialProviderError):
+            logger.error(
+                "[%s] Social publication failed (code=%s recoverable=%s refresh_required=%s): %s | provider_payload=%s",
+                job_id,
+                exc.code,
+                exc.recoverable,
+                exc.refresh_required,
+                exc,
+                _provider_payload_preview(exc.provider_payload),
+            )
+        else:
+            logger.error("[%s] Social publication failed: %s", job_id, exc)
         logger.debug(traceback.format_exc())
 
         if isinstance(exc, SocialProviderError) and exc.refresh_required:

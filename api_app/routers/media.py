@@ -17,6 +17,7 @@ from api_app.models import (
 )
 from config import WORKER_INTERNAL_API_TOKEN
 from utils.media_storage import (
+    GeneratedClipStorageError,
     delete_local_generated_clip,
     delete_local_raw_video,
     resolve_generated_clip_path,
@@ -181,7 +182,19 @@ def _verify_signed_media_access(*, relative_path: str, expires: int, signature: 
 def _resolve_clip_media_path(clip_id: str) -> str:
     storage_path = _load_clip_storage_path(clip_id)
 
-    resolved_path = resolve_generated_clip_path(storage_path)
+    try:
+        resolved_path = resolve_generated_clip_path(storage_path, raise_on_error=True)
+    except GeneratedClipStorageError as exc:
+        if exc.reason in {"invalid_storage_path", "missing_object"}:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Clip file could not be resolved.",
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Clip storage is temporarily unavailable.",
+        ) from exc
+
     if not resolved_path or not os.path.isfile(resolved_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

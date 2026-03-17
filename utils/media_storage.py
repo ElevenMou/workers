@@ -24,6 +24,31 @@ from config import (
 GENERATED_CLIPS_BUCKET = MINIO_CLIPS_BUCKET
 RAW_VIDEOS_BUCKET = MINIO_RAW_VIDEOS_BUCKET
 _LOCAL_CLIP_CONTENT_TYPE = "video/mp4"
+_MISSING_MINIO_OBJECT_CODES = {
+    "NoSuchBucket",
+    "NoSuchKey",
+    "NoSuchObject",
+    "ResourceNotFound",
+}
+
+
+class GeneratedClipStorageError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        storage_path: str,
+        bucket: str,
+        object_name: str | None,
+        reason: str,
+        recoverable: bool,
+    ) -> None:
+        super().__init__(message)
+        self.storage_path = storage_path
+        self.bucket = bucket
+        self.object_name = object_name
+        self.reason = reason
+        self.recoverable = recoverable
 
 
 def _normalize_bucket_relative_path(storage_path: str, bucket: str) -> str:
@@ -166,19 +191,126 @@ def resolve_generated_clip_local_path(storage_path: str) -> str:
     return resolve_local_bucket_path(GENERATED_CLIPS_BUCKET, storage_path)
 
 
+def _generated_clip_object_name(storage_path: str) -> str:
+    return _normalize_bucket_relative_path(storage_path, GENERATED_CLIPS_BUCKET)
+
+
+def _minio_exception_code(exc: Exception) -> str:
+    code = getattr(exc, "code", None)
+    if callable(code):
+        try:
+            code = code()
+        except Exception:
+            code = None
+    return str(code or "").strip()
+
+
+def _build_generated_clip_storage_error(
+    *,
+    storage_path: str,
+    object_name: str | None,
+    exc: Exception | None = None,
+    reason: str | None = None,
+) -> GeneratedClipStorageError:
+    resolved_reason = reason or "storage_unavailable"
+    if resolved_reason == "storage_unavailable":
+        error_code = _minio_exception_code(exc) if exc is not None else ""
+        if error_code in _MISSING_MINIO_OBJECT_CODES:
+            resolved_reason = "missing_object"
+
+    qualified_object = (
+        f"{GENERATED_CLIPS_BUCKET}/{object_name}"
+        if object_name
+        else f"{GENERATED_CLIPS_BUCKET}/{storage_path}"
+    )
+    if resolved_reason == "invalid_storage_path":
+        message = f"Clip storage path is invalid: {storage_path!r}."
+        recoverable = False
+    elif resolved_reason == "missing_object":
+        message = (
+            f"Clip asset is missing from MinIO at {qualified_object}. "
+            "Regenerate the clip before publishing."
+        )
+        recoverable = False
+    elif resolved_reason == "materialization_incomplete":
+        message = f"Clip download from MinIO did not create a local file for {qualified_object}."
+        recoverable = True
+    else:
+        message = f"Failed to access clip asset in MinIO at {qualified_object}: {exc}"
+        recoverable = True
+
+    return GeneratedClipStorageError(
+        message,
+        storage_path=storage_path,
+        bucket=GENERATED_CLIPS_BUCKET,
+        object_name=object_name,
+        reason=resolved_reason,
+        recoverable=recoverable,
+    )
+
+
+def ensure_generated_clip_available(
+    storage_path: str | None,
+    *,
+    logger=None,
+) -> None:
+    if not storage_path:
+        raise _build_generated_clip_storage_error(
+            storage_path="",
+            object_name=None,
+            reason="invalid_storage_path",
+        )
+
+    try:
+        local_path = resolve_generated_clip_local_path(storage_path)
+        object_name = _generated_clip_object_name(storage_path)
+    except ValueError as exc:
+        if logger is not None:
+            logger.warning("Invalid generated-clip storage path %s: %s", storage_path, exc)
+        raise _build_generated_clip_storage_error(
+            storage_path=str(storage_path),
+            object_name=None,
+            reason="invalid_storage_path",
+        ) from exc
+
+    if os.path.isfile(local_path):
+        return
+
+    try:
+        from utils.minio_client import get_minio_client
+
+        get_minio_client().stat_object(GENERATED_CLIPS_BUCKET, object_name)
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("Failed to stat clip %s in MinIO: %s", storage_path, exc)
+        raise _build_generated_clip_storage_error(
+            storage_path=str(storage_path),
+            object_name=object_name,
+            exc=exc,
+        ) from exc
+
+
 def resolve_generated_clip_path(
     storage_path: str | None,
     *,
     logger=None,
+    raise_on_error: bool = False,
 ) -> str | None:
     if not storage_path:
         return None
 
     try:
         local_path = resolve_generated_clip_local_path(storage_path)
+        object_name = _generated_clip_object_name(storage_path)
     except ValueError as exc:
         if logger is not None:
             logger.warning("Invalid generated-clip storage path %s: %s", storage_path, exc)
+        if raise_on_error:
+            raise _build_generated_clip_storage_error(
+                storage_path=str(storage_path),
+                object_name=None,
+                reason="invalid_storage_path",
+            ) from exc
         return None
 
     if os.path.isfile(local_path):
@@ -187,15 +319,34 @@ def resolve_generated_clip_path(
     try:
         from utils.minio_client import get_minio_client
 
-        object_name = _normalize_bucket_relative_path(storage_path, GENERATED_CLIPS_BUCKET)
         _ensure_parent_dir(local_path)
         get_minio_client().fget_object(GENERATED_CLIPS_BUCKET, object_name, local_path)
     except Exception as exc:
+        try:
+            if os.path.exists(local_path):
+                os.remove(local_path)
+        except OSError:
+            pass
         if logger is not None:
             logger.warning("Failed to download clip %s from MinIO: %s", storage_path, exc)
+        if raise_on_error:
+            raise _build_generated_clip_storage_error(
+                storage_path=str(storage_path),
+                object_name=object_name,
+                exc=exc,
+            ) from exc
         return None
 
-    return local_path if os.path.isfile(local_path) else None
+    if os.path.isfile(local_path):
+        return local_path
+
+    if raise_on_error:
+        raise _build_generated_clip_storage_error(
+            storage_path=str(storage_path),
+            object_name=object_name,
+            reason="materialization_incomplete",
+        )
+    return None
 
 
 def delete_local_generated_clip(storage_path: str, *, logger=None) -> bool:

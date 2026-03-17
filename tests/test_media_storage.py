@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlparse
 import api_app.routers.media as media_router
 import utils.media_storage as media_storage
 import utils.minio_client as minio_client
+import pytest
 
 
 def test_preferred_source_video_order_is_minio_first():
@@ -80,6 +81,29 @@ def test_resolve_generated_clip_path_materializes_minio_object(tmp_path, monkeyp
     ]
     with open(resolved_path, "rb") as handle:
         assert handle.read() == b"remote-bytes"
+
+
+def test_resolve_generated_clip_path_raises_missing_object_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(media_storage, "LOCAL_MEDIA_ROOT", str(tmp_path / "media"))
+
+    class _MissingObjectClient:
+        def fget_object(self, _bucket, _object_name, _file_path):
+            error = RuntimeError("missing")
+            setattr(error, "code", "NoSuchKey")
+            raise error
+
+    monkeypatch.setattr(
+        minio_client,
+        "get_minio_client",
+        lambda: _MissingObjectClient(),
+    )
+
+    with pytest.raises(media_storage.GeneratedClipStorageError) as exc:
+        media_storage.resolve_generated_clip_path("clips/remote.mp4", raise_on_error=True)
+
+    assert exc.value.reason == "missing_object"
+    assert exc.value.object_name == "clips/remote.mp4"
+    assert exc.value.recoverable is False
 
 
 def test_stream_clip_media_supports_range_requests(client, tmp_path, monkeypatch):

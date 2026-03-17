@@ -5,7 +5,9 @@ from pathlib import Path
 import pytest
 
 from services.social.base import SocialProviderError
+from services.social.media import download_clip_to_path
 from tasks.publishing import publish as publish_task_module
+from utils.media_storage import GeneratedClipStorageError
 
 
 def test_publish_clip_task_skips_canceled_publication_without_provider_call(tmp_path, monkeypatch):
@@ -165,3 +167,25 @@ def test_publish_clip_task_fails_disconnected_account_without_provider_call(tmp_
     assert payload["last_error"] == str(exc.value)
     assert payload["result_payload"]["provider_error_code"] == "social_account_disconnected"
     assert not Path(tmp_path / "publication-workdir").exists()
+
+
+def test_download_clip_to_path_maps_missing_storage_to_social_provider_error(monkeypatch):
+    monkeypatch.setattr(
+        "services.social.media.resolve_generated_clip_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            GeneratedClipStorageError(
+                "Clip asset is missing from MinIO at generated-clips/clips/clip-1.mp4.",
+                storage_path="clips/clip-1.mp4",
+                bucket="generated-clips",
+                object_name="clips/clip-1.mp4",
+                reason="missing_object",
+                recoverable=False,
+            )
+        ),
+    )
+
+    with pytest.raises(SocialProviderError) as exc:
+        download_clip_to_path("clips/clip-1.mp4", work_dir="unused")
+
+    assert exc.value.code == "clip_asset_missing"
+    assert "Regenerate the clip before publishing" in str(exc.value)

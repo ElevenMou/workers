@@ -5,9 +5,10 @@ from types import SimpleNamespace
 
 import api_app.routers.publishing as publishing_router
 import pytest
+from fastapi import HTTPException
 from api_app.app import app
 from api_app.auth import AuthenticatedUser, get_current_user
-from services.social import meta_facebook
+from services.social import meta_facebook, meta_instagram
 from services.social.base import (
     PublicationContext,
     PublicationMedia,
@@ -43,6 +44,19 @@ def _facebook_account() -> SocialAccountContext:
         provider_metadata={},
         scopes=[],
         tokens=SocialAccountTokens(access_token="page-token"),
+    )
+
+
+def _instagram_account() -> SocialAccountContext:
+    return SocialAccountContext(
+        id="account-1",
+        provider="instagram_business",
+        external_account_id="account-1",
+        display_name="IG One",
+        handle="clipscut",
+        provider_metadata={},
+        scopes=[],
+        tokens=SocialAccountTokens(access_token="ig-token"),
     )
 
 
@@ -106,6 +120,11 @@ def _mock_create_publish_flow(
         publishing_router,
         "_load_social_accounts_for_workspace",
         lambda **_kwargs: accounts,
+    )
+    monkeypatch.setattr(
+        publishing_router,
+        "_assert_clip_storage_ready_for_publish",
+        lambda _clip: None,
     )
     monkeypatch.setattr(
         publishing_router,
@@ -265,6 +284,55 @@ def test_create_clip_publications_allows_non_facebook_longer_clips(client, monke
     assert payload["publications"][0]["accountDisplayName"] == "IG One"
 
 
+def test_create_clip_publications_rejects_missing_clip_asset(client, monkeypatch):
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    _mock_create_publish_flow(
+        monkeypatch,
+        clip_duration_seconds=45,
+        accounts=[
+            {
+                "id": "account-1",
+                "provider": "facebook_page",
+                "status": "active",
+            }
+        ],
+        publications=[],
+    )
+    monkeypatch.setattr(
+        publishing_router,
+        "_assert_clip_storage_ready_for_publish",
+        lambda _clip: (_ for _ in ()).throw(
+            HTTPException(
+                status_code=409,
+                detail=(
+                    "Clip asset is missing from storage "
+                    "(generated-clips/clips/clip-1.mp4). Regenerate the clip before publishing."
+                ),
+            )
+        ),
+    )
+
+    response = client.post(
+        "/publishing",
+        json={
+            "clipId": "clip-1",
+            "socialAccountIds": ["account-1"],
+            "caption": "Caption",
+            "mode": "schedule",
+            "scheduledAt": _future_timestamp(),
+            "timeZone": "UTC",
+            "clientRequestId": "request-missing-clip",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "Regenerate the clip before publishing" in response.json()["detail"]
+
+
 def test_facebook_publish_falls_back_to_page_video_for_longer_clips(tmp_path, monkeypatch):
     def _fake_post(url: str, **kwargs):
         assert url.endswith("/page-1/videos")
@@ -400,3 +468,106 @@ def test_facebook_reels_publish_marks_oauth_errors_for_reconnect(tmp_path, monke
 
     assert exc.value.code == "facebook_reels_start_failed"
     assert exc.value.refresh_required is True
+
+
+def test_instagram_reels_publish_uses_resumable_upload(tmp_path, monkeypatch):
+    media = _media(tmp_path)
+    post_calls: list[tuple[str, dict]] = []
+    status_payloads = iter(
+        [
+            _FakeResponse(payload={"status_code": "IN_PROGRESS"}),
+            _FakeResponse(payload={"status_code": "FINISHED"}),
+        ]
+    )
+
+    def _fake_post(url: str, **kwargs):
+        post_calls.append((url, kwargs))
+        if url.endswith("/account-1/media"):
+            assert kwargs["data"]["upload_type"] == "resumable"
+            assert kwargs["data"]["media_type"] == "REELS"
+            return _FakeResponse(
+                payload={
+                    "id": "creation-123",
+                    "uri": "https://rupload.facebook.com/ig-api-upload/session-123",
+                }
+            )
+        if url == "https://rupload.facebook.com/ig-api-upload/session-123":
+            assert kwargs["headers"]["Authorization"] == "OAuth ig-token"
+            assert kwargs["headers"]["offset"] == "0"
+            assert kwargs["headers"]["file_size"] == str(media.file_size)
+            assert kwargs["content"] == b"clip-bytes"
+            return _FakeResponse(payload={"success": True})
+        if url.endswith("/account-1/media_publish"):
+            assert kwargs["data"]["creation_id"] == "creation-123"
+            return _FakeResponse(payload={"id": "media-123"})
+        raise AssertionError(f"Unexpected POST URL: {url}")
+
+    def _fake_get(url: str, **kwargs):
+        if url.endswith("/creation-123"):
+            return next(status_payloads)
+        if url.endswith("/media-123"):
+            return _FakeResponse(payload={"permalink": "https://www.instagram.com/reel/media-123/"})
+        raise AssertionError(f"Unexpected GET URL: {url}")
+
+    monkeypatch.setattr(meta_instagram.httpx, "post", _fake_post)
+    monkeypatch.setattr(meta_instagram.httpx, "get", _fake_get)
+    monkeypatch.setattr(meta_instagram.time, "sleep", lambda _seconds: None)
+
+    result = meta_instagram.publish_reel(
+        account=_instagram_account(),
+        publication=_publication_context(),
+        media=media,
+    )
+
+    assert result.remote_post_id == "media-123"
+    assert result.remote_post_url == "https://www.instagram.com/reel/media-123/"
+    assert result.provider_payload["container"]["id"] == "creation-123"
+    assert result.provider_payload["upload"]["success"] is True
+    assert result.provider_payload["upload_uri_host"] == "rupload.facebook.com"
+    assert result.result_payload == {"platform": "instagram_business", "media_id": "media-123"}
+    assert len(post_calls) == 3
+
+
+def test_instagram_container_failure_includes_status_details_and_media_host(tmp_path, monkeypatch):
+    media = _media(tmp_path)
+    media.signed_url = "https://storage.clipscut.pro/generated-clips/clips/clip-1.mp4?X-Amz-Signature=test"
+    status_payload = {
+        "status_code": "ERROR",
+        "error_message": "Failed to fetch the video from the provided URL.",
+    }
+
+    def _fake_post(url: str, **kwargs):
+        if url.endswith("/account-1/media"):
+            return _FakeResponse(
+                payload={
+                    "id": "creation-123",
+                    "uri": "https://rupload.facebook.com/ig-api-upload/session-123",
+                }
+            )
+        if url == "https://rupload.facebook.com/ig-api-upload/session-123":
+            return _FakeResponse(payload={"success": True})
+        raise AssertionError(f"Unexpected POST URL: {url}")
+
+    def _fake_get(url: str, **kwargs):
+        if url.endswith("/creation-123"):
+            return _FakeResponse(payload=status_payload)
+        raise AssertionError(f"Unexpected GET URL: {url}")
+
+    monkeypatch.setattr(meta_instagram.httpx, "post", _fake_post)
+    monkeypatch.setattr(meta_instagram.httpx, "get", _fake_get)
+    monkeypatch.setattr(meta_instagram.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(SocialProviderError) as exc:
+        meta_instagram.publish_reel(
+            account=_instagram_account(),
+            publication=_publication_context(),
+            media=media,
+        )
+
+    assert exc.value.code == "instagram_container_failed"
+    assert "Failed to fetch the video from the provided URL." in str(exc.value)
+    assert exc.value.provider_payload["container"]["id"] == "creation-123"
+    assert exc.value.provider_payload["upload"]["success"] is True
+    assert exc.value.provider_payload["status"]["status"]["error_message"] == status_payload["error_message"]
+    assert exc.value.provider_payload["upload_uri_host"] == "rupload.facebook.com"
+    assert exc.value.provider_payload["media_url_host"] == "storage.clipscut.pro"

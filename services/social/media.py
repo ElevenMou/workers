@@ -7,8 +7,9 @@ import os
 import subprocess
 from pathlib import Path
 
-from services.social.base import PublicationMedia
+from services.social.base import PublicationMedia, SocialProviderError
 from utils.media_storage import (
+    GeneratedClipStorageError,
     create_signed_clip_url as create_minio_signed_clip_url,
     resolve_generated_clip_path,
 )
@@ -32,11 +33,39 @@ def create_signed_clip_url(storage_path: str, *, expires_in_seconds: int = 3600)
 
 
 def download_clip_to_path(storage_path: str, *, work_dir: str) -> str:
-    resolved_path = resolve_generated_clip_path(storage_path)
+    try:
+        resolved_path = resolve_generated_clip_path(storage_path, raise_on_error=True)
+    except GeneratedClipStorageError as exc:
+        storage_location = (
+            f"{exc.bucket}/{exc.object_name}"
+            if exc.object_name
+            else str(storage_path or "").strip()
+        )
+        if exc.reason in {"invalid_storage_path", "missing_object"}:
+            raise SocialProviderError(
+                f"The clip asset is missing from storage ({storage_location}). Regenerate the clip before publishing.",
+                code="clip_asset_missing",
+            ) from exc
+
+        raise SocialProviderError(
+            f"The clip storage service could not load {storage_location}. Please retry publishing shortly.",
+            code="clip_storage_unavailable",
+            recoverable=exc.recoverable,
+            provider_payload={
+                "storage_path": exc.storage_path,
+                "storage_bucket": exc.bucket,
+                "storage_object": exc.object_name,
+                "storage_reason": exc.reason,
+            },
+        ) from exc
+
     if resolved_path:
         return resolved_path
 
-    raise RuntimeError(f"Could not materialize clip from MinIO: {storage_path}")
+    raise SocialProviderError(
+        f"The clip asset is missing from storage ({storage_path}). Regenerate the clip before publishing.",
+        code="clip_asset_missing",
+    )
 
 
 def probe_media(local_path: str) -> tuple[int | None, int | None, float | None]:
