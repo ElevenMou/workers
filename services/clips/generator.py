@@ -13,6 +13,7 @@ from services.clips.constants import (
     DEFAULT_CANVAS_ASPECT_RATIO,
     DEFAULT_VIDEO_SCALE_MODE,
     QUALITY_PRESETS,
+    TITLE_SAFE_MARGIN_X,
     canvas_size_for_aspect_ratio,
     intermediate_quality_preset,
 )
@@ -125,9 +126,9 @@ class ClipGenerator:
             base_title_width = max(2, min(canvas_w, custom_title_width))
         else:
             base_title_width = canvas_w
-        horizontal_padding = max(0, int(title_padding_x))
+        horizontal_padding = max(TITLE_SAFE_MARGIN_X, int(title_padding_x))
         max_text_w = max(120, base_title_width - (2 * horizontal_padding))
-        title_lines = wrap_title(title, title_font_size, max_text_w)
+        title_lines = wrap_title(title, title_font_size, max_text_w, title_font_family)
 
         # Probe the source video once for resolution (used by layout computation).
         src_w, src_h = _probe_video_resolution(video_path)

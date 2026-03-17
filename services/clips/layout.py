@@ -7,9 +7,11 @@ import ffmpeg
 from services.clips.constants import (
     DEFAULT_CANVAS_ASPECT_RATIO,
     CHAR_WIDTH_RATIO,
+    CHAR_WIDTH_RATIOS,
     TITLE_BAR_V_PAD,
     TITLE_GAP,
     TITLE_LINE_HEIGHT_RATIO,
+    TITLE_SAFE_MARGIN_X,
     canvas_size_for_aspect_ratio,
     normalize_video_scale_mode,
 )
@@ -25,9 +27,26 @@ def _as_int(value: object, fallback: int) -> int:
         return fallback
 
 
-def wrap_title(title: str, font_size: int, max_width: int) -> list[str]:
-    """Word-wrap title text to fit within a given pixel width."""
-    avg_char_w = font_size * CHAR_WIDTH_RATIO
+def _char_width_ratio(font_family: str) -> float:
+    """Return the average character-width ratio for *font_family*."""
+    if not font_family:
+        return CHAR_WIDTH_RATIO
+    key = font_family.strip().lower()
+    return CHAR_WIDTH_RATIOS.get(key, CHAR_WIDTH_RATIO)
+
+
+def wrap_title(
+    title: str,
+    font_size: int,
+    max_width: int,
+    font_family: str = "",
+) -> list[str]:
+    """Word-wrap title text to fit within a given pixel width.
+
+    *font_family* is used for a per-font character-width estimate (optional).
+    """
+    ratio = _char_width_ratio(font_family)
+    avg_char_w = font_size * ratio
     max_chars = max(10, int(max_width / avg_char_w))
 
     words = title.split()
