@@ -6,6 +6,7 @@ from typing import TypedDict
 class QualityPreset(TypedDict):
     crf: int
     preset: str
+    resolution: int
 
 
 class ClipLayout(TypedDict):

@@ -103,7 +103,9 @@ class ClipGenerator:
         """
         intermediates: list[str] = []
         qp = QUALITY_PRESETS.get(output_quality, QUALITY_PRESETS["medium"])
-        canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
+        canvas_w, canvas_h = canvas_size_for_aspect_ratio(
+            canvas_aspect_ratio, resolution=qp.get("resolution"),
+        )
 
         has_intro = (
             intro_file_path

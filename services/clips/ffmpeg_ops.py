@@ -11,6 +11,7 @@ from config import FFMPEG_THREADS
 from services.clips.constants import (
     CHAR_WIDTH_RATIO,
     CHAR_WIDTH_RATIOS,
+    SPACE_WIDTH_RATIO,
     TITLE_BAR_BORDER_RADIUS,
     TITLE_BAR_H_PAD,
     TITLE_BAR_V_PAD,
@@ -225,12 +226,18 @@ def _estimate_line_width(
     letter_spacing: int,
     stroke_width: int,
 ) -> int:
-    """Return pixel-width estimate for a single line of text."""
+    """Return pixel-width estimate for a single line of text.
+
+    Spaces are narrower than regular glyphs in virtually every font, so we
+    use a dedicated ``SPACE_WIDTH_RATIO`` for them to avoid overestimating.
+    """
     key = (font_family or "").strip().lower()
     ratio = CHAR_WIDTH_RATIOS.get(key, CHAR_WIDTH_RATIO)
+    n_chars = sum(1 for c in text if c != " ")
+    n_spaces = sum(1 for c in text if c == " ")
     n = len(text)
-    char_w = font_size * ratio
-    text_w = n * char_w + max(0, n - 1) * max(0, letter_spacing)
+    text_w = n_chars * font_size * ratio + n_spaces * font_size * SPACE_WIDTH_RATIO
+    text_w += max(0, n - 1) * max(0, letter_spacing)
     text_w += 2 * max(0, stroke_width)
     return int(text_w)
 
@@ -726,6 +733,8 @@ def add_overlays(
                     )
                 else:
                     stream = stream.filter("ass", filename=normalized_title_ass)
+                # Ensure consistent pixel format after ASS alpha compositing.
+                stream = stream.filter("format", "yuv420p")
         except Exception:
             logger.exception("Failed to build title ASS; continuing without title text overlay")
 
@@ -741,6 +750,7 @@ def add_overlays(
             )
         else:
             stream = stream.filter("ass", filename=normalized_ass_path)
+        stream = stream.filter("format", "yuv420p")
 
     if (
         overlay_file_path
@@ -967,6 +977,8 @@ def compose_clip(
                     )
                 else:
                     stream = stream.filter("ass", filename=normalized_title_ass)
+                # Ensure consistent pixel format after ASS alpha compositing.
+                stream = stream.filter("format", "yuv420p")
         except Exception:
             logger.exception("Failed to build title ASS; continuing without title text overlay")
 
@@ -982,6 +994,7 @@ def compose_clip(
             )
         else:
             stream = stream.filter("ass", filename=normalized_ass_path)
+        stream = stream.filter("format", "yuv420p")
 
     if (
         overlay_file_path

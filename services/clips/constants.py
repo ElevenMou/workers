@@ -46,9 +46,9 @@ TITLE_BAR_BORDER_RADIUS = 12
 TITLE_SAFE_MARGIN_X = 40
 
 QUALITY_PRESETS: dict[str, QualityPreset] = {
-    "low": {"crf": 23, "preset": "fast"},
-    "medium": {"crf": 18, "preset": "medium"},
-    "high": {"crf": 15, "preset": "slow"},
+    "low": {"crf": 23, "preset": "fast", "resolution": 420},
+    "medium": {"crf": 18, "preset": "medium", "resolution": 720},
+    "high": {"crf": 15, "preset": "slow", "resolution": 1080},
 }
 
 
@@ -62,10 +62,15 @@ def intermediate_quality_preset(base: QualityPreset) -> QualityPreset:
     base_crf = int(base.get("crf", 23))
     # Keep intermediates visibly cleaner than the final CRF target.
     intermediate_crf = max(10, min(28, base_crf - 8))
-    return {"crf": intermediate_crf, "preset": str(base.get("preset", "medium"))}
+    return {
+        "crf": intermediate_crf,
+        "preset": str(base.get("preset", "medium")),
+        "resolution": int(base.get("resolution", 1080)),
+    }
 
 
 CHAR_WIDTH_RATIO = 0.52
+SPACE_WIDTH_RATIO = 0.28
 
 # Per-font average character width ratios for more accurate text wrapping.
 # Values represent avg glyph advance / font-size for mixed-case Latin text.
@@ -91,10 +96,30 @@ def normalize_canvas_aspect_ratio(aspect_ratio: str | None) -> str:
     return CANVAS_ASPECT_RATIO_ALIASES.get(key, DEFAULT_CANVAS_ASPECT_RATIO)
 
 
-def canvas_size_for_aspect_ratio(aspect_ratio: str | None) -> tuple[int, int]:
-    """Return concrete ``(width, height)`` pixels for a canvas aspect ratio."""
+def canvas_size_for_aspect_ratio(
+    aspect_ratio: str | None,
+    resolution: int | None = None,
+) -> tuple[int, int]:
+    """Return concrete ``(width, height)`` pixels for a canvas aspect ratio.
+
+    When *resolution* is provided the base dimensions are scaled so that the
+    shorter side equals *resolution* (rounded to the nearest even number).
+    For example ``resolution=720`` with ``9:16`` yields ``(720, 1280)``.
+    """
     normalized = normalize_canvas_aspect_ratio(aspect_ratio)
-    return CANVAS_ASPECT_RATIO_DIMENSIONS[normalized]
+    base_w, base_h = CANVAS_ASPECT_RATIO_DIMENSIONS[normalized]
+
+    if resolution is None or resolution >= min(base_w, base_h):
+        return base_w, base_h
+
+    short_side = min(base_w, base_h)
+    scale = resolution / short_side
+    scaled_w = int(round(base_w * scale))
+    scaled_h = int(round(base_h * scale))
+    # Ensure even dimensions for video encoding.
+    scaled_w -= scaled_w % 2
+    scaled_h -= scaled_h % 2
+    return max(2, scaled_w), max(2, scaled_h)
 
 
 def normalize_video_scale_mode(scale_mode: str | None) -> str:

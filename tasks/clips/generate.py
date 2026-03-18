@@ -5,7 +5,7 @@ import traceback
 
 from config import normalize_clip_generation_credits
 from services.clip_generator import ClipGenerator, compute_video_position
-from services.clips.constants import canvas_size_for_aspect_ratio
+from services.clips.constants import QUALITY_PRESETS, canvas_size_for_aspect_ratio
 from services.clips.quality_policy import resolve_effective_output_quality
 from services.video_downloader import VideoDownloader
 from tasks.clips.helpers.captions import build_caption_ass, resolve_caption_style_mode
@@ -428,7 +428,10 @@ def generate_clip_task(job_data: GenerateClipJob):
         )
         canvas_aspect_ratio = str(vid_cfg.get("canvasAspectRatio") or "9:16")
         video_scale_mode = str(vid_cfg.get("videoScaleMode") or "fit")
-        canvas_w, canvas_h = canvas_size_for_aspect_ratio(canvas_aspect_ratio)
+        qp = QUALITY_PRESETS.get(output_quality, QUALITY_PRESETS["medium"])
+        canvas_w, canvas_h = canvas_size_for_aspect_ratio(
+            canvas_aspect_ratio, resolution=qp.get("resolution"),
+        )
 
         bg_style, bg_image_path = maybe_download_layout_background_image(
             bg_style=bg_style,
