@@ -72,6 +72,7 @@ def _run_ffmpeg_with_timeout(
     import sys
 
     cmd = stream.compile()
+    logger.debug("FFmpeg command: %s", " ".join(cmd))
     stderr_pipe = subprocess.PIPE if (capture_stderr or quiet) else None
     stdout_pipe = subprocess.PIPE if quiet else None
 
@@ -1096,6 +1097,13 @@ def compose_clip(
 
         stream = ffmpeg.filter([stream, overlay_input], "overlay", overlay_x, overlay_y)
 
+    # Ensure the video stream's pixel format matches what the encoder expects.
+    # Done explicitly in the filter chain to avoid FFmpeg auto-conversion
+    # conflicts that can silently drop audio in complex filtergraphs.
+    target_pix_fmt = output_args.pop("pix_fmt", None)
+    if target_pix_fmt:
+        stream = stream.filter("format", target_pix_fmt)
+
     audio_stream = source.audio if _media_has_audio(input_path) else None
     if audio_stream is None:
         audio_stream = ffmpeg.input(
@@ -1130,6 +1138,13 @@ def compose_clip(
     finally:
         for temp_file in temp_files:
             safe_remove(temp_file)
+
+    if not _media_has_audio(output_path):
+        logger.error(
+            "compose_clip output %s has no audio stream — source had audio: %s",
+            output_path,
+            _media_has_audio(input_path),
+        )
 
 
 def _prepare_intro_outro_segment(
@@ -1345,6 +1360,15 @@ def derive_delivery_from_master(
     if target_fps:
         stream = stream.filter("fps", max(1, int(target_fps)))
 
+    resolved_args = _resolve_encode_args(encode_args=encode_args)
+
+    # Ensure the video stream's pixel format matches what the encoder expects.
+    # Done explicitly in the filter chain to avoid FFmpeg auto-conversion
+    # conflicts that can silently drop audio in complex filtergraphs.
+    target_pix_fmt = resolved_args.pop("pix_fmt", None)
+    if target_pix_fmt:
+        stream = stream.filter("format", target_pix_fmt)
+
     audio_stream = source.audio if _media_has_audio(input_path) else None
     if audio_stream is None:
         duration_seconds = max(0.1, _probe_media_duration(input_path))
@@ -1364,11 +1388,18 @@ def derive_delivery_from_master(
             stream,
             audio_stream,
             output_path,
-            **_resolve_encode_args(encode_args=encode_args),
+            **resolved_args,
         )
         .overwrite_output()
     )
     _run_ffmpeg_with_timeout(output_stream, capture_stderr=True)
+
+    if not _media_has_audio(output_path):
+        logger.error(
+            "derive_delivery output %s has no audio stream — master had audio: %s",
+            output_path,
+            _media_has_audio(input_path),
+        )
 
 
 def generate_thumbnail(

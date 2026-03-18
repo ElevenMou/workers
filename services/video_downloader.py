@@ -589,14 +589,30 @@ class VideoDownloader:
         return "video" in VideoDownloader._probe_stream_types(video_path)
 
     @staticmethod
-    def _resolve_output_path(expected_path: str) -> str:
-        if os.path.isfile(expected_path) and VideoDownloader._has_video_stream(expected_path):
-            return expected_path
+    def _has_muxed_audio_video(video_path: str) -> bool:
+        stream_types = VideoDownloader._probe_stream_types(video_path)
+        return "video" in stream_types and "audio" in stream_types
 
+    @staticmethod
+    def _resolve_output_path(expected_path: str) -> str:
         base, _ = os.path.splitext(expected_path)
-        candidates = [p for p in glob(f"{base}.*") if os.path.isfile(p)]
+        candidate_pool: list[str] = []
+        if os.path.isfile(expected_path):
+            candidate_pool.append(expected_path)
+        candidate_pool.extend(
+            path
+            for path in glob(f"{base}.*")
+            if os.path.isfile(path) and path not in candidate_pool
+        )
+        candidates = candidate_pool
         if not candidates:
             return expected_path
+
+        muxed_candidates = [
+            path for path in candidates if VideoDownloader._has_muxed_audio_video(path)
+        ]
+        if muxed_candidates:
+            return max(muxed_candidates, key=os.path.getmtime)
 
         video_candidates = [path for path in candidates if VideoDownloader._has_video_stream(path)]
         if video_candidates:

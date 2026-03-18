@@ -27,7 +27,7 @@ from utils.media_storage import (
 )
 from utils.supabase_client import supabase
 
-_VIDEO_RAW_TTL_HOURS = 24
+_VIDEO_RAW_TTL_HOURS = 12
 _WAIT_STAGE_NOTIFY_INTERVAL_SECONDS = 5.0
 _WAIT_POLL_INTERVAL_SECONDS = 1.0
 _UNSET_SOURCE_MAX_HEIGHT = object()
@@ -341,12 +341,6 @@ def _try_resolve_waited_video(
     Shared by both the in-loop and post-loop resolution paths.
     """
     def _resolve_storage_candidate() -> SourceVideoResolution | None:
-        if prefer_fresh_download and not _value_is_fresh(
-            latest_storage_path,
-            entry_raw_storage_path,
-        ):
-            return None
-
         storage_is_fresh = _should_force_storage_cache_refresh(
             latest_storage_path=latest_storage_path,
             entry_raw_storage_path=entry_raw_storage_path,
@@ -442,59 +436,60 @@ def resolve_source_video(
     )
     entry_raw_video_path = _normalize_optional_text(initial_raw_video_path)
     entry_raw_storage_path = _normalize_optional_text(initial_raw_video_storage_path)
-    if not prefer_fresh_download:
-        def _initial_local_candidate() -> SourceVideoResolution | None:
-            existing = _resolve_existing_video_path(
-                video_id=video_id,
-                job_id=job_id,
-                logger=logger,
-                raw_video_path=initial_raw_video_path,
-            )
-            if existing is None:
-                return None
-            path, width, height = existing
-            return SourceVideoResolution(
-                video_path=path,
-                width=width,
-                height=height,
-                strategy="reused_existing",
-                wait_seconds=0.0,
-                download_seconds=0.0,
-                download_metadata=None,
-                source_profile=normalized_source_profile,
-            )
+    def _initial_local_candidate() -> SourceVideoResolution | None:
+        existing = _resolve_existing_video_path(
+            video_id=video_id,
+            job_id=job_id,
+            logger=logger,
+            raw_video_path=initial_raw_video_path,
+        )
+        if existing is None:
+            return None
+        path, width, height = existing
+        return SourceVideoResolution(
+            video_path=path,
+            width=width,
+            height=height,
+            strategy="reused_existing",
+            wait_seconds=0.0,
+            download_seconds=0.0,
+            download_metadata=None,
+            source_profile=normalized_source_profile,
+        )
 
-        def _initial_storage_candidate() -> SourceVideoResolution | None:
-            storage_existing = _resolve_storage_video_path(
-                video_id=video_id,
-                source_profile=normalized_source_profile,
-                job_id=job_id,
-                logger=logger,
-                raw_video_storage_path=entry_raw_storage_path,
-            )
-            if storage_existing is None:
-                return None
-            path, width, height = storage_existing
-            return SourceVideoResolution(
-                video_path=path,
-                width=width,
-                height=height,
-                strategy="downloaded_from_storage",
-                wait_seconds=0.0,
-                download_seconds=0.0,
-                download_metadata=None,
-                storage_path=entry_raw_storage_path,
-                source_profile=normalized_source_profile,
-            )
+    def _initial_storage_candidate() -> SourceVideoResolution | None:
+        storage_existing = _resolve_storage_video_path(
+            video_id=video_id,
+            source_profile=normalized_source_profile,
+            job_id=job_id,
+            logger=logger,
+            raw_video_storage_path=entry_raw_storage_path,
+        )
+        if storage_existing is None:
+            return None
+        path, width, height = storage_existing
+        return SourceVideoResolution(
+            video_path=path,
+            width=width,
+            height=height,
+            strategy="downloaded_from_storage",
+            wait_seconds=0.0,
+            download_seconds=0.0,
+            download_metadata=None,
+            storage_path=entry_raw_storage_path,
+            source_profile=normalized_source_profile,
+        )
 
-        for candidate in preferred_source_video_order():
-            resolved = (
-                _initial_local_candidate()
-                if candidate == "local"
-                else _initial_storage_candidate()
-            )
-            if resolved is not None:
-                return resolved
+    for candidate in preferred_source_video_order():
+        if candidate == "local" and prefer_fresh_download:
+            continue
+        resolved = (
+            _initial_local_candidate()
+            if candidate == "local"
+            else _initial_storage_candidate()
+        )
+        if resolved is not None:
+            return resolved
 
     wait_started_at = time.monotonic()
     lock_wait_seconds = max(1, int(SOURCE_VIDEO_LOCK_WAIT_SECONDS))
@@ -627,11 +622,6 @@ def resolve_source_video(
                 )
 
             def _latest_storage_candidate() -> SourceVideoResolution | None:
-                if prefer_fresh_download and not _value_is_fresh(
-                    latest_storage_path,
-                    entry_raw_storage_path,
-                ):
-                    return None
                 latest_storage_existing = _resolve_storage_video_path(
                     video_id=video_id,
                     source_profile=normalized_source_profile,

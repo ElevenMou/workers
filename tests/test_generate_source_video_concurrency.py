@@ -787,6 +787,34 @@ def test_video_downloader_resolve_output_path_skips_audio_only_expected_file(
     assert resolved == str(split_video)
 
 
+def test_video_downloader_resolve_output_path_prefers_muxed_output_over_video_only_sidecar(
+    monkeypatch,
+    tmp_path: Path,
+):
+    expected = tmp_path / "video-123.mp4"
+    merged_output = tmp_path / "video-123.mkv"
+    split_video = tmp_path / "video-123.f137.mp4"
+    merged_output.write_bytes(b"muxed")
+    split_video.write_bytes(b"video")
+    mtimes = {str(merged_output): 1.0, str(split_video): 2.0}
+
+    monkeypatch.setattr(
+        video_downloader_module.os.path,
+        "getmtime",
+        lambda path: mtimes[str(path)],
+    )
+    monkeypatch.setattr(
+        VideoDownloader,
+        "_probe_stream_types",
+        staticmethod(
+            lambda path: {"video", "audio"} if str(path) == str(merged_output) else {"video"}
+        ),
+    )
+
+    resolved = VideoDownloader._resolve_output_path(str(expected))
+    assert resolved == str(merged_output)
+
+
 def test_video_downloader_fallback_selector_is_not_720_limited(
     monkeypatch,
     tmp_path: Path,
