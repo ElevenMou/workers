@@ -14,6 +14,11 @@ from config import normalize_custom_clip_generation_credits
 from services.clip_generator import ClipGenerator, compute_video_position
 from services.clips.constants import QUALITY_PRESETS, canvas_size_for_aspect_ratio
 from services.clips.quality_policy import resolve_effective_output_quality
+from services.clips.render_profiles import (
+    DEFAULT_DELIVERY_PROFILE,
+    DEFAULT_MASTER_PROFILE,
+    DEFAULT_SOURCE_PROFILE,
+)
 from services.video_downloader import VideoDownloader
 from tasks.clips.helpers.captions import build_caption_ass, resolve_caption_style_mode
 from tasks.clips.helpers.lifecycle import (
@@ -255,6 +260,9 @@ def custom_clip_task(job_data: CustomClipJob):
         source_max_height = None
     output_quality_override = str(job_data.get("outputQualityOverride") or "").strip().lower() or None
     quality_policy_profile = str(job_data.get("qualityPolicyProfile") or "").strip() or None
+    source_profile = str(job_data.get("sourceProfile") or DEFAULT_SOURCE_PROFILE).strip() or DEFAULT_SOURCE_PROFILE
+    master_profile = str(job_data.get("masterProfile") or DEFAULT_MASTER_PROFILE).strip() or DEFAULT_MASTER_PROFILE
+    requested_delivery_profile = str(job_data.get("deliveryProfile") or DEFAULT_DELIVERY_PROFILE).strip() or DEFAULT_DELIVERY_PROFILE
 
     configure_job_scope(
         job_id=job_id,
@@ -283,7 +291,9 @@ def custom_clip_task(job_data: CustomClipJob):
 
     downloader = VideoDownloader(work_dir=work_dir)
     audio_path: str | None = None
-    uploaded_storage_path: str | None = None
+    storage_path: str | None = None
+    uploaded_delivery_storage_path: str | None = None
+    uploaded_master_storage_path: str | None = None
     uploaded_file_size: int | None = None
     source_video_strategy = "reused_existing"
     source_video_wait_seconds = 0.0
@@ -431,6 +441,7 @@ def custom_clip_task(job_data: CustomClipJob):
             logger=logger,
             job_id=job_id,
             source_max_height=quality_controls.effective_source_max_height,
+            source_profile=source_profile,
             prefer_fresh_download=quality_controls.prefer_fresh_source_download,
             on_wait_for_download=_emit_waiting_for_source,
             on_download_start=_emit_downloading_source,
@@ -508,8 +519,7 @@ def custom_clip_task(job_data: CustomClipJob):
             thumbnail_url=source_thumbnail,
             platform=source_platform,
             external_id=source_external_id,
-            raw_video_path=raw_video_metadata["raw_video_path"],
-            raw_video_expires_at=raw_video_metadata["raw_video_expires_at"],
+            **raw_video_metadata,
         )
 
         # 2. Get transcript ----------------------------------------------------
@@ -838,6 +848,7 @@ def custom_clip_task(job_data: CustomClipJob):
             blur_strength=blur_strength,
             blur_brightness=float(vid_cfg.get("blurBrightness", -0.15)),
             output_quality=output_quality,
+            delivery_profile=requested_delivery_profile,
             title_shadow_size=int(title_cfg.get("shadowSize", 2)),
             title_letter_spacing=int(title_cfg.get("letterSpacing", 0)),
             title_fade_in_ms=int(title_cfg.get("fadeInMs", 300)),
@@ -846,6 +857,8 @@ def custom_clip_task(job_data: CustomClipJob):
 
         # 7. Upload to Supabase Storage ----------------------------------------
         storage_path = f"clips/{clip_id}.mp4"
+        delivery_storage_path = storage_path
+        master_storage_path = f"clips/{clip_id}/master.mov"
 
         update_clip_job_progress(
             job_id=job_id,
@@ -855,14 +868,22 @@ def custom_clip_task(job_data: CustomClipJob):
         )
         logger.info("[%s] Uploading clip to storage ...", job_id)
 
+        upload_clip_with_replace(
+            local_clip_path=result["master_path"],
+            storage_path=master_storage_path,
+            job_id=job_id,
+            logger=logger,
+            allow_reencode=False,
+        )
+        uploaded_master_storage_path = master_storage_path
         uploaded_file_size = upload_clip_with_replace(
-            local_clip_path=result["clip_path"],
-            storage_path=storage_path,
+            local_clip_path=result["delivery_path"],
+            storage_path=delivery_storage_path,
             job_id=job_id,
             logger=logger,
             allow_reencode=quality_controls.allow_upload_reencode,
         )
-        uploaded_storage_path = storage_path
+        uploaded_delivery_storage_path = delivery_storage_path
 
         # 8. Update clip record ------------------------------------------------
         update_clip_job_progress(
@@ -874,6 +895,9 @@ def custom_clip_task(job_data: CustomClipJob):
         clip_update = {
             "status": "completed",
             "storage_path": storage_path,
+            "delivery_storage_path": delivery_storage_path,
+            "master_storage_path": master_storage_path,
+            "delivery_profile": result["delivery_profile"],
             "file_size_bytes": uploaded_file_size or result["file_size"],
             "asset_expires_at": asset_expires_at_iso(clip_retention_days),
             "asset_expired_at": None,
@@ -922,7 +946,15 @@ def custom_clip_task(job_data: CustomClipJob):
                 detail_key="generation_finished",
                 extra_result_data={
                     "storage_path": storage_path,
+                    "delivery_storage_path": delivery_storage_path,
+                    "master_storage_path": master_storage_path,
                     "file_size": uploaded_file_size or result["file_size"],
+                    "master_file_size": result["master_file_size"],
+                    "delivery_file_size": result["delivery_file_size"],
+                    "source_profile": source_profile,
+                    "master_profile": master_profile,
+                    "requested_delivery_profile": requested_delivery_profile,
+                    "delivery_profile": result["delivery_profile"],
                     "source_video_strategy": source_video_strategy,
                     "source_video_wait_seconds": round(source_video_wait_seconds, 3),
                     "source_video_download_seconds": round(
@@ -942,7 +974,9 @@ def custom_clip_task(job_data: CustomClipJob):
         best_effort_cleanup_uploaded_artifacts(
             job_id=job_id,
             clip_id=clip_id,
-            storage_path=uploaded_storage_path,
+            storage_path=storage_path,
+            delivery_storage_path=uploaded_delivery_storage_path,
+            master_storage_path=uploaded_master_storage_path,
             logger=logger,
         )
         if _has_retries_remaining():

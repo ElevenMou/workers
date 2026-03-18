@@ -48,7 +48,18 @@ TITLE_SAFE_MARGIN_X = 40
 QUALITY_PRESETS: dict[str, QualityPreset] = {
     "low": {"crf": 23, "preset": "fast", "resolution": 420},
     "medium": {"crf": 18, "preset": "medium", "resolution": 720},
-    "high": {"crf": 15, "preset": "slow", "resolution": 1080},
+    "high": {
+        "crf": 12,
+        "preset": "slow",
+        "resolution": 1080,
+        "profile": "high",
+        "level": "4.1",
+        "tune": "film",
+        "maxrate": "16M",
+        "bufsize": "32M",
+        "audio_bitrate": "320k",
+        "fps": None,
+    },
 }
 
 
@@ -62,11 +73,16 @@ def intermediate_quality_preset(base: QualityPreset) -> QualityPreset:
     base_crf = int(base.get("crf", 23))
     # Keep intermediates visibly cleaner than the final CRF target.
     intermediate_crf = max(10, min(28, base_crf - 8))
-    return {
+    result: QualityPreset = {
         "crf": intermediate_crf,
         "preset": str(base.get("preset", "medium")),
         "resolution": int(base.get("resolution", 1080)),
     }
+    # Propagate high-quality encoding options to intermediates.
+    for key in ("profile", "level", "tune", "maxrate", "bufsize", "audio_bitrate", "fps"):
+        if key in base:
+            result[key] = base[key]  # type: ignore[literal-required]
+    return result
 
 
 CHAR_WIDTH_RATIO = 0.52

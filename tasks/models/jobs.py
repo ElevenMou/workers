@@ -44,6 +44,9 @@ class GenerateClipJob(TypedDict):
     workspaceRole: NotRequired[str]
     subscriptionTier: NotRequired[str]
     sourceMaxHeight: NotRequired[int | None]
+    sourceProfile: NotRequired[str]
+    masterProfile: NotRequired[str]
+    deliveryProfile: NotRequired[str]
     outputQualityOverride: NotRequired[str | None]
     qualityPolicyProfile: NotRequired[str]
 
@@ -67,6 +70,9 @@ class CustomClipJob(TypedDict):
     workspaceRole: NotRequired[str]
     subscriptionTier: NotRequired[str]
     sourceMaxHeight: NotRequired[int | None]
+    sourceProfile: NotRequired[str]
+    masterProfile: NotRequired[str]
+    deliveryProfile: NotRequired[str]
     outputQualityOverride: NotRequired[str | None]
     qualityPolicyProfile: NotRequired[str]
 

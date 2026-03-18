@@ -26,18 +26,19 @@ def test_source_video_resolution_downloads_from_minio(tmp_path, monkeypatch):
 
     resolved = source_video._resolve_storage_video_path(
         video_id="video-1",
+        source_profile="source_h1080",
         job_id="job-1",
         logger=type("Logger", (), {"warning": lambda *args, **kwargs: None})(),
         raw_video_storage_path="raw-videos/raw/video-1.mp4",
         force_refresh_cache=True,
     )
 
-    assert resolved == (str(tmp_path / "cache" / "video-1.mp4"), 1920, 1080)
+    assert resolved == (str(tmp_path / "cache" / "video-1__source_h1080.mp4"), 1920, 1080)
     assert download_calls == [
         (
             "raw-videos",
             "raw/video-1.mp4",
-            str(tmp_path / "cache" / "video-1.mp4.tmp"),
+            str(tmp_path / "cache" / "video-1__source_h1080.mp4.tmp"),
         )
     ]
 

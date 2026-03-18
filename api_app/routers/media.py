@@ -48,7 +48,7 @@ def _require_internal_token(internal_token: str | None = Header(default=None, al
 def _load_clip_storage_path(clip_id: str) -> str:
     response = (
         supabase.table("clips")
-        .select("id,storage_path,status")
+        .select("id,storage_path,delivery_storage_path,status")
         .eq("id", clip_id)
         .limit(1)
         .execute()
@@ -59,7 +59,11 @@ def _load_clip_storage_path(clip_id: str) -> str:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Clip not found.")
 
     clip = rows[0]
-    storage_path = str(clip.get("storage_path") or "").strip()
+    storage_path = str(
+        clip.get("delivery_storage_path")
+        or clip.get("storage_path")
+        or ""
+    ).strip()
     if not storage_path:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

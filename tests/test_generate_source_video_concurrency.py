@@ -16,6 +16,7 @@ from config import (
 from services import video_downloader as video_downloader_module
 from services.video_downloader import VideoDownloader
 from tasks.clips.helpers import source_video
+from utils import minio_client as minio_client_module
 
 
 class _FakeRedis:
@@ -51,6 +52,19 @@ class _NeverAcquireRedis:
 
     def delete(self, *_args, **_kwargs):
         return 0
+
+
+@pytest.fixture(autouse=True)
+def _stub_source_probe_update(monkeypatch):
+    monkeypatch.setattr(source_video, "build_video_source_probe_update", lambda _path: {})
+
+
+def _expected_profiled_cache_path(tmp_path: Path, video_id: str, suffix: str = ".mp4") -> str:
+    return str(
+        Path(tmp_path)
+        / "cache"
+        / f"{video_id}__{source_video._default_source_profile(source_video._UNSET_SOURCE_MAX_HEIGHT)}{suffix}"
+    )
 
 
 def test_resolve_source_video_deduplicates_download_for_concurrent_same_video(
@@ -273,17 +287,13 @@ def test_resolve_source_video_downloads_from_canonical_storage_before_url(
         def download(self, *_args, **_kwargs):
             raise AssertionError("URL download should not be used when canonical storage is available")
 
-    class _FakeStorageBucket:
-        def download(self, _path: str):
-            return b"stored-video"
-
-    class _FakeStorageClient:
-        def from_(self, _bucket: str):
-            return _FakeStorageBucket()
+    class _FakeMinioClient:
+        def fget_object(self, _bucket: str, _object_name: str, target_path: str):
+            Path(target_path).write_bytes(b"stored-video")
 
     monkeypatch.setattr(source_video, "RAW_VIDEO_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1280, 720))
-    monkeypatch.setattr(source_video, "supabase", type("S", (), {"storage": _FakeStorageClient()})())
+    monkeypatch.setattr(minio_client_module, "get_minio_client", lambda: _FakeMinioClient())
 
     result = source_video.resolve_source_video(
         video_id="video-storage-first",
@@ -389,7 +399,7 @@ def test_resolve_source_video_prefers_fresh_but_reuses_waited_download(
     assert "waited_and_reused" in strategies
     reused = [resolution for resolution in results.values() if resolution.strategy == "waited_and_reused"]
     assert reused
-    assert reused[0].video_path == str(tmp_path / "cache" / "video-fresh-wait.mp4")
+    assert reused[0].video_path == _expected_profiled_cache_path(tmp_path, "video-fresh-wait")
     assert Path(reused[0].video_path).is_file()
 
 
@@ -485,7 +495,7 @@ def test_resolve_source_video_prefers_fresh_with_three_waiters_uses_first_fresh_
         resolution for resolution in results.values() if resolution.strategy == "waited_and_reused"
     ]
     assert len(waited) == 2
-    expected_cache_path = str(tmp_path / "cache" / "video-triple-fresh.mp4")
+    expected_cache_path = _expected_profiled_cache_path(tmp_path, "video-triple-fresh")
     assert {resolution.video_path for resolution in waited} == {expected_cache_path}
     assert Path(expected_cache_path).is_file()
 
@@ -593,7 +603,7 @@ def test_resolve_source_video_waiter_reuses_shared_cache_not_producer_workdir(
     assert not errors
     assert results["producer"].strategy == "downloaded_now"
     assert results["waiter"].strategy == "waited_and_reused"
-    expected_cache_path = str(tmp_path / "cache" / "video-durable-handoff.mp4")
+    expected_cache_path = _expected_profiled_cache_path(tmp_path, "video-durable-handoff")
     assert results["waiter"].video_path == expected_cache_path
     assert results["waiter"].video_path != producer_paths[0]
     assert Path(expected_cache_path).read_bytes() == b"producer-video"
@@ -814,10 +824,10 @@ def test_video_downloader_fallback_selector_is_not_720_limited(
 
     assert result["path"].endswith("video-123.mp4")
     assert selectors[0] == (
-        "primary_av_merge_default",
+        "best_source_default",
         VideoDownloader._format_selector_for_max_height(1080),
     )
-    assert selectors[1][0] == "fallback_muxed_av"
+    assert selectors[1][0] == "compatibility_fallback"
     assert "height<=720" not in selectors[1][1]
 
 
@@ -839,7 +849,7 @@ def test_video_downloader_retries_legacy_clients_for_youtube_on_primary_error(
     ):
         del self, url, output_path, format_selector, max_height
         attempts.append((attempt_label, ydl_overrides))
-        if attempt_label == "primary_av_merge_default":
+        if attempt_label == "best_source_default":
             raise yt_dlp.utils.DownloadError("primary failed")
         return {
             "title": "Video",
@@ -858,9 +868,9 @@ def test_video_downloader_retries_legacy_clients_for_youtube_on_primary_error(
     result = downloader.download("https://www.youtube.com/watch?v=abc123", "video-123")
 
     assert result["path"].endswith("video-123.mp4")
-    assert attempts[0] == ("primary_av_merge_default", None)
+    assert attempts[0] == ("best_source_default", None)
     assert attempts[1] == (
-        "primary_av_merge_legacy_clients",
+        "best_source_legacy_clients",
         {"extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}},
     )
     assert len(attempts) == 2
@@ -901,4 +911,4 @@ def test_video_downloader_no_legacy_retry_when_primary_succeeds(
     result = downloader.download("https://www.youtube.com/watch?v=abc123", "video-123")
 
     assert result["path"].endswith("video-123.mp4")
-    assert attempts == [("primary_av_merge_default", None)]
+    assert attempts == [("best_source_default", None)]

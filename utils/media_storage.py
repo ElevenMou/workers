@@ -30,6 +30,10 @@ _MISSING_MINIO_OBJECT_CODES = {
     "NoSuchObject",
     "ResourceNotFound",
 }
+_CONTENT_TYPE_BY_EXTENSION = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+}
 
 
 class GeneratedClipStorageError(RuntimeError):
@@ -122,6 +126,11 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _content_type_for_path(path: str, fallback: str = "application/octet-stream") -> str:
+    suffix = Path(str(path or "")).suffix.lower()
+    return _CONTENT_TYPE_BY_EXTENSION.get(suffix, fallback)
 
 
 def _create_signature(path: str, expires_at: int) -> str:
@@ -373,11 +382,12 @@ def delete_local_generated_clip(storage_path: str, *, logger=None) -> bool:
 def _cached_raw_video_path_for_storage_path(storage_path: str) -> str | None:
     normalized = _normalize_bucket_relative_path(storage_path, RAW_VIDEOS_BUCKET)
     stem = Path(normalized).stem.strip()
+    suffix = Path(normalized).suffix.lower().strip() or ".mp4"
     if not stem:
         return None
     cache_root = Path(RAW_VIDEO_CACHE_DIR)
     cache_root.mkdir(parents=True, exist_ok=True)
-    return str(cache_root / f"{stem}.mp4")
+    return str(cache_root / f"{stem}{suffix}")
 
 
 def delete_local_raw_video(
@@ -447,18 +457,26 @@ def upload_raw_video(
     *,
     video_id: str,
     local_video_path: str,
+    source_profile: str = "source_best",
     logger,
     job_id: str,
 ) -> tuple[str | None, str | None]:
     from utils.minio_client import get_minio_client
 
-    storage_path = _normalize_bucket_relative_path(f"raw/{video_id}.mp4", RAW_VIDEOS_BUCKET)
+    normalized_source_profile = "".join(
+        ch for ch in str(source_profile or "source_best").strip().lower() if ch.isalnum() or ch == "_"
+    ) or "source_best"
+    suffix = Path(local_video_path).suffix.lower().strip() or ".mp4"
+    storage_path = _normalize_bucket_relative_path(
+        f"raw/{video_id}__{normalized_source_profile}{suffix}",
+        RAW_VIDEOS_BUCKET,
+    )
     file_hash = _sha256_file(local_video_path)
     get_minio_client().fput_object(
         RAW_VIDEOS_BUCKET,
         storage_path,
         local_video_path,
-        content_type="video/mp4",
+        content_type=_content_type_for_path(local_video_path, "video/mp4"),
     )
     logger.info(
         "[%s] Uploaded canonical raw source to MinIO %s/%s",
@@ -481,7 +499,7 @@ def store_generated_clip(
         GENERATED_CLIPS_BUCKET,
         object_name,
         local_clip_path,
-        content_type=_LOCAL_CLIP_CONTENT_TYPE,
+        content_type=_content_type_for_path(local_clip_path, _LOCAL_CLIP_CONTENT_TYPE),
     )
     if hasattr(result, "size") and result.size:
         return int(result.size)

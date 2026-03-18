@@ -28,6 +28,11 @@ from config import (
     calculate_custom_clip_generation_cost,
 )
 from services.clips.quality_policy import resolve_clip_quality_policy
+from services.clips.render_profiles import (
+    DEFAULT_DELIVERY_PROFILE,
+    DEFAULT_MASTER_PROFILE,
+    DEFAULT_SOURCE_PROFILE,
+)
 from utils.supabase_client import (
     get_credit_balance,
     get_team_wallet_balance,
@@ -286,11 +291,7 @@ def generate_clip(
         clip_duration_seconds=clip_duration,
         requested_output_quality=None,
     )
-    output_quality_override = (
-        quality_policy.get("output_quality")
-        if quality_policy.get("profile") == "premium_short_clip"
-        else None
-    )
+    output_quality_override = None
 
     is_ai_suggested = _is_ai_suggested_clip(clip)
     has_prior_generation = _clip_has_prior_generation(
@@ -341,6 +342,9 @@ def generate_clip(
         "workspaceRole": access_context.workspace_role,
         "subscriptionTier": access_context.tier,
         "sourceMaxHeight": quality_policy.get("source_max_height"),
+        "sourceProfile": DEFAULT_SOURCE_PROFILE,
+        "masterProfile": DEFAULT_MASTER_PROFILE,
+        "deliveryProfile": DEFAULT_DELIVERY_PROFILE,
         "outputQualityOverride": output_quality_override,
         "qualityPolicyProfile": quality_policy.get("profile"),
     }
@@ -495,11 +499,7 @@ def custom_clip(
         clip_duration_seconds=duration,
         requested_output_quality=None,
     )
-    output_quality_override = (
-        quality_policy.get("output_quality")
-        if quality_policy.get("profile") == "premium_short_clip"
-        else None
-    )
+    output_quality_override = None
 
     job_data = {
         "jobId": job_id,
@@ -520,6 +520,9 @@ def custom_clip(
         "workspaceRole": access_context.workspace_role,
         "subscriptionTier": access_context.tier,
         "sourceMaxHeight": quality_policy.get("source_max_height"),
+        "sourceProfile": DEFAULT_SOURCE_PROFILE,
+        "masterProfile": DEFAULT_MASTER_PROFILE,
+        "deliveryProfile": DEFAULT_DELIVERY_PROFILE,
         "outputQualityOverride": output_quality_override,
         "qualityPolicyProfile": quality_policy.get("profile"),
     }

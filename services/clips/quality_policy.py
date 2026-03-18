@@ -13,15 +13,13 @@ class ClipQualityPolicy(TypedDict):
 
 _QUALITY_LEVELS = ("low", "medium", "high")
 _QUALITY_RANK = {"low": 0, "medium": 1, "high": 2}
-_PREMIUM_TIERS = {"pro", "enterprise"}
-_SHORT_CLIP_SECONDS = 90.0
 
 
 def _normalize_quality(value: str | None) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in _QUALITY_LEVELS:
         return normalized
-    return "medium"
+    return "high"
 
 
 def _normalize_quality_optional(value: object) -> str | None:
@@ -40,7 +38,7 @@ def resolve_effective_output_quality(
 
     Policy may upgrade quality, but never lower a template-selected quality level.
     """
-    base_quality = _normalize_quality_optional(template_quality) or "medium"
+    base_quality = _normalize_quality_optional(template_quality) or "high"
     override_quality = _normalize_quality_optional(policy_override_quality)
     if not override_quality:
         return base_quality
@@ -56,19 +54,10 @@ def resolve_clip_quality_policy(
     requested_output_quality: str | None,
 ) -> ClipQualityPolicy:
     """Return deterministic source/output quality knobs for the clip pipeline."""
-    normalized_tier = str(tier or "").strip().lower()
+    del tier, clip_duration_seconds
     output_quality = _normalize_quality(requested_output_quality)
-    source_max_height: int | None = 1080
-    profile = "balanced_1080"
-
-    # Premium short clips can use higher source quality and a stronger encode profile.
-    if normalized_tier in _PREMIUM_TIERS and float(clip_duration_seconds) <= _SHORT_CLIP_SECONDS:
-        source_max_height = 2160
-        profile = "premium_short_clip"
-        if output_quality == "low":
-            output_quality = "medium"
-        elif output_quality == "medium":
-            output_quality = "high"
+    source_max_height: int | None = 2160
+    profile = "master_first_2160"
 
     return {
         "source_max_height": source_max_height,

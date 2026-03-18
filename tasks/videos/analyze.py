@@ -8,6 +8,7 @@ from typing import Any
 
 from config import calculate_video_analysis_cost
 from services.ai_analyzer import AIAnalyzer
+from services.clips.render_profiles import DEFAULT_SOURCE_PROFILE
 from services.transcriber import Transcriber
 from services.video_downloader import VideoDownloader
 from tasks.clips.helpers.source_video import (
@@ -726,6 +727,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                     raw_storage_path, raw_storage_etag = upload_raw_video_to_storage(
                         video_id=video_id,
                         local_video_path=video_path,
+                        source_profile=DEFAULT_SOURCE_PROFILE,
                         logger=logger,
                         job_id=job_id,
                     )

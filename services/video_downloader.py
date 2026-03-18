@@ -470,8 +470,7 @@ class VideoDownloader:
         normalized_max_height = cls._normalize_max_height(max_height)
         if normalized_max_height is None:
             return (
-                "bv[vcodec^=avc1]+ba[acodec^=mp4a]/"
-                "bv[vcodec^=avc1]+ba/"
+                "bv*[vcodec!=none]+ba[acodec!=none]/"
                 "bv+ba/"
                 "b/"
                 "bv*+ba/b"
@@ -479,20 +478,38 @@ class VideoDownloader:
 
         height_filter = f"[height<={normalized_max_height}]"
         return (
-            f"bv{height_filter}[vcodec^=avc1]+ba[acodec^=mp4a]/"
-            f"bv{height_filter}[vcodec^=avc1]+ba/"
-            f"bv{height_filter}+ba/"
+            f"bv*{height_filter}[vcodec!=none]+ba[acodec!=none]/"
+            f"bv*{height_filter}+ba/"
             f"b{height_filter}/"
             "bv*+ba/b"
         )
 
+    @classmethod
+    def _compatibility_selector_for_max_height(cls, max_height: int | None) -> str:
+        normalized_max_height = cls._normalize_max_height(max_height)
+        if normalized_max_height is None:
+            return (
+                "bv[vcodec^=avc1]+ba[acodec^=mp4a]/"
+                "bv[vcodec^=avc1]+ba/"
+                "b[ext=mp4][vcodec!=none][acodec!=none]/"
+                "b[vcodec!=none][acodec!=none]"
+            )
+
+        height_filter = f"[height<={normalized_max_height}]"
+        return (
+            f"bv{height_filter}[vcodec^=avc1]+ba[acodec^=mp4a]/"
+            f"bv{height_filter}[vcodec^=avc1]+ba/"
+            f"b{height_filter}[ext=mp4][vcodec!=none][acodec!=none]/"
+            f"b{height_filter}[vcodec!=none][acodec!=none]"
+        )
+
     def _base_ydl_opts(self, *, max_height: int | None = 1080) -> dict:
         opts: dict = {
-            # Prefer h264+AAC for fast downstream processing.
-            # Height cap is controlled by tier-aware quality policy.
+            # Prefer the highest-quality source first and fall back to
+            # compatibility-oriented selectors only if needed.
             "format": self._format_selector_for_max_height(max_height),
             "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
-            "merge_output_format": "mp4",
+            "merge_output_format": "mkv",
             "noplaylist": True,
             # Let yt-dlp use its built-in default User-Agent (keeps Chrome
             # version current and avoids stale-UA bot detection).
@@ -683,6 +700,9 @@ class VideoDownloader:
         output_path = os.path.join(self.temp_dir, f"{video_id}.mp4")
         normalized_max_height = self._normalize_max_height(max_height)
         primary_selector = self._format_selector_for_max_height(normalized_max_height)
+        compatibility_selector = self._compatibility_selector_for_max_height(
+            normalized_max_height
+        )
         legacy_client_overrides = {
             "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}
         }
@@ -691,14 +711,14 @@ class VideoDownloader:
                 url,
                 output_path,
                 format_selector=primary_selector,
-                attempt_label="primary_av_merge_default",
+                attempt_label="best_source_default",
                 max_height=normalized_max_height,
             )
         except yt_dlp.utils.DownloadError as exc:
             if not self._is_youtube_url(url):
                 raise
             logger.warning(
-                "yt-dlp default-client download failed for %s; retrying with legacy YouTube clients: %s",
+                "yt-dlp best-source download failed for %s; retrying with legacy YouTube clients: %s",
                 video_id,
                 exc,
             )
@@ -706,7 +726,7 @@ class VideoDownloader:
                 url,
                 output_path,
                 format_selector=primary_selector,
-                attempt_label="primary_av_merge_legacy_clients",
+                attempt_label="best_source_legacy_clients",
                 max_height=normalized_max_height,
                 ydl_overrides=legacy_client_overrides,
             )
@@ -714,7 +734,7 @@ class VideoDownloader:
 
         if not self._has_audio_stream(downloaded_path):
             logger.warning(
-                "Downloaded media for %s has no audio stream; retrying with muxed A/V format",
+                "Downloaded media for %s has no audio stream; retrying with compatibility selector",
                 video_id,
             )
             try:
@@ -725,14 +745,8 @@ class VideoDownloader:
             info = self._download_with_opts(
                 url,
                 output_path,
-                format_selector=(
-                    f"b[ext=mp4][vcodec!=none][acodec!=none]"
-                    f"{f'[height<={normalized_max_height}]' if normalized_max_height else ''}/"
-                    f"b[vcodec!=none][acodec!=none]"
-                    f"{f'[height<={normalized_max_height}]' if normalized_max_height else ''}/"
-                    "b[vcodec!=none][acodec!=none]"
-                ),
-                attempt_label="fallback_muxed_av",
+                format_selector=compatibility_selector,
+                attempt_label="compatibility_fallback",
                 max_height=normalized_max_height,
             )
             downloaded_path = self._resolve_output_path(output_path)
@@ -747,6 +761,7 @@ class VideoDownloader:
             "thumbnail": info.get("thumbnail"),
             "platform": info.get("extractor_key", "unknown").lower(),
             "external_id": info.get("id"),
+            "selected_formats": self._selected_format_summary(info),
         }
 
     def download_audio_only(self, url: str, video_id: str) -> dict:
@@ -849,7 +864,7 @@ class VideoDownloader:
     def _probe_info(self, url: str) -> dict:
         """Fetch source metadata from yt-dlp without downloading media."""
         _validate_url(url)
-        ydl_opts = self._base_ydl_opts(max_height=1080)
+        ydl_opts = self._base_ydl_opts(max_height=2160)
         # Probing doesn't need cookies — stale/IP-mismatched cookies can
         # trigger YouTube bot checks *before* PO tokens come into play.
         ydl_opts.pop("cookiefile", None)

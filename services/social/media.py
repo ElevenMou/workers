@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import subprocess
 from pathlib import Path
 
+from services.clips.ffmpeg_ops import derive_delivery_from_master
+from services.clips.render_profiles import build_delivery_encode_args
+from services.media_profiles import clamped_source_fps, probe_media_profile
 from services.social.base import PublicationMedia, SocialProviderError
 from utils.media_storage import (
     GeneratedClipStorageError,
@@ -112,13 +116,62 @@ def probe_media(local_path: str) -> tuple[int | None, int | None, float | None]:
     return width, height, duration
 
 
-def load_publication_media(storage_path: str, *, work_dir: str) -> PublicationMedia:
-    local_path = download_clip_to_path(storage_path, work_dir=work_dir)
+def _build_publish_derivative_from_master(
+    *,
+    master_storage_path: str,
+    publish_profile: str,
+    delivery_profile: str | None,
+    work_dir: str,
+) -> str:
+    master_local_path = download_clip_to_path(master_storage_path, work_dir=work_dir)
+    source_profile = probe_media_profile(master_local_path)
+    encode_args = build_delivery_encode_args(
+        delivery_profile=delivery_profile or "social_auto_h264",
+        source_profile=source_profile,
+        profile_name=publish_profile,
+    )
+    target_fps = max(
+        1,
+        int(round(clamped_source_fps(source_profile, fallback=30.0, max_fps=60.0))),
+    )
+    output_path = os.path.join(work_dir, f"publish-{publish_profile}.mp4")
+    derive_delivery_from_master(
+        master_local_path,
+        output_path,
+        encode_args=encode_args,
+        source_media_profile=source_profile,
+        target_fps=target_fps,
+    )
+    return output_path
+
+
+def load_publication_media(
+    storage_path: str,
+    *,
+    work_dir: str,
+    master_storage_path: str | None = None,
+    publish_profile: str | None = None,
+    delivery_profile: str | None = None,
+) -> PublicationMedia:
+    local_path = ""
+    if master_storage_path and publish_profile:
+        try:
+            local_path = _build_publish_derivative_from_master(
+                master_storage_path=master_storage_path,
+                publish_profile=publish_profile,
+                delivery_profile=delivery_profile,
+                work_dir=work_dir,
+            )
+        except Exception:
+            local_path = ""
+    if not local_path:
+        local_path = download_clip_to_path(storage_path, work_dir=work_dir)
     width, height, duration = probe_media(local_path)
+    content_type = mimetypes.guess_type(local_path)[0] or "video/mp4"
     return PublicationMedia(
         local_path=local_path,
         file_size=os.path.getsize(local_path),
-        content_type="video/mp4",
+        content_type=content_type,
         signed_url=create_signed_clip_url(storage_path),
         width=width,
         height=height,

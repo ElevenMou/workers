@@ -18,7 +18,7 @@ class LayoutOverrides:
     bg_color: str = "#000000"
     bg_image_storage_path: str | None = None
     blur_strength: int = 20
-    output_quality: str = "medium"
+    output_quality: str = "high"
     layout_video: dict[str, Any] = field(default_factory=dict)
     layout_title: dict[str, Any] = field(default_factory=dict)
     layout_captions: dict[str, Any] = field(default_factory=dict)
@@ -236,8 +236,8 @@ def load_layout_overrides(
     overrides.bg_color = layout.get("background_color") or "#000000"
     overrides.bg_image_storage_path = layout.get("background_image_path")
     overrides.blur_strength = layout.get("background_blur_strength") or 20
-    raw_output_quality = str(layout.get("output_quality") or "medium").strip().lower()
-    overrides.output_quality = raw_output_quality if raw_output_quality else "medium"
+    raw_output_quality = str(layout.get("output_quality") or "high").strip().lower()
+    overrides.output_quality = raw_output_quality if raw_output_quality else "high"
     overrides.layout_video = layout.get("video") or {}
     overrides.layout_title = layout.get("title") or {}
 

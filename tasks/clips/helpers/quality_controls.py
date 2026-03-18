@@ -20,7 +20,7 @@ def _normalize_output_quality(value: object) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in _QUALITY_LEVELS:
         return normalized
-    return "medium"
+    return "high"
 
 
 def _normalize_source_max_height(value: object) -> int | None:

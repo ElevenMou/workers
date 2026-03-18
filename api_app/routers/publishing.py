@@ -118,7 +118,10 @@ def _social_queue_for_context(priority_processing: bool) -> str:
 def _load_workspace_clip(*, clip_id: str, user_id: str, workspace_team_id: str | None) -> dict:
     query = (
         supabase.table("clips")
-        .select("id, video_id, user_id, team_id, title, duration_seconds, status, storage_path")
+        .select(
+            "id, video_id, user_id, team_id, title, duration_seconds, status, "
+            "storage_path, delivery_storage_path, master_storage_path, delivery_profile, publish_profile_used"
+        )
         .eq("id", clip_id)
     )
     if workspace_team_id:
@@ -208,7 +211,11 @@ def _validate_provider_specific_constraints(*, clip: dict, social_accounts: list
 
 
 def _assert_clip_storage_ready_for_publish(clip: dict) -> None:
-    storage_path = str(clip.get("storage_path") or "").strip()
+    storage_path = str(
+        clip.get("delivery_storage_path")
+        or clip.get("storage_path")
+        or ""
+    ).strip()
     if not storage_path:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -565,7 +572,9 @@ def create_clip_publications(
         user_id=user_id,
         workspace_team_id=access_context.workspace_team_id,
     )
-    if clip.get("status") != "completed" or not clip.get("storage_path"):
+    if clip.get("status") != "completed" or not (
+        clip.get("delivery_storage_path") or clip.get("storage_path")
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only completed clips with generated assets can be published.",

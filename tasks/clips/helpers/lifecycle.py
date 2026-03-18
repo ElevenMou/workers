@@ -120,38 +120,58 @@ def best_effort_cleanup_uploaded_artifacts(
     job_id: str,
     clip_id: str,
     storage_path: str | None,
+    delivery_storage_path: str | None = None,
+    master_storage_path: str | None = None,
     logger,
 ) -> None:
     """Delete uploaded files and clear DB pointers after partial failure."""
-    if storage_path:
+    storage_paths = [
+        path
+        for path in (delivery_storage_path, storage_path, master_storage_path)
+        if path
+    ]
+    seen_paths: set[str] = set()
+    unique_paths: list[str] = []
+    for path in storage_paths:
+        normalized = str(path).strip()
+        if not normalized or normalized in seen_paths:
+            continue
+        seen_paths.add(normalized)
+        unique_paths.append(normalized)
+
+    for path in unique_paths:
         try:
-            delete_local_generated_clip(storage_path, logger=logger)
+            delete_local_generated_clip(path, logger=logger)
         except Exception as exc:
             logger.warning(
                 "[%s] Failed to delete local clip artifact %s: %s",
                 job_id,
-                storage_path,
+                path,
                 exc,
             )
 
-    if storage_path:
+    for path in unique_paths:
         try:
-            delete_generated_clip(storage_path, logger=logger)
+            delete_generated_clip(path, logger=logger)
         except Exception as exc:
             logger.warning(
                 "[%s] Failed to delete MinIO clip artifact %s: %s",
                 job_id,
-                storage_path,
+                path,
                 exc,
             )
 
-    if storage_path:
+    if unique_paths:
         try:
             clear_resp = (
                 supabase.table("clips")
                 .update(
                     {
                         "storage_path": None,
+                        "delivery_storage_path": None,
+                        "master_storage_path": None,
+                        "delivery_profile": None,
+                        "publish_profile_used": None,
                         "file_size_bytes": None,
                         "asset_expires_at": None,
                         "asset_expired_at": None,

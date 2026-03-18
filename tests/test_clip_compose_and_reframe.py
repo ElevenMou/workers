@@ -16,7 +16,9 @@ if "cv2" not in sys.modules:
     sys.modules["cv2"] = cv2_stub
 
 if "numpy" not in sys.modules:
-    sys.modules["numpy"] = ModuleType("numpy")
+    numpy_stub = ModuleType("numpy")
+    numpy_stub.isscalar = lambda value: isinstance(value, (int, float, complex, bool, str, bytes))
+    sys.modules["numpy"] = numpy_stub
 
 from services.clips import ffmpeg_ops
 from services.clips.generator import ClipGenerator
@@ -164,7 +166,7 @@ def test_generator_passes_reframe_window_and_uses_segment_relative_seek(monkeypa
     calls: dict[str, object] = {}
 
     def _fake_probe(path: str) -> tuple[int, int]:
-        if path.endswith("_reframed.mp4"):
+        if path.endswith("_reframed.mov"):
             return (140, 250)
         return (640, 360)
 
@@ -185,10 +187,35 @@ def test_generator_passes_reframe_window_and_uses_segment_relative_seek(monkeypa
         }
         Path(output_path).write_bytes(b"composited")
 
+    def _fake_probe_media_profile(_path: str) -> dict:
+        return {
+            "video": {
+                "fps": 30.0,
+                "color_primaries": "bt709",
+                "color_transfer": "bt709",
+                "color_space": "bt709",
+                "color_range": "tv",
+            },
+            "audio": {
+                "sample_rate": 48000,
+                "channel_layout": "stereo",
+            },
+        }
+
+    def _fake_derive_delivery(input_path: str, output_path: str, **kwargs):
+        calls["delivery"] = {
+            "input_path": input_path,
+            "output_path": output_path,
+            **kwargs,
+        }
+        Path(output_path).write_bytes(b"delivery")
+
     monkeypatch.setattr("services.clips.generator._probe_video_resolution", _fake_probe)
+    monkeypatch.setattr("services.clips.generator.probe_media_profile", _fake_probe_media_profile)
     monkeypatch.setattr("services.clips.generator.wrap_title", lambda *_args, **_kwargs: ["Title"])
     monkeypatch.setattr("services.clips.generator.compute_layout", lambda *_args, **_kwargs: dict(layout))
     monkeypatch.setattr("services.clips.generator.compose_clip", _fake_compose)
+    monkeypatch.setattr("services.clips.generator.derive_delivery_from_master", _fake_derive_delivery)
     monkeypatch.setattr(reframer_module, "reframe_video", _fake_reframe)
 
     result = ClipGenerator(work_dir=str(tmp_path)).generate(
@@ -204,7 +231,9 @@ def test_generator_passes_reframe_window_and_uses_segment_relative_seek(monkeypa
 
     assert calls["reframe"]["start_time"] == 530.0
     assert calls["reframe"]["end_time"] == 603.0
-    assert calls["compose"]["input_path"].endswith("clip-123_reframed.mp4")
+    assert calls["compose"]["input_path"].endswith("clip-123_reframed.mov")
     assert calls["compose"]["start_time"] == 0.0
     assert calls["compose"]["end_time"] == 73.0
-    assert result["file_size"] == len(b"composited")
+    assert calls["delivery"]["input_path"].endswith("clip-123_composited.mov")
+    assert calls["delivery"]["output_path"].endswith("clip-123_delivery.mp4")
+    assert result["file_size"] == len(b"delivery")

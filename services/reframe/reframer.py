@@ -53,6 +53,10 @@ def _probe_video(path: str) -> dict[str, Any]:
         "height": int(v_stream["height"]),
         "fps": _parse_frame_rate(v_stream.get("r_frame_rate", "30/1")),
         "duration": float(probe.get("format", {}).get("duration", 0)),
+        "color_primaries": v_stream.get("color_primaries"),
+        "color_transfer": v_stream.get("color_transfer"),
+        "color_space": v_stream.get("color_space"),
+        "color_range": v_stream.get("color_range"),
     }
 
 
@@ -100,6 +104,7 @@ def reframe_video(
     src_w, src_h = info["width"], info["height"]
     fps = info["fps"] or 30.0
     duration = info["duration"]
+    output_is_master = str(output_path).strip().lower().endswith(".mov")
 
     if duration <= 0:
         logger.warning("Cannot reframe: source duration is 0")
@@ -196,12 +201,6 @@ def reframe_video(
     from config import FFMPEG_THREADS
     threads = max(1, int(FFMPEG_THREADS))
 
-    # Quality presets matching the clip generator.
-    crf_map = {"low": "23", "medium": "18", "high": "15"}
-    preset_map = {"low": "fast", "medium": "medium", "high": "slow"}
-    crf = crf_map.get(output_quality, "18")
-    preset = preset_map.get(output_quality, "medium")
-
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo",
@@ -215,21 +214,56 @@ def reframe_video(
         "-i", input_path,
         "-map", "0:v:0",
         "-map", "1:a:0?",
-        "-c:v", "libx264",
-        "-crf", crf,
-        "-preset", preset,
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "256k",
-        "-ar", "48000",
         "-threads", str(threads),
-        "-movflags", "+faststart",
-        "-colorspace", "bt709",
-        "-color_primaries", "bt709",
-        "-color_trc", "bt709",
-        "-shortest",
-        output_path,
     ]
+    if output_is_master:
+        ffmpeg_cmd.extend([
+            "-c:v", "prores_ks",
+            "-profile:v", "3",
+            "-pix_fmt", "yuv422p10le",
+            "-c:a", "pcm_s16le",
+            "-ar", "48000",
+        ])
+        for info_key, ffmpeg_key in (
+            ("color_space", "-colorspace"),
+            ("color_primaries", "-color_primaries"),
+            ("color_transfer", "-color_trc"),
+            ("color_range", "-color_range"),
+        ):
+            value = str(info.get(info_key) or "").strip()
+            if value:
+                ffmpeg_cmd.extend([ffmpeg_key, value])
+    else:
+        # Quality presets matching the clip generator.
+        crf_map = {"low": "23", "medium": "18", "high": "12"}
+        preset_map = {"low": "fast", "medium": "medium", "high": "slow"}
+        audio_bitrate_map = {"low": "256k", "medium": "256k", "high": "320k"}
+        crf = crf_map.get(output_quality, "18")
+        preset = preset_map.get(output_quality, "medium")
+        audio_bitrate = audio_bitrate_map.get(output_quality, "256k")
+        ffmpeg_cmd.extend([
+            "-c:v", "libx264",
+            "-crf", crf,
+            "-preset", preset,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", audio_bitrate,
+            "-ar", "48000",
+            "-movflags", "+faststart",
+            "-colorspace", "bt709",
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+        ])
+        # High-quality encoding: add H.264 profile/level, tuning, and VBV rate control.
+        if output_quality == "high":
+            ffmpeg_cmd.extend([
+                "-profile:v", "high",
+                "-level", "4.1",
+                "-tune", "film",
+                "-maxrate", "16M",
+                "-bufsize", "32M",
+            ])
+    ffmpeg_cmd.extend(["-shortest", output_path])
 
     popen_kwargs: dict[str, Any] = {}
     if sys.platform != "win32":

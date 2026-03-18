@@ -20,10 +20,17 @@ from services.clips.constants import (
 from services.clips.ffmpeg_ops import (
     concat_intro_outro,
     compose_clip,
+    derive_delivery_from_master,
     safe_remove,
 )
 from services.clips.layout import compute_layout, compute_video_position, wrap_title
 from services.clips.models import ClipGenerationResult
+from services.clips.render_profiles import (
+    build_delivery_encode_args,
+    build_master_encode_args,
+    delivery_profile_for_aspect_ratio,
+)
+from services.media_profiles import clamped_source_fps, probe_media_profile
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +96,8 @@ class ClipGenerator:
         # -- misc --
         blur_strength: int = 20,
         blur_brightness: float = -0.15,
-        output_quality: str = "medium",
+        output_quality: str = "high",
+        delivery_profile: str | None = None,
         title_shadow_size: int = 2,
         title_letter_spacing: int = 0,
         title_fade_in_ms: int = 300,
@@ -102,7 +110,7 @@ class ClipGenerator:
         re-encoding pass from a separate extraction step.
         """
         intermediates: list[str] = []
-        qp = QUALITY_PRESETS.get(output_quality, QUALITY_PRESETS["medium"])
+        qp = QUALITY_PRESETS.get(output_quality, QUALITY_PRESETS["high"])
         canvas_w, canvas_h = canvas_size_for_aspect_ratio(
             canvas_aspect_ratio, resolution=qp.get("resolution"),
         )
@@ -164,7 +172,7 @@ class ClipGenerator:
             try:
                 from services.reframe.reframer import reframe_video as _reframe
 
-                reframed_path = os.path.join(self.temp_dir, f"{clip_id}_reframed.mp4")
+                reframed_path = os.path.join(self.temp_dir, f"{clip_id}_reframed.mov")
                 logger.info(
                     "[%s] Reframe requested for window %.2f-%.2f (%.2fs)",
                     clip_id,
@@ -217,11 +225,26 @@ class ClipGenerator:
                     logger.info("[%s] Reframe skipped (no faces / unavailable)", clip_id)
             except Exception:
                 logger.exception("[%s] Reframe failed — continuing with original source", clip_id)
-                safe_remove(os.path.join(self.temp_dir, f"{clip_id}_reframed.mp4"))
+                safe_remove(os.path.join(self.temp_dir, f"{clip_id}_reframed.mov"))
 
-        # If intro/outro concat runs afterward, keep this pass high-fidelity.
+        source_media_profile = probe_media_profile(effective_video_path)
+        target_fps = max(
+            1,
+            int(round(clamped_source_fps(source_media_profile, fallback=30.0, max_fps=60.0))),
+        )
+        master_encode_args = build_master_encode_args(source_profile=source_media_profile)
+        delivery_profile_name = delivery_profile or delivery_profile_for_aspect_ratio(
+            canvas_aspect_ratio
+        )
+        delivery_encode_args = build_delivery_encode_args(
+            delivery_profile=delivery_profile_name,
+            source_profile=source_media_profile,
+            profile_name=delivery_profile_name,
+        )
+
+        # If intro/outro concat runs afterward, keep this pass at master quality.
         overlay_qp = qp if not (has_intro or has_outro) else intermediate_quality_preset(qp)
-        composited_path = os.path.join(self.temp_dir, f"{clip_id}_composited.mp4")
+        composited_path = os.path.join(self.temp_dir, f"{clip_id}_composited.mov")
         compose_clip(
             effective_video_path,
             composited_path,
@@ -263,15 +286,17 @@ class ClipGenerator:
             title_letter_spacing=title_letter_spacing,
             title_fade_in_ms=title_fade_in_ms,
             title_bar_opacity=title_bar_opacity,
+            encode_args=master_encode_args,
+            target_fps=target_fps,
         )
         intermediates.append(composited_path)
 
-        # Concatenate intro/outro if configured.
+        # Concatenate intro/outro into the archival master if configured.
         if has_intro or has_outro:
-            final_clip_path = os.path.join(self.temp_dir, f"{clip_id}_final.mp4")
+            final_master_path = os.path.join(self.temp_dir, f"{clip_id}_master.mov")
             concat_intermediates = concat_intro_outro(
                 composited_path,
-                final_clip_path,
+                final_master_path,
                 qp,
                 intro_file_path=intro_file_path,
                 intro_cfg=intro_cfg,
@@ -279,17 +304,35 @@ class ClipGenerator:
                 outro_cfg=outro_cfg,
                 canvas_w=canvas_w,
                 canvas_h=canvas_h,
+                encode_args=master_encode_args,
+                segment_encode_args=master_encode_args,
+                target_fps=target_fps,
             )
             intermediates.extend(concat_intermediates)
         else:
-            final_clip_path = composited_path
+            final_master_path = composited_path
             # Remove composited_path from intermediates since it IS the final.
             intermediates = [p for p in intermediates if p != composited_path]
 
-        file_size = os.path.getsize(final_clip_path)
+        delivery_path = os.path.join(self.temp_dir, f"{clip_id}_delivery.mp4")
+        derive_delivery_from_master(
+            final_master_path,
+            delivery_path,
+            encode_args=delivery_encode_args,
+            source_media_profile=source_media_profile,
+            target_fps=target_fps,
+        )
+
+        master_file_size = os.path.getsize(final_master_path)
+        delivery_file_size = os.path.getsize(delivery_path)
         return {
-            "clip_path": final_clip_path,
-            "file_size": file_size,
+            "clip_path": delivery_path,
+            "file_size": delivery_file_size,
+            "master_path": final_master_path,
+            "master_file_size": master_file_size,
+            "delivery_path": delivery_path,
+            "delivery_file_size": delivery_file_size,
+            "delivery_profile": delivery_profile_name,
             "intermediates": intermediates,
         }
 

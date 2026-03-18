@@ -276,26 +276,26 @@ def test_health_metrics_requires_auth(client):
     assert response.status_code == 401
 
 
-def test_quality_policy_premium_short_clip_promotes_quality():
+def test_quality_policy_master_first_defaults_to_2160_source_and_preserves_requested_delivery_quality():
     policy = resolve_clip_quality_policy(
         tier="pro",
         clip_duration_seconds=45.0,
         requested_output_quality="medium",
     )
     assert policy["source_max_height"] == 2160
-    assert policy["output_quality"] == "high"
-    assert policy["profile"] == "premium_short_clip"
+    assert policy["output_quality"] == "medium"
+    assert policy["profile"] == "master_first_2160"
 
 
-def test_quality_policy_basic_keeps_balanced_1080():
+def test_quality_policy_master_first_applies_across_tiers():
     policy = resolve_clip_quality_policy(
         tier="basic",
         clip_duration_seconds=45.0,
         requested_output_quality="medium",
     )
-    assert policy["source_max_height"] == 1080
+    assert policy["source_max_height"] == 2160
     assert policy["output_quality"] == "medium"
-    assert policy["profile"] == "balanced_1080"
+    assert policy["profile"] == "master_first_2160"
 
 
 def test_quality_override_never_downgrades_template_quality():

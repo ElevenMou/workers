@@ -17,7 +17,7 @@ def cleanup_expired_clip_assets(batch_size: int = 100) -> dict[str, int]:
 
     response = (
         supabase.table("clips")
-        .select("id,storage_path,asset_expires_at")
+        .select("id,storage_path,delivery_storage_path,master_storage_path,asset_expires_at")
         .lte("asset_expires_at", now_iso)
         .is_("asset_expired_at", "null")
         .limit(batch_size)
@@ -33,14 +33,28 @@ def cleanup_expired_clip_assets(batch_size: int = 100) -> dict[str, int]:
     for row in rows:
         clip_id = row.get("id")
         storage_path = row.get("storage_path")
-        paths = [storage_path] if storage_path else []
+        delivery_storage_path = row.get("delivery_storage_path")
+        master_storage_path = row.get("master_storage_path")
+        paths = [
+            path
+            for path in (delivery_storage_path, storage_path, master_storage_path)
+            if path
+        ]
+        unique_paths: list[str] = []
+        seen_paths: set[str] = set()
+        for path in paths:
+            normalized = str(path).strip()
+            if not normalized or normalized in seen_paths:
+                continue
+            seen_paths.add(normalized)
+            unique_paths.append(normalized)
 
         try:
-            if paths:
-                for path in paths:
+            if unique_paths:
+                for path in unique_paths:
                     delete_local_generated_clip(path, logger=logger)
                     delete_generated_clip(path, logger=logger)
-                removed_files += len(paths)
+                removed_files += len(unique_paths)
         except Exception as exc:
             logger.warning(
                 "Failed to delete expired clip artifacts for %s (%s): %s",
@@ -56,6 +70,10 @@ def cleanup_expired_clip_assets(batch_size: int = 100) -> dict[str, int]:
                 .update(
                     {
                         "storage_path": None,
+                        "delivery_storage_path": None,
+                        "master_storage_path": None,
+                        "delivery_profile": None,
+                        "publish_profile_used": None,
                         "file_size_bytes": None,
                         "asset_expires_at": None,
                         "asset_expired_at": now_iso,

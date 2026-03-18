@@ -17,6 +17,7 @@ from services.social.base import (
     SocialAccountTokens,
     SocialProviderError,
 )
+from services.clips.render_profiles import publish_profile_for_provider
 from services.social.crypto import (
     decrypt_text,
     encrypt_text,
@@ -79,7 +80,10 @@ def _load_publication_row(publication_id: str) -> dict:
 def _load_clip_row(clip_id: str) -> dict:
     response = (
         supabase.table("clips")
-        .select("id, video_id, title, duration_seconds, status, storage_path")
+        .select(
+            "id, video_id, title, duration_seconds, status, storage_path, "
+            "delivery_storage_path, master_storage_path, delivery_profile, publish_profile_used"
+        )
         .eq("id", clip_id)
         .maybe_single()
         .execute()
@@ -353,7 +357,8 @@ def publish_clip_task(job_data: PublishClipJob) -> None:
         clip = _load_clip_row(str(publication["clip_id"]))
         social_account = _load_social_account(str(publication["social_account_id"]))
 
-        if clip.get("status") != "completed" or not clip.get("storage_path"):
+        delivery_storage_path = clip.get("delivery_storage_path") or clip.get("storage_path")
+        if clip.get("status") != "completed" or not delivery_storage_path:
             raise SocialProviderError(
                 "The clip asset is no longer available for publishing.",
                 code="clip_unavailable",
@@ -412,7 +417,22 @@ def publish_clip_task(job_data: PublishClipJob) -> None:
 
         account_context = _build_social_account_context(social_account)
         publication_context = _build_publication_context(publication, clip)
-        media = load_publication_media(str(clip["storage_path"]), work_dir=work_dir)
+        publish_profile = publish_profile_for_provider(account_context.provider)
+        media = load_publication_media(
+            str(delivery_storage_path),
+            work_dir=work_dir,
+            master_storage_path=(
+                str(clip.get("master_storage_path"))
+                if clip.get("master_storage_path")
+                else None
+            ),
+            publish_profile=publish_profile,
+            delivery_profile=(
+                str(clip.get("delivery_profile"))
+                if clip.get("delivery_profile")
+                else None
+            ),
+        )
         _validate_media_for_provider(account_context.provider, media.duration_seconds)
 
         if token_is_expired(social_account.get("token_expires_at")):
@@ -460,6 +480,21 @@ def publish_clip_task(job_data: PublishClipJob) -> None:
             media=media,
         )
         _persist_social_account_token_update(str(social_account["id"]), result)
+        try:
+            clip_update_resp = (
+                supabase.table("clips")
+                .update({"publish_profile_used": publish_profile})
+                .eq("id", clip["id"])
+                .execute()
+            )
+            assert_response_ok(clip_update_resp, f"Failed to update publish profile for clip {clip['id']}")
+        except Exception as clip_update_exc:
+            logger.warning(
+                "[%s] Failed to persist publish profile for clip %s: %s",
+                job_id,
+                clip["id"],
+                clip_update_exc,
+            )
 
         _best_effort_update_publication(
             publication_id,

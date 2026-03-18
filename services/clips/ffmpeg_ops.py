@@ -8,6 +8,7 @@ from pathlib import Path
 import ffmpeg
 
 from config import FFMPEG_THREADS
+from services.clips.render_profiles import requires_sdr_tonemap
 from services.clips.constants import (
     CHAR_WIDTH_RATIO,
     CHAR_WIDTH_RATIOS,
@@ -106,6 +107,99 @@ def _run_ffmpeg_with_timeout(
 
 def _ffmpeg_thread_args() -> dict[str, int]:
     return {"threads": _FFMPEG_THREADS}
+
+
+def _build_encode_args(qp: QualityPreset) -> dict:
+    """Build FFmpeg output kwargs from a QualityPreset.
+
+    Returns a dict suitable for unpacking into ``ffmpeg.output()``.
+    Includes all standard encoding params plus any optional
+    high-quality overrides present in the preset.
+    """
+    args: dict = {
+        "vcodec": "libx264",
+        "acodec": "aac",
+        "crf": qp["crf"],
+        "preset": qp["preset"],
+        **_ffmpeg_thread_args(),
+        "pix_fmt": "yuv420p",
+        "audio_bitrate": qp.get("audio_bitrate", "256k"),
+        "colorspace": "bt709",
+        "color_primaries": "bt709",
+        "color_trc": "bt709",
+        "movflags": "+faststart",
+    }
+    for key, ffkey in [
+        ("profile", "profile:v"),
+        ("level", "level"),
+        ("tune", "tune"),
+        ("maxrate", "maxrate"),
+        ("bufsize", "bufsize"),
+    ]:
+        if key in qp:
+            args[ffkey] = qp[key]  # type: ignore[literal-required]
+    return args
+
+
+def _resolve_encode_args(
+    *,
+    qp: QualityPreset | None = None,
+    encode_args: dict | None = None,
+) -> dict:
+    resolved = dict(encode_args or (_build_encode_args(qp) if qp is not None else {}))
+    if "threads" not in resolved:
+        resolved.update(_ffmpeg_thread_args())
+    return resolved
+
+
+def _resolve_target_fps(qp: QualityPreset, source_path: str | None = None) -> int:
+    """Determine target FPS from quality preset.
+
+    When the preset has no ``fps`` key (low/medium), returns 30.
+    When ``fps`` is ``None`` (high quality), probes the source for its
+    native framerate to preserve temporal quality.
+    """
+    if "fps" not in qp:
+        return 30
+    fps_setting = qp.get("fps")
+    if fps_setting is not None:
+        return max(1, int(fps_setting))
+    # fps=None means "preserve source framerate".
+    if source_path:
+        try:
+            probe = ffmpeg.probe(source_path)
+            v_stream = next(
+                (s for s in probe.get("streams", []) if s.get("codec_type") == "video"),
+                {},
+            )
+            r_frame_rate = str(v_stream.get("r_frame_rate", "30/1"))
+            if "/" in r_frame_rate:
+                num, den = r_frame_rate.split("/", 1)
+                return max(1, round(int(num) / max(1, int(den))))
+            return max(1, round(float(r_frame_rate)))
+        except Exception:
+            pass
+    return 30
+
+
+def _apply_delivery_color_pipeline(stream, source_media_profile: dict | None):
+    if not requires_sdr_tonemap(source_media_profile):
+        return stream
+
+    logger.info("Applying HDR-to-SDR tone mapping for delivery output")
+    return (
+        stream
+        .filter("zscale", transfer="linear", npl=100)
+        .filter("tonemap", tonemap="hable", desat=0)
+        .filter(
+            "zscale",
+            primaries="bt709",
+            transfer="bt709",
+            matrix="bt709",
+            range="tv",
+        )
+        .filter("format", "yuv420p")
+    )
 
 
 def _probe_media_duration(path: str) -> float:
@@ -448,18 +542,8 @@ def extract_segment(
             ffmpeg.input(input_path, ss=safe_start, t=duration)
             .output(
                 output_path,
-                vcodec="libx264",
-                acodec="aac",
-                crf=qp["crf"],
-                preset=qp["preset"],
-                **_ffmpeg_thread_args(),
-                pix_fmt="yuv420p",
+                **_build_encode_args(qp),
                 ar=48000,
-                audio_bitrate="256k",
-                colorspace="bt709",
-                color_primaries="bt709",
-                color_trc="bt709",
-                movflags="+faststart",
             )
             .overwrite_output()
         )
@@ -550,11 +634,7 @@ def create_portrait_background(
             ffmpeg.filter([bg, video], "overlay", vid_x, vid_y)
             .output(
                 output_path,
-                vcodec="libx264",
-                acodec="aac",
-                crf=qp["crf"],
-                preset=qp["preset"],
-                **_ffmpeg_thread_args(),
+                **_build_encode_args(qp),
             )
             .overwrite_output()
             .run(quiet=True)
@@ -578,11 +658,7 @@ def create_portrait_background(
             ffmpeg.filter([bg, video], "overlay", vid_x, vid_y)
             .output(
                 output_path,
-                vcodec="libx264",
-                acodec="aac",
-                crf=qp["crf"],
-                preset=qp["preset"],
-                **_ffmpeg_thread_args(),
+                **_build_encode_args(qp),
                 shortest=None,
             )
             .overwrite_output()
@@ -605,18 +681,15 @@ def create_portrait_background(
         probe = ffmpeg.probe(input_path)
         duration = float(probe["format"]["duration"])
 
-        bg = ffmpeg.input(bg_img_scaled, loop=1, t=duration, framerate=30)
+        target_fps = _resolve_target_fps(qp, input_path)
+        bg = ffmpeg.input(bg_img_scaled, loop=1, t=duration, framerate=target_fps)
         video = _foreground_video_stream()
 
         (
             ffmpeg.filter([bg, video], "overlay", vid_x, vid_y)
             .output(
                 output_path,
-                vcodec="libx264",
-                acodec="aac",
-                crf=qp["crf"],
-                preset=qp["preset"],
-                **_ffmpeg_thread_args(),
+                **_build_encode_args(qp),
                 shortest=None,
             )
             .overwrite_output()
@@ -631,11 +704,7 @@ def create_portrait_background(
         .filter("pad", canvas_w, canvas_h, vid_x, vid_y, _sanitize_color(background_color))
         .output(
             output_path,
-            vcodec="libx264",
-            acodec="aac",
-            crf=qp["crf"],
-            preset=qp["preset"],
-            **_ffmpeg_thread_args(),
+            **_build_encode_args(qp),
         )
         .overwrite_output()
         .run(quiet=True)
@@ -777,17 +846,7 @@ def add_overlays(
                 stream,
                 audio.audio,
                 output_path,
-                vcodec="libx264",
-                acodec="aac",
-                crf=qp["crf"],
-                preset=qp["preset"],
-                **_ffmpeg_thread_args(),
-                pix_fmt="yuv420p",
-                audio_bitrate="256k",
-                colorspace="bt709",
-                color_primaries="bt709",
-                color_trc="bt709",
-                movflags="+faststart",
+                **_build_encode_args(qp),
             )
             .overwrite_output()
         )
@@ -843,6 +902,8 @@ def compose_clip(
     title_letter_spacing: int = 0,
     title_fade_in_ms: int = 300,
     title_bar_opacity: float = 1.0,
+    encode_args: dict | None = None,
+    target_fps: int | None = None,
 ) -> None:
     """Compose background, source video, title/captions, and overlay in one pass.
 
@@ -858,6 +919,8 @@ def compose_clip(
         bool(title_show and title_lines),
         f"{start_time:.2f}-{end_time:.2f}" if start_time is not None else "none",
     )
+    output_args = _resolve_encode_args(qp=qp, encode_args=encode_args)
+    resolved_target_fps = int(target_fps or _resolve_target_fps(qp, input_path))
 
     if start_time is not None and end_time is not None:
         duration_seconds = max(0.1, end_time - start_time)
@@ -918,7 +981,7 @@ def compose_clip(
                 background_image_path,
                 loop=1,
                 t=duration_seconds,
-                framerate=30,
+                framerate=resolved_target_fps,
             )
             .video.filter(
                 "scale", canvas_w, canvas_h,
@@ -1052,17 +1115,7 @@ def compose_clip(
                 stream,
                 audio_stream,
                 output_path,
-                vcodec="libx264",
-                acodec="aac",
-                crf=qp["crf"],
-                preset=qp["preset"],
-                **_ffmpeg_thread_args(),
-                pix_fmt="yuv420p",
-                audio_bitrate="256k",
-                colorspace="bt709",
-                color_primaries="bt709",
-                color_trc="bt709",
-                movflags="+faststart",
+                **output_args,
             )
             .overwrite_output()
         )
@@ -1086,21 +1139,25 @@ def _prepare_intro_outro_segment(
     canvas_h: int,
     output_path: str,
     qp: QualityPreset,
+    *,
+    target_fps: int = 30,
+    encode_args: dict | None = None,
 ) -> str | None:
     """Convert an intro/outro source (image or video) to a normalised clip segment.
 
     Returns the path to the normalised segment on success, ``None`` on failure.
+    *target_fps* should match the main clip framerate so concat segments align.
     """
     media_type = cfg.get("type", "image")
     duration = max(0.5, min(60.0, float(cfg.get("durationSeconds", 3.0))))
     try:
         if media_type == "image":
             video_stream = (
-                ffmpeg.input(file_path, loop=1, t=duration, framerate=30)
+                ffmpeg.input(file_path, loop=1, t=duration, framerate=target_fps)
                 .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="decrease", flags="lanczos")
                 .filter("pad", canvas_w, canvas_h, "(ow-iw)/2", "(oh-ih)/2", color="black")
                 .filter("setsar", "1")
-                .filter("fps", 30)
+                .filter("fps", target_fps)
                 .filter("setpts", "PTS-STARTPTS")
             )
             audio_stream = ffmpeg.input(
@@ -1116,7 +1173,7 @@ def _prepare_intro_outro_segment(
                 .filter("scale", canvas_w, canvas_h, force_original_aspect_ratio="decrease", flags="lanczos")
                 .filter("pad", canvas_w, canvas_h, "(ow-iw)/2", "(oh-ih)/2", color="black")
                 .filter("setsar", "1")
-                .filter("fps", 30)
+                .filter("fps", target_fps)
                 .filter("setpts", "PTS-STARTPTS")
             )
 
@@ -1139,17 +1196,7 @@ def _prepare_intro_outro_segment(
                 video_stream,
                 audio_stream,
                 output_path,
-                vcodec="libx264",
-                acodec="aac",
-                crf=qp["crf"],
-                preset=qp["preset"],
-                **_ffmpeg_thread_args(),
-                pix_fmt="yuv420p",
-                audio_bitrate="256k",
-                colorspace="bt709",
-                color_primaries="bt709",
-                color_trc="bt709",
-                movflags="+faststart",
+                **_resolve_encode_args(qp=qp, encode_args=encode_args),
                 shortest=None,
             )
             .overwrite_output()
@@ -1173,6 +1220,9 @@ def concat_intro_outro(
     outro_cfg: dict | None = None,
     canvas_w: int,
     canvas_h: int,
+    encode_args: dict | None = None,
+    segment_encode_args: dict | None = None,
+    target_fps: int | None = None,
 ) -> list[str]:
     """Prepend intro and/or append outro to main clip using FFmpeg concat filter.
 
@@ -1182,12 +1232,15 @@ def concat_intro_outro(
     segments: list[str] = []
 
     segment_qp = intermediate_quality_preset(qp)
+    resolved_target_fps = int(target_fps or _resolve_target_fps(qp, main_clip_path))
 
     # Prepare intro segment.
     if intro_file_path and intro_cfg and intro_cfg.get("enabled"):
         intro_norm = main_clip_path + ".intro_norm.mp4"
         result = _prepare_intro_outro_segment(
             intro_file_path, intro_cfg, canvas_w, canvas_h, intro_norm, segment_qp,
+            target_fps=resolved_target_fps,
+            encode_args=segment_encode_args,
         )
         if result:
             segments.append(result)
@@ -1200,6 +1253,8 @@ def concat_intro_outro(
         outro_norm = main_clip_path + ".outro_norm.mp4"
         result = _prepare_intro_outro_segment(
             outro_file_path, outro_cfg, canvas_w, canvas_h, outro_norm, segment_qp,
+            target_fps=resolved_target_fps,
+            encode_args=segment_encode_args,
         )
         if result:
             segments.append(result)
@@ -1223,7 +1278,7 @@ def concat_intro_outro(
 
             segment_video = (
                 segment_input.video
-                .filter("fps", 30)
+                .filter("fps", resolved_target_fps)
                 .filter(
                     "scale",
                     canvas_w,
@@ -1261,17 +1316,7 @@ def concat_intro_outro(
                 concat_video,
                 concat_audio,
                 output_path,
-                vcodec="libx264",
-                acodec="aac",
-                crf=qp["crf"],
-                preset=qp["preset"],
-                **_ffmpeg_thread_args(),
-                pix_fmt="yuv420p",
-                audio_bitrate="256k",
-                colorspace="bt709",
-                color_primaries="bt709",
-                color_trc="bt709",
-                movflags="+faststart",
+                **_resolve_encode_args(qp=qp, encode_args=encode_args),
             )
             .overwrite_output()
         )
@@ -1282,6 +1327,48 @@ def concat_intro_outro(
         raise
 
     return intermediates
+
+
+def derive_delivery_from_master(
+    input_path: str,
+    output_path: str,
+    *,
+    encode_args: dict,
+    source_media_profile: dict | None = None,
+    target_fps: int | None = None,
+) -> None:
+    """Derive an SDR/browser delivery asset from a higher-quality master."""
+
+    logger.info("Deriving delivery asset from master %s -> %s", input_path, output_path)
+    source = ffmpeg.input(input_path)
+    stream = _apply_delivery_color_pipeline(source.video, source_media_profile)
+    if target_fps:
+        stream = stream.filter("fps", max(1, int(target_fps)))
+
+    audio_stream = source.audio if _media_has_audio(input_path) else None
+    if audio_stream is None:
+        duration_seconds = max(0.1, _probe_media_duration(input_path))
+        audio_stream = ffmpeg.input(
+            "anullsrc=r=48000:cl=stereo",
+            f="lavfi",
+            t=duration_seconds,
+        ).audio
+    audio_stream = audio_stream.filter("aresample", 48000).filter(
+        "aformat",
+        sample_rates=48000,
+        channel_layouts="stereo",
+    )
+
+    output_stream = (
+        ffmpeg.output(
+            stream,
+            audio_stream,
+            output_path,
+            **_resolve_encode_args(encode_args=encode_args),
+        )
+        .overwrite_output()
+    )
+    _run_ffmpeg_with_timeout(output_stream, capture_stderr=True)
 
 
 def generate_thumbnail(
