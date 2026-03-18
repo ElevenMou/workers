@@ -218,19 +218,19 @@ def _ass_rounded_rect(w: int, h: int, r: int) -> str:
     )
 
 
-def _estimate_text_width(
-    lines: list[str],
+def _estimate_line_width(
+    text: str,
     font_size: int,
     font_family: str,
     letter_spacing: int,
     stroke_width: int,
 ) -> int:
-    """Return pixel-width estimate of the widest title line."""
+    """Return pixel-width estimate for a single line of text."""
     key = (font_family or "").strip().lower()
     ratio = CHAR_WIDTH_RATIOS.get(key, CHAR_WIDTH_RATIO)
-    max_len = max((len(ln) for ln in lines), default=0)
+    n = len(text)
     char_w = font_size * ratio
-    text_w = max_len * char_w + max(0, max_len - 1) * max(0, letter_spacing)
+    text_w = n * char_w + max(0, n - 1) * max(0, letter_spacing)
     text_w += 2 * max(0, stroke_width)
     return int(text_w)
 
@@ -336,42 +336,39 @@ def _build_title_ass(
     start = _ass_time(0.0)
     end = _ass_time(max(0.1, duration_seconds))
 
-    # ── Rounded-rect background bar (layer 0, behind text) ─────────
-    if title_bar_enabled:
-        text_w = _estimate_text_width(
-            title_lines, title_font_size, title_font_family,
-            spacing, max(0, int(title_stroke_width)),
-        )
-        box_pad_h = TITLE_BAR_H_PAD
-        box_w = int(text_w + 2 * box_pad_h)
-        single_line_h = title_font_size + 2 * TITLE_BAR_V_PAD
-        box_h = single_line_h + (num_lines - 1) * line_height
-        box_w = max(box_w, box_h)  # never narrower than tall
+    # ── Per-line rounded-rect backgrounds (layer 0) + text (layer 1) ──
+    box_h = title_font_size + 2 * TITLE_BAR_V_PAD
+    stroke_w = max(0, int(title_stroke_width))
 
-        # Clamp to canvas bounds.
-        box_w = min(box_w, area_w)
-        box_h = min(box_h, canvas_h)
-
-        # Position the box centered on the text block.
-        if title_align == "center":
-            box_x = x - box_w // 2
-        else:
-            box_x = area_x + max(0, int(title_padding_x)) - box_pad_h
-        box_y = title_text_y - box_h // 2
-        box_x = max(0, min(box_x, canvas_w - box_w))
-        box_y = max(0, min(box_y, canvas_h - box_h))
-
-        radius = min(TITLE_BAR_BORDER_RADIUS, box_w // 2, box_h // 2)
-        drawing = _ass_rounded_rect(box_w, box_h, radius)
-
-        bar_tag = rf"{{\an7{fade_tag}\pos({box_x},{box_y})\1a{bar_alpha}\bord0\shad0\p1}}"
-        lines.append(f"Dialogue: 0,{start},{end},TitleBg,,0,0,0,,{bar_tag}{drawing}")
-
-    # ── Text lines (layer 1, above the bar) ────────────────────────
-    for idx, line in enumerate(title_lines):
+    for idx, line_text in enumerate(title_lines):
         y = max(0, int(first_line_y + idx * line_height))
+
+        # Background box for this line (each line gets its own box width).
+        if title_bar_enabled:
+            line_w = _estimate_line_width(
+                line_text, title_font_size, title_font_family, spacing, stroke_w,
+            )
+            box_w = int(line_w + 2 * TITLE_BAR_H_PAD)
+            box_w = max(box_w, box_h)  # never narrower than tall
+            box_w = min(box_w, area_w)
+
+            if title_align == "center":
+                box_x = x - box_w // 2
+            else:
+                box_x = area_x + max(0, int(title_padding_x)) - TITLE_BAR_H_PAD
+            box_y = y - box_h // 2
+            box_x = max(0, min(box_x, canvas_w - box_w))
+            box_y = max(0, min(box_y, canvas_h - box_h))
+
+            radius = min(TITLE_BAR_BORDER_RADIUS, box_w // 2, box_h // 2)
+            drawing = _ass_rounded_rect(box_w, box_h, radius)
+
+            bar_tag = rf"{{\an7{fade_tag}\pos({box_x},{box_y})\1a{bar_alpha}\bord0\shad0\p1}}"
+            lines.append(f"Dialogue: 0,{start},{end},TitleBg,,0,0,0,,{bar_tag}{drawing}")
+
+        # Text line.
         tag = rf"{{{align_tag}{fade_tag}\pos({x},{y})}}"
-        lines.append(f"Dialogue: 1,{start},{end},Title,,0,0,0,,{tag}{_ass_escape(line)}")
+        lines.append(f"Dialogue: 1,{start},{end},Title,,0,0,0,,{tag}{_ass_escape(line_text)}")
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
