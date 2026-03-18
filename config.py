@@ -1,6 +1,7 @@
 import os
 import logging
 from math import ceil
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -351,9 +352,24 @@ SOCIAL_ACCOUNT_ENCRYPTION_KEY = os.getenv("SOCIAL_ACCOUNT_ENCRYPTION_KEY")
 # ---------------------------------------------------------------------------
 _REQUIRED_ENV = ["SUPABASE_URL", "SUPABASE_SERVICE_KEY"]
 _ANALYZER_API_KEYS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+_LOCAL_CORS_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 
-def validate_env(extra: list[str] | None = None):
+def _parse_cors_allowed_origins(raw_value: str | None) -> list[str]:
+    return [origin.strip() for origin in (raw_value or "").split(",") if origin.strip()]
+
+
+def _cors_origin_is_local(origin: str) -> bool:
+    parsed = urlparse(origin)
+    hostname = (parsed.hostname or "").strip().lower()
+    return hostname in _LOCAL_CORS_HOSTS or hostname.endswith(".localhost")
+
+
+def validate_env(
+    extra: list[str] | None = None,
+    *,
+    require_browser_cors: bool = False,
+):
     """Check that critical env vars are set.  Call at process startup."""
     required = list(_REQUIRED_ENV) + (extra or [])
     missing = [v for v in required if not os.getenv(v)]
@@ -371,4 +387,31 @@ def validate_env(extra: list[str] | None = None):
         missing.append("WORKER_INTERNAL_API_TOKEN")
     if missing:
         logger.error("Missing required environment variables: %s", ", ".join(missing))
+        raise SystemExit(1)
+
+    if not require_browser_cors:
+        return
+
+    current_environment = (os.getenv("ENVIRONMENT", ENVIRONMENT) or ENVIRONMENT).strip().lower()
+    if current_environment not in {"production", "prod"}:
+        return
+
+    cors_allowed_origins = _parse_cors_allowed_origins(os.getenv("CORS_ALLOWED_ORIGINS"))
+    cors_origin_regex = (os.getenv("CORS_ALLOWED_ORIGIN_REGEX") or "").strip()
+    if not cors_allowed_origins and not cors_origin_regex:
+        logger.error(
+            "Production CORS configuration is missing. Set CORS_ALLOWED_ORIGINS "
+            "and/or CORS_ALLOWED_ORIGIN_REGEX to your frontend origins."
+        )
+        raise SystemExit(1)
+
+    if (
+        cors_allowed_origins
+        and all(_cors_origin_is_local(origin) for origin in cors_allowed_origins)
+        and not cors_origin_regex
+    ):
+        logger.error(
+            "Production CORS configuration only allows local origins: %s",
+            ", ".join(cors_allowed_origins),
+        )
         raise SystemExit(1)

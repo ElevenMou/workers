@@ -132,7 +132,7 @@ app.add_middleware(
 app.add_middleware(RequestSizeLimitMiddleware)
 app.add_middleware(RequestTimeoutMiddleware)
 app.add_middleware(CorrelationIdMiddleware)
-validate_env()
+validate_env(require_browser_cors=True)
 initialize_minio_storage()
 
 app.include_router(health_router)

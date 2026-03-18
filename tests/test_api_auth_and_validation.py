@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import logging
 from dataclasses import dataclass
 
@@ -8,6 +9,8 @@ import api_app.routers.clips as clips_router
 import api_app.routers.videos as videos_router
 from api_app.auth import AuthenticatedUser, get_current_user
 from services.video_downloader import VideoProbeError
+
+app_module = importlib.import_module("api_app.app")
 
 
 @dataclass
@@ -1931,13 +1934,17 @@ def test_generate_clip_sets_three_credits_for_pro_smart_cleanup(client, monkeypa
 
 
 def test_credit_cost_endpoint_allows_cors_preflight(client):
+    configured_origins = list(app_module.cors_allowed_origins)
+    assert configured_origins, "Expected at least one configured CORS origin for preflight tests."
+    allowed_origin = configured_origins[0]
+
     response = client.options(
         "/credits/cost",
         headers={
-            "Origin": "http://localhost:3000",
+            "Origin": allowed_origin,
             "Access-Control-Request-Method": "POST",
             "Access-Control-Request-Headers": "authorization,content-type",
         },
     )
     assert response.status_code == 200
-    assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
+    assert response.headers["access-control-allow-origin"] == allowed_origin

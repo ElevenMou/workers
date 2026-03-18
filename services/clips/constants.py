@@ -36,8 +36,10 @@ VIDEO_SCALE_MODE_ALIASES = {
 }
 
 TITLE_BAR_V_PAD = 10
+TITLE_BAR_H_PAD = 20
 TITLE_GAP = 12
 TITLE_LINE_HEIGHT_RATIO = 0.75
+TITLE_BAR_BORDER_RADIUS = 12
 
 # Minimum horizontal safe margin (pixels at 1080px canvas width, ~3.7%).
 # Ensures text never touches the canvas edge regardless of user paddingX.

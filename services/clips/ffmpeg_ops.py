@@ -9,6 +9,11 @@ import ffmpeg
 
 from config import FFMPEG_THREADS
 from services.clips.constants import (
+    CHAR_WIDTH_RATIO,
+    CHAR_WIDTH_RATIOS,
+    TITLE_BAR_BORDER_RADIUS,
+    TITLE_BAR_H_PAD,
+    TITLE_BAR_V_PAD,
     TITLE_LINE_HEIGHT_RATIO,
     intermediate_quality_preset,
     normalize_video_scale_mode,
@@ -190,6 +195,46 @@ def _hex_to_ass_color(value: str, fallback: str) -> str:
     return fallback
 
 
+def _ass_rounded_rect(w: int, h: int, r: int) -> str:
+    """Return ASS ``\\p1`` drawing commands for a rounded rectangle.
+
+    The origin is top-left (pair with ``\\an7``).  Coordinates are integer
+    pixels (``\\p1`` scale).  Uses the kappa constant (0.5523) for smooth
+    cubic-bézier quarter-circle arcs at each corner.
+    """
+    r = max(0, min(r, w // 2, h // 2))
+    if r <= 0:
+        return f"m 0 0 l {w} 0 {w} {h} 0 {h}"
+    k = 0.5523
+    rk = int(round(r * k))
+    wr = w - r
+    hr = h - r
+    return (
+        f"m {r} 0 "
+        f"l {wr} 0 b {wr + rk} 0 {w} {r - rk} {w} {r} "
+        f"l {w} {hr} b {w} {hr + rk} {wr + rk} {h} {wr} {h} "
+        f"l {r} {h} b {r - rk} {h} 0 {hr + rk} 0 {hr} "
+        f"l 0 {r} b 0 {r - rk} {r - rk} 0 {r} 0"
+    )
+
+
+def _estimate_text_width(
+    lines: list[str],
+    font_size: int,
+    font_family: str,
+    letter_spacing: int,
+    stroke_width: int,
+) -> int:
+    """Return pixel-width estimate of the widest title line."""
+    key = (font_family or "").strip().lower()
+    ratio = CHAR_WIDTH_RATIOS.get(key, CHAR_WIDTH_RATIO)
+    max_len = max((len(ln) for ln in lines), default=0)
+    char_w = font_size * ratio
+    text_w = max_len * char_w + max(0, max_len - 1) * max(0, letter_spacing)
+    text_w += 2 * max(0, stroke_width)
+    return int(text_w)
+
+
 def _build_title_ass(
     *,
     title_lines: list[str],
@@ -210,6 +255,10 @@ def _build_title_ass(
     title_shadow_size: int = 2,
     title_letter_spacing: int = 0,
     title_fade_in_ms: int = 300,
+    # Bar rendering (moved from drawbox into ASS for rounded corners).
+    title_bar_enabled: bool = False,
+    title_bar_color: str = "#000000",
+    title_bar_opacity: float = 1.0,
 ) -> str | None:
     if not title_lines:
         return None
@@ -244,13 +293,8 @@ def _build_title_ass(
     if title_fade_in_ms > 0:
         fade_tag = rf"\fad({max(1, int(title_fade_in_ms))},0)"
 
-    lines: list[str] = [
-        "[Script Info]",
-        "ScriptType: v4.00+",
-        "ScaledBorderAndShadow: yes",
-        f"PlayResX: {canvas_w}",
-        f"PlayResY: {canvas_h}",
-        "",
+    # ── Styles ──────────────────────────────────────────────────────────
+    styles: list[str] = [
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
@@ -262,6 +306,28 @@ def _build_title_ass(
             f"{outline},{back_color},{bold_flag},0,0,0,100,100,{spacing},0,1,"
             f"{max(0, int(title_stroke_width))},{shadow},5,0,0,0,1"
         ),
+    ]
+
+    # A transparent drawing style used for the rounded-rect background bar.
+    if title_bar_enabled:
+        bar_ass_color = _hex_to_ass_color(title_bar_color, "&H00000000")
+        # ASS alpha: 00 = fully opaque, FF = fully transparent.
+        alpha_int = max(0, min(255, int(round((1.0 - max(0.0, min(1.0, title_bar_opacity))) * 255))))
+        bar_alpha = f"&H{alpha_int:02X}&"
+        styles.append(
+            "Style: TitleBg,"
+            f"Arial,20,{bar_ass_color},&H00FFFFFF,&H00000000,&H00000000,"
+            "0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1"
+        )
+
+    lines: list[str] = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "ScaledBorderAndShadow: yes",
+        f"PlayResX: {canvas_w}",
+        f"PlayResY: {canvas_h}",
+        "",
+        *styles,
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -269,10 +335,43 @@ def _build_title_ass(
 
     start = _ass_time(0.0)
     end = _ass_time(max(0.1, duration_seconds))
+
+    # ── Rounded-rect background bar (layer 0, behind text) ─────────
+    if title_bar_enabled:
+        text_w = _estimate_text_width(
+            title_lines, title_font_size, title_font_family,
+            spacing, max(0, int(title_stroke_width)),
+        )
+        box_pad_h = TITLE_BAR_H_PAD
+        box_w = int(text_w + 2 * box_pad_h)
+        single_line_h = title_font_size + 2 * TITLE_BAR_V_PAD
+        box_h = single_line_h + (num_lines - 1) * line_height
+        box_w = max(box_w, box_h)  # never narrower than tall
+
+        # Clamp to canvas bounds.
+        box_w = min(box_w, area_w)
+        box_h = min(box_h, canvas_h)
+
+        # Position the box centered on the text block.
+        if title_align == "center":
+            box_x = x - box_w // 2
+        else:
+            box_x = area_x + max(0, int(title_padding_x)) - box_pad_h
+        box_y = title_text_y - box_h // 2
+        box_x = max(0, min(box_x, canvas_w - box_w))
+        box_y = max(0, min(box_y, canvas_h - box_h))
+
+        radius = min(TITLE_BAR_BORDER_RADIUS, box_w // 2, box_h // 2)
+        drawing = _ass_rounded_rect(box_w, box_h, radius)
+
+        bar_tag = rf"{{\an7{fade_tag}\pos({box_x},{box_y})\1a{bar_alpha}\bord0\shad0\p1}}"
+        lines.append(f"Dialogue: 0,{start},{end},TitleBg,,0,0,0,,{bar_tag}{drawing}")
+
+    # ── Text lines (layer 1, above the bar) ────────────────────────
     for idx, line in enumerate(title_lines):
         y = max(0, int(first_line_y + idx * line_height))
         tag = rf"{{{align_tag}{fade_tag}\pos({x},{y})}}"
-        lines.append(f"Dialogue: 0,{start},{end},Title,,0,0,0,,{tag}{_ass_escape(line)}")
+        lines.append(f"Dialogue: 1,{start},{end},Title,,0,0,0,,{tag}{_ass_escape(line)}")
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -585,20 +684,6 @@ def add_overlays(
     stream = video
     temp_files: list[str] = []
     if title_show and title_lines:
-        if title_bar_enabled:
-            clamped_opacity = max(0.0, min(1.0, float(title_bar_opacity)))
-            if clamped_opacity < 1.0:
-                bar_color_str = f"{_sanitize_color(title_bar_color)}@{clamped_opacity:.2f}"
-            else:
-                bar_color_str = _sanitize_color(title_bar_color)
-            stream = stream.drawbox(
-                x=max(0, int(title_bar_x)),
-                y=title_bar_y,
-                width=max(2, int(title_bar_w)),
-                height=title_bar_h,
-                color=bar_color_str,
-                t="fill",
-            )
         try:
             probe = ffmpeg.probe(video_path)
             duration_seconds = float(probe["format"]["duration"])
@@ -627,6 +712,9 @@ def add_overlays(
                 title_shadow_size=title_shadow_size,
                 title_letter_spacing=title_letter_spacing,
                 title_fade_in_ms=title_fade_in_ms,
+                title_bar_enabled=title_bar_enabled,
+                title_bar_color=title_bar_color,
+                title_bar_opacity=title_bar_opacity,
             )
             if title_ass_path:
                 temp_files.append(title_ass_path)
@@ -845,21 +933,6 @@ def compose_clip(
 
     temp_files: list[str] = []
     if title_show and title_lines:
-        if title_bar_enabled:
-            # Support semi-transparent title bars via ``color@opacity`` syntax.
-            clamped_opacity = max(0.0, min(1.0, float(title_bar_opacity)))
-            if clamped_opacity < 1.0:
-                bar_color_str = f"{_sanitize_color(title_bar_color)}@{clamped_opacity:.2f}"
-            else:
-                bar_color_str = _sanitize_color(title_bar_color)
-            stream = stream.drawbox(
-                x=max(0, int(title_bar_x)),
-                y=title_bar_y,
-                width=max(2, int(title_bar_w)),
-                height=title_bar_h,
-                color=bar_color_str,
-                t="fill",
-            )
         try:
             title_ass_path = _build_title_ass(
                 title_lines=title_lines,
@@ -880,6 +953,9 @@ def compose_clip(
                 title_shadow_size=title_shadow_size,
                 title_letter_spacing=title_letter_spacing,
                 title_fade_in_ms=title_fade_in_ms,
+                title_bar_enabled=title_bar_enabled,
+                title_bar_color=title_bar_color,
+                title_bar_opacity=title_bar_opacity,
             )
             if title_ass_path:
                 temp_files.append(title_ass_path)

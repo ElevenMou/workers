@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="/opt/clipscut/workers"
-DEFAULT_ENV_FILE=".env"
+DEFAULT_ENV_FILE=".env.production"
 
 cd "$PROJECT_DIR"
 
@@ -24,15 +24,17 @@ fi
 
 ENV_FILE="${ENV_FILE:-$DEFAULT_ENV_FILE}"
 if [ ! -f "$ENV_FILE" ]; then
-  if [ -f ".env.production" ]; then
-    ENV_FILE=".env.production"
+  if [ "$ENV_FILE" = ".env.production" ] && [ -f ".env" ]; then
+    ENV_FILE=".env"
   else
-    echo "Missing env file. Expected $PROJECT_DIR/.env or $PROJECT_DIR/.env.production" >&2
+    echo "Missing env file. Expected $PROJECT_DIR/.env.production or $PROJECT_DIR/.env" >&2
     exit 1
   fi
 fi
 
 COMPOSE_ARGS=(--env-file "$ENV_FILE")
+
+echo "Using env file: $ENV_FILE"
 
 git fetch origin
 git pull --ff-only origin "$BRANCH"

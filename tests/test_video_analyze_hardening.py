@@ -1522,4 +1522,37 @@ def test_validate_env_requires_analyzer_api_key(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
     with pytest.raises(SystemExit):
-        config_module.validate_env()
+        config_module.validate_env(require_browser_cors=True)
+
+
+def test_validate_env_rejects_localhost_only_cors_in_production(monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("MINIO_ENDPOINT", "minio:9000")
+    monkeypatch.setenv("MINIO_ACCESS_KEY", "minio-access")
+    monkeypatch.setenv("MINIO_SECRET_KEY", "minio-secret")
+    monkeypatch.setenv("MINIO_PUBLIC_ENDPOINT", "https://storage.example.com")
+    monkeypatch.setenv("WORKER_INTERNAL_API_TOKEN", "internal-token")
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+    monkeypatch.delenv("CORS_ALLOWED_ORIGIN_REGEX", raising=False)
+
+    with pytest.raises(SystemExit):
+        config_module.validate_env(require_browser_cors=True)
+
+
+def test_validate_env_accepts_public_cors_origin_in_production(monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("MINIO_ENDPOINT", "minio:9000")
+    monkeypatch.setenv("MINIO_ACCESS_KEY", "minio-access")
+    monkeypatch.setenv("MINIO_SECRET_KEY", "minio-secret")
+    monkeypatch.setenv("MINIO_PUBLIC_ENDPOINT", "https://storage.example.com")
+    monkeypatch.setenv("WORKER_INTERNAL_API_TOKEN", "internal-token")
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://www.clipscut.pro")
+    monkeypatch.delenv("CORS_ALLOWED_ORIGIN_REGEX", raising=False)
+
+    config_module.validate_env(require_browser_cors=True)
