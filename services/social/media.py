@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
-from services.clips.ffmpeg_ops import derive_delivery_from_master
-from services.clips.render_profiles import build_delivery_encode_args
-from services.media_profiles import clamped_source_fps, probe_media_profile
 from services.social.base import PublicationMedia, SocialProviderError
 from utils.media_storage import (
+    GENERATED_CLIPS_BUCKET,
     GeneratedClipStorageError,
     create_signed_clip_url as create_minio_signed_clip_url,
     resolve_generated_clip_path,
@@ -34,6 +34,89 @@ def create_signed_clip_url(storage_path: str, *, expires_in_seconds: int = 3600)
         clip_id=clip_id,
         expires_in_seconds=expires_in_seconds,
     )
+
+
+def _generated_clip_object_name(storage_path: str) -> str | None:
+    raw_value = str(storage_path or "").strip().replace("\\", "/")
+    if not raw_value:
+        return None
+    normalized = raw_value.lstrip("/")
+    bucket_prefix = f"{GENERATED_CLIPS_BUCKET}/"
+    if normalized.startswith(bucket_prefix):
+        normalized = normalized[len(bucket_prefix) :]
+    return normalized or None
+
+
+def _generated_clip_storage_location(storage_path: str) -> str:
+    object_name = _generated_clip_object_name(storage_path)
+    if object_name:
+        return f"{GENERATED_CLIPS_BUCKET}/{object_name}"
+    return str(storage_path or "").strip()
+
+
+def _clip_storage_unavailable_error(
+    storage_path: str,
+    *,
+    reason: str,
+    local_path: str | None = None,
+    exc: Exception | None = None,
+) -> SocialProviderError:
+    object_name = _generated_clip_object_name(storage_path)
+    provider_payload = {
+        "storage_path": str(storage_path or "").strip(),
+        "storage_bucket": GENERATED_CLIPS_BUCKET,
+        "storage_object": object_name,
+        "storage_reason": reason,
+    }
+    if local_path:
+        provider_payload["local_path"] = local_path
+    if exc is not None:
+        provider_payload["storage_error"] = str(exc)
+    return SocialProviderError(
+        f"The clip storage service could not load {_generated_clip_storage_location(storage_path)}. Please retry publishing shortly.",
+        code="clip_storage_unavailable",
+        recoverable=True,
+        provider_payload=provider_payload,
+    )
+
+
+def _publication_local_media_path(storage_path: str, *, work_dir: str) -> str:
+    normalized = str(storage_path or "").strip().replace("\\", "/")
+    suffix = Path(normalized).suffix.lower().strip() or ".mp4"
+    stem = Path(normalized).stem.strip() or "clip"
+    safe_stem = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in stem)
+    safe_stem = safe_stem.strip("-_") or "clip"
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(work_dir, f"{safe_stem}-{digest}{suffix}")
+
+
+def _materialize_publication_local_copy(
+    *,
+    shared_path: str,
+    storage_path: str,
+    work_dir: str,
+) -> str:
+    local_path = _publication_local_media_path(storage_path, work_dir=work_dir)
+    Path(work_dir).mkdir(parents=True, exist_ok=True)
+    if os.path.abspath(shared_path) == os.path.abspath(local_path):
+        return local_path
+
+    try:
+        if os.path.exists(local_path):
+            os.remove(local_path)
+        try:
+            os.link(shared_path, local_path)
+        except OSError:
+            shutil.copyfile(shared_path, local_path)
+    except (FileNotFoundError, OSError) as exc:
+        raise _clip_storage_unavailable_error(
+            storage_path,
+            reason="publication_local_copy_failed",
+            local_path=local_path,
+            exc=exc,
+        ) from exc
+
+    return local_path
 
 
 def download_clip_to_path(storage_path: str, *, work_dir: str) -> str:
@@ -64,7 +147,11 @@ def download_clip_to_path(storage_path: str, *, work_dir: str) -> str:
         ) from exc
 
     if resolved_path:
-        return resolved_path
+        return _materialize_publication_local_copy(
+            shared_path=resolved_path,
+            storage_path=storage_path,
+            work_dir=work_dir,
+        )
 
     raise SocialProviderError(
         f"The clip asset is missing from storage ({storage_path}). Regenerate the clip before publishing.",
@@ -116,61 +203,32 @@ def probe_media(local_path: str) -> tuple[int | None, int | None, float | None]:
     return width, height, duration
 
 
-def _build_publish_derivative_from_master(
-    *,
-    master_storage_path: str,
-    publish_profile: str,
-    delivery_profile: str | None,
-    work_dir: str,
-) -> str:
-    master_local_path = download_clip_to_path(master_storage_path, work_dir=work_dir)
-    source_profile = probe_media_profile(master_local_path)
-    encode_args = build_delivery_encode_args(
-        delivery_profile=delivery_profile or "social_auto_h264",
-        source_profile=source_profile,
-        profile_name=publish_profile,
-    )
-    target_fps = max(
-        1,
-        int(round(clamped_source_fps(source_profile, fallback=30.0, max_fps=60.0))),
-    )
-    output_path = os.path.join(work_dir, f"publish-{publish_profile}.mp4")
-    derive_delivery_from_master(
-        master_local_path,
-        output_path,
-        encode_args=encode_args,
-        source_media_profile=source_profile,
-        target_fps=target_fps,
-    )
-    return output_path
-
 
 def load_publication_media(
     storage_path: str,
     *,
     work_dir: str,
-    master_storage_path: str | None = None,
-    publish_profile: str | None = None,
-    delivery_profile: str | None = None,
 ) -> PublicationMedia:
-    local_path = ""
-    if master_storage_path and publish_profile:
-        try:
-            local_path = _build_publish_derivative_from_master(
-                master_storage_path=master_storage_path,
-                publish_profile=publish_profile,
-                delivery_profile=delivery_profile,
-                work_dir=work_dir,
-            )
-        except Exception:
-            local_path = ""
-    if not local_path:
-        local_path = download_clip_to_path(storage_path, work_dir=work_dir)
-    width, height, duration = probe_media(local_path)
+    local_path = download_clip_to_path(storage_path, work_dir=work_dir)
+    try:
+        width, height, duration = probe_media(local_path)
+        file_size = os.path.getsize(local_path)
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        FileNotFoundError,
+        OSError,
+    ) as exc:
+        raise _clip_storage_unavailable_error(
+            storage_path,
+            reason="probe_failed",
+            local_path=local_path,
+            exc=exc,
+        ) from exc
     content_type = mimetypes.guess_type(local_path)[0] or "video/mp4"
     return PublicationMedia(
         local_path=local_path,
-        file_size=os.path.getsize(local_path),
+        file_size=file_size,
         content_type=content_type,
         signed_url=create_signed_clip_url(storage_path),
         width=width,

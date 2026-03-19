@@ -1,11 +1,36 @@
 from __future__ import annotations
 
+import os
+import threading
 from urllib.parse import parse_qs, urlparse
 
 import api_app.routers.media as media_router
 import utils.media_storage as media_storage
 import utils.minio_client as minio_client
 import pytest
+
+
+class _FakeRedis:
+    def __init__(self):
+        self._values: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def set(self, key: str, value: str, nx: bool = False, ex: int | None = None) -> bool:
+        del ex
+        with self._lock:
+            if nx and key in self._values:
+                return False
+            self._values[key] = value
+            return True
+
+    def get(self, key: str):
+        with self._lock:
+            return self._values.get(key)
+
+    def delete(self, key: str):
+        with self._lock:
+            self._values.pop(key, None)
+        return 1
 
 
 def test_preferred_source_video_order_is_minio_first():
@@ -104,6 +129,98 @@ def test_resolve_generated_clip_path_raises_missing_object_error(tmp_path, monke
     assert exc.value.reason == "missing_object"
     assert exc.value.object_name == "clips/remote.mp4"
     assert exc.value.recoverable is False
+
+
+def test_resolve_generated_clip_path_deduplicates_concurrent_materialization(tmp_path, monkeypatch):
+    monkeypatch.setattr(media_storage, "LOCAL_MEDIA_ROOT", str(tmp_path / "media"))
+    fake_redis = _FakeRedis()
+    monkeypatch.setattr(media_storage, "get_redis_connection", lambda: fake_redis)
+    monkeypatch.setattr(media_storage, "SOURCE_VIDEO_LOCK_WAIT_SECONDS", 5)
+    monkeypatch.setattr(media_storage, "_WAIT_POLL_INTERVAL_SECONDS", 0.01)
+
+    download_started = threading.Event()
+    release_download = threading.Event()
+    download_calls: list[tuple[str, str, str, str | None]] = []
+
+    class _FakeMinioClient:
+        def fget_object(self, bucket, object_name, file_path, *, tmp_file_path=None):
+            download_calls.append((bucket, object_name, file_path, tmp_file_path))
+            assert tmp_file_path is not None
+            with open(tmp_file_path, "wb") as handle:
+                handle.write(b"remote-bytes")
+            download_started.set()
+            assert release_download.wait(timeout=1)
+            os.replace(tmp_file_path, file_path)
+
+    monkeypatch.setattr(
+        minio_client,
+        "get_minio_client",
+        lambda: _FakeMinioClient(),
+    )
+
+    results: dict[str, str] = {}
+    errors: list[Exception] = []
+    barrier = threading.Barrier(2)
+
+    def _run(worker_name: str):
+        try:
+            barrier.wait(timeout=2)
+            results[worker_name] = media_storage.resolve_generated_clip_path(
+                "clips/remote.mp4",
+                raise_on_error=True,
+            )
+        except Exception as exc:  # pragma: no cover - assertion path
+            errors.append(exc)
+
+    first = threading.Thread(target=_run, args=("worker-a",), daemon=True)
+    second = threading.Thread(target=_run, args=("worker-b",), daemon=True)
+    first.start()
+    second.start()
+    assert download_started.wait(timeout=1)
+    release_download.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not errors
+    assert len(download_calls) == 1
+    assert len(results) == 2
+    resolved_paths = set(results.values())
+    assert len(resolved_paths) == 1
+    resolved_path = next(iter(resolved_paths))
+    assert resolved_path == media_storage.resolve_generated_clip_local_path("clips/remote.mp4")
+    assert download_calls[0][3] != resolved_path
+    with open(resolved_path, "rb") as handle:
+        assert handle.read() == b"remote-bytes"
+
+
+def test_resolve_generated_clip_path_reuses_materialized_file_after_download_exception(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(media_storage, "LOCAL_MEDIA_ROOT", str(tmp_path / "media"))
+    monkeypatch.setattr(media_storage, "get_redis_connection", lambda: None)
+
+    class _LateFailureClient:
+        def fget_object(self, _bucket, _object_name, file_path, *, tmp_file_path=None):
+            with open(tmp_file_path, "wb") as handle:
+                handle.write(b"remote-bytes")
+            os.replace(tmp_file_path, file_path)
+            raise RuntimeError("late failure after materialization")
+
+    monkeypatch.setattr(
+        minio_client,
+        "get_minio_client",
+        lambda: _LateFailureClient(),
+    )
+
+    resolved_path = media_storage.resolve_generated_clip_path(
+        "clips/remote.mp4",
+        raise_on_error=True,
+    )
+
+    assert resolved_path == media_storage.resolve_generated_clip_local_path("clips/remote.mp4")
+    with open(resolved_path, "rb") as handle:
+        assert handle.read() == b"remote-bytes"
 
 
 def test_stream_clip_media_supports_range_requests(client, tmp_path, monkeypatch):

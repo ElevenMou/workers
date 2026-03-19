@@ -136,7 +136,7 @@ class ClipGenerator:
             base_title_width = max(2, min(canvas_w, custom_title_width))
         else:
             base_title_width = canvas_w
-        horizontal_padding = max(TITLE_SAFE_MARGIN_X, int(title_padding_x))
+        horizontal_padding = TITLE_SAFE_MARGIN_X
         max_text_w = max(120, base_title_width - (2 * horizontal_padding))
         title_lines = wrap_title(title, title_font_size, max_text_w, title_font_family)
 

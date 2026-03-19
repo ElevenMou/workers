@@ -17,6 +17,7 @@ from services.clips.constants import (
     TITLE_BAR_H_PAD,
     TITLE_BAR_V_PAD,
     TITLE_LINE_HEIGHT_RATIO,
+    TITLE_SAFE_MARGIN_X,
     intermediate_quality_preset,
     normalize_video_scale_mode,
 )
@@ -382,7 +383,7 @@ def _build_title_ass(
 
     area_x = max(0, int(title_area_x))
     area_w = max(2, min(canvas_w - area_x, int(title_area_w)))
-    x = area_x + (area_w // 2) if title_align == "center" else area_x + max(0, int(title_padding_x))
+    x = area_x + (area_w // 2) if title_align == "center" else area_x + TITLE_SAFE_MARGIN_X
 
     # title_text_y is the vertical center of the title bar.
     # Distribute lines evenly around that center.
@@ -457,7 +458,7 @@ def _build_title_ass(
             if title_align == "center":
                 box_x = x - box_w // 2
             else:
-                box_x = area_x + max(0, int(title_padding_x)) - TITLE_BAR_H_PAD
+                box_x = area_x + TITLE_SAFE_MARGIN_X - TITLE_BAR_H_PAD
             box_y = y - box_h // 2
             box_x = max(0, min(box_x, canvas_w - box_w))
             box_y = max(0, min(box_y, canvas_h - box_h))

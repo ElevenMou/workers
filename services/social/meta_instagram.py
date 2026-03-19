@@ -16,7 +16,7 @@ from services.social.base import (
     SocialProviderError,
 )
 
-_META_API_VERSION = (os.getenv("META_GRAPH_API_VERSION") or "v23.0").strip() or "v23.0"
+_META_API_VERSION = (os.getenv("META_GRAPH_API_VERSION") or "v25.0").strip() or "v25.0"
 _GRAPH_BASE = f"https://graph.facebook.com/{_META_API_VERSION}"
 
 
@@ -119,10 +119,11 @@ def _upload_reel_bytes(
                     "Authorization": f"OAuth {access_token}",
                     "offset": "0",
                     "file_size": str(media.file_size),
+                    "Content-Length": str(media.file_size),
                     "Content-Type": "application/octet-stream",
                 },
-                content=handle.read(),
-                timeout=300.0,
+                content=handle,
+                timeout=600.0,
             )
     except OSError as exc:
         raise SocialProviderError(

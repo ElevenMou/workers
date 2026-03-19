@@ -88,11 +88,12 @@ def build_delivery_encode_args(
     bufsize = "40M" if fps_is_high else "32M"
     level = "4.2" if fps_is_high else "4.1"
     crf = 14 if "youtube" in str(profile_name or delivery_profile).lower() else 15
+    preset = "slow"
     return {
         "vcodec": "libx264",
         "acodec": "aac",
         "crf": crf,
-        "preset": "slow",
+        "preset": preset,
         "profile:v": "high",
         "level": level,
         "tune": "film",

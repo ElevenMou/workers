@@ -9,6 +9,7 @@ import posixpath
 import shutil
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -17,13 +18,17 @@ from config import (
     MINIO_CLIPS_BUCKET,
     MINIO_RAW_VIDEOS_BUCKET,
     RAW_VIDEO_CACHE_DIR,
+    SOURCE_VIDEO_LOCK_TTL_SECONDS,
+    SOURCE_VIDEO_LOCK_WAIT_SECONDS,
     WORKER_MEDIA_SIGNING_SECRET,
     WORKER_PUBLIC_BASE_URL,
 )
+from utils.redis_client import get_redis_connection
 
 GENERATED_CLIPS_BUCKET = MINIO_CLIPS_BUCKET
 RAW_VIDEOS_BUCKET = MINIO_RAW_VIDEOS_BUCKET
 _LOCAL_CLIP_CONTENT_TYPE = "video/mp4"
+_WAIT_POLL_INTERVAL_SECONDS = 0.1
 _MISSING_MINIO_OBJECT_CODES = {
     "NoSuchBucket",
     "NoSuchKey",
@@ -214,6 +219,63 @@ def _minio_exception_code(exc: Exception) -> str:
     return str(code or "").strip()
 
 
+def _decode_redis_value(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def _release_lock_if_owned(*, conn, key: str, token: str) -> None:
+    try:
+        current = conn.get(key)
+    except Exception:
+        return
+    if current is None:
+        return
+    if _decode_redis_value(current) != token:
+        return
+    try:
+        conn.delete(key)
+    except Exception:
+        return
+
+
+def _generated_clip_lock_key(bucket: str, object_name: str) -> str:
+    return f"clipry:generated-clip:{bucket}:{object_name}"
+
+
+def _cleanup_temp_file(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _download_generated_clip_to_local_path(*, object_name: str, local_path: str) -> None:
+    from utils.minio_client import get_minio_client
+
+    _ensure_parent_dir(local_path)
+    tmp_file_path = f"{local_path}.{uuid.uuid4().hex}.part.minio"
+    client = get_minio_client()
+    try:
+        try:
+            client.fget_object(
+                GENERATED_CLIPS_BUCKET,
+                object_name,
+                local_path,
+                tmp_file_path=tmp_file_path,
+            )
+        except TypeError as exc:
+            # Keep compatibility with legacy test doubles that do not accept
+            # the explicit tmp-file argument.
+            if "tmp_file_path" not in str(exc):
+                raise
+            client.fget_object(GENERATED_CLIPS_BUCKET, object_name, local_path)
+    finally:
+        _cleanup_temp_file(tmp_file_path)
+
+
 def _build_generated_clip_storage_error(
     *,
     storage_path: str,
@@ -325,37 +387,101 @@ def resolve_generated_clip_path(
     if os.path.isfile(local_path):
         return local_path
 
-    try:
-        from utils.minio_client import get_minio_client
+    wait_started_at = time.monotonic()
+    lock_wait_seconds = max(1, int(SOURCE_VIDEO_LOCK_WAIT_SECONDS))
+    lock_ttl_seconds = max(5, int(SOURCE_VIDEO_LOCK_TTL_SECONDS))
+    lock_key = _generated_clip_lock_key(GENERATED_CLIPS_BUCKET, object_name)
+    lock_token = f"{uuid.uuid4()}:{os.getpid()}"
+    lock_acquired = False
 
-        _ensure_parent_dir(local_path)
-        get_minio_client().fget_object(GENERATED_CLIPS_BUCKET, object_name, local_path)
+    try:
+        conn = get_redis_connection()
     except Exception as exc:
-        try:
-            if os.path.exists(local_path):
-                os.remove(local_path)
-        except OSError:
-            pass
         if logger is not None:
-            logger.warning("Failed to download clip %s from MinIO: %s", storage_path, exc)
+            logger.warning(
+                "Redis unavailable while resolving generated clip %s; falling back to direct download: %s",
+                storage_path,
+                exc,
+            )
+        conn = None
+
+    try:
+        while conn is not None and not lock_acquired:
+            if os.path.isfile(local_path):
+                return local_path
+
+            try:
+                lock_acquired = bool(
+                    conn.set(
+                        lock_key,
+                        lock_token,
+                        nx=True,
+                        ex=lock_ttl_seconds,
+                    )
+                )
+            except Exception as exc:
+                if logger is not None:
+                    logger.warning(
+                        "Failed to acquire generated-clip lock for %s; falling back to direct download: %s",
+                        storage_path,
+                        exc,
+                    )
+                conn = None
+                break
+
+            if lock_acquired:
+                break
+
+            elapsed = time.monotonic() - wait_started_at
+            if elapsed >= lock_wait_seconds:
+                timeout_error = TimeoutError(
+                    "Timed out waiting for generated clip materialization "
+                    f"(storage_path={storage_path}, waited={lock_wait_seconds}s)."
+                )
+                if raise_on_error:
+                    raise _build_generated_clip_storage_error(
+                        storage_path=str(storage_path),
+                        object_name=object_name,
+                        exc=timeout_error,
+                        reason="materialization_incomplete",
+                    ) from timeout_error
+                return None
+            time.sleep(_WAIT_POLL_INTERVAL_SECONDS)
+
+        if os.path.isfile(local_path):
+            return local_path
+
+        try:
+            _download_generated_clip_to_local_path(
+                object_name=object_name,
+                local_path=local_path,
+            )
+        except Exception as exc:
+            if os.path.isfile(local_path):
+                return local_path
+            if logger is not None:
+                logger.warning("Failed to download clip %s from MinIO: %s", storage_path, exc)
+            if raise_on_error:
+                raise _build_generated_clip_storage_error(
+                    storage_path=str(storage_path),
+                    object_name=object_name,
+                    exc=exc,
+                ) from exc
+            return None
+
+        if os.path.isfile(local_path):
+            return local_path
+
         if raise_on_error:
             raise _build_generated_clip_storage_error(
                 storage_path=str(storage_path),
                 object_name=object_name,
-                exc=exc,
-            ) from exc
+                reason="materialization_incomplete",
+            )
         return None
-
-    if os.path.isfile(local_path):
-        return local_path
-
-    if raise_on_error:
-        raise _build_generated_clip_storage_error(
-            storage_path=str(storage_path),
-            object_name=object_name,
-            reason="materialization_incomplete",
-        )
-    return None
+    finally:
+        if conn is not None and lock_acquired:
+            _release_lock_if_owned(conn=conn, key=lock_key, token=lock_token)
 
 
 def delete_local_generated_clip(storage_path: str, *, logger=None) -> bool:

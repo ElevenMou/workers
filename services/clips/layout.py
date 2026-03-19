@@ -8,6 +8,7 @@ from services.clips.constants import (
     DEFAULT_CANVAS_ASPECT_RATIO,
     CHAR_WIDTH_RATIO,
     CHAR_WIDTH_RATIOS,
+    SPACE_WIDTH_RATIO,
     TITLE_BAR_V_PAD,
     TITLE_GAP,
     TITLE_LINE_HEIGHT_RATIO,
@@ -35,6 +36,14 @@ def _char_width_ratio(font_family: str) -> float:
     return CHAR_WIDTH_RATIOS.get(key, CHAR_WIDTH_RATIO)
 
 
+def _estimate_text_width(text: str, font_size: int, ratio: float) -> float:
+    """Return pixel-width estimate for *text* using per-character ratios."""
+    return sum(
+        font_size * (SPACE_WIDTH_RATIO if c == " " else ratio)
+        for c in text
+    )
+
+
 def wrap_title(
     title: str,
     font_size: int,
@@ -43,19 +52,18 @@ def wrap_title(
 ) -> list[str]:
     """Word-wrap title text to fit within a given pixel width.
 
-    *font_family* is used for a per-font character-width estimate (optional).
+    Uses pixel-width estimation per character (matching the frontend
+    ``estimateTextWidth`` approach) for consistent line breaks.
     """
     ratio = _char_width_ratio(font_family)
-    avg_char_w = font_size * ratio
-    max_chars = max(10, int(max_width / avg_char_w))
 
     words = title.split()
     lines: list[str] = []
     current_line = ""
 
     for word in words:
-        candidate = f"{current_line} {word}".strip() if current_line else word
-        if len(candidate) <= max_chars:
+        candidate = f"{current_line} {word}" if current_line else word
+        if _estimate_text_width(candidate, font_size, ratio) <= max_width:
             current_line = candidate
         else:
             if current_line:
@@ -67,6 +75,7 @@ def wrap_title(
 
     if len(lines) > 3:
         lines = lines[:3]
+        max_chars = max(10, int(max_width / (font_size * ratio)))
         lines[-1] = lines[-1][: max_chars - 3].rstrip() + "..."
 
     return lines

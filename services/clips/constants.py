@@ -36,12 +36,12 @@ VIDEO_SCALE_MODE_ALIASES = {
 }
 
 TITLE_BAR_V_PAD = 10
-TITLE_BAR_H_PAD = 10
+TITLE_BAR_H_PAD = 6
 TITLE_GAP = 12
 TITLE_LINE_HEIGHT_RATIO = 0.75
 TITLE_BAR_BORDER_RADIUS = 12
 
-# Minimum horizontal safe margin (pixels at 1080px canvas width, ~3.7%).
+# Minimum horizontal safe margin (pixels at 1080px canvas width, ~1.4%).
 # Ensures text never touches the canvas edge regardless of user paddingX.
 TITLE_SAFE_MARGIN_X = 40
 
@@ -85,22 +85,22 @@ def intermediate_quality_preset(base: QualityPreset) -> QualityPreset:
     return result
 
 
-CHAR_WIDTH_RATIO = 0.52
-SPACE_WIDTH_RATIO = 0.28
+CHAR_WIDTH_RATIO = 0.48
+SPACE_WIDTH_RATIO = 0.25
 
 # Per-font average character width ratios for more accurate text wrapping.
 # Values represent avg glyph advance / font-size for mixed-case Latin text.
 # Fonts not listed fall back to CHAR_WIDTH_RATIO.
 CHAR_WIDTH_RATIOS: dict[str, float] = {
-    "montserrat": 0.52,
-    "montserrat-bold": 0.54,
-    "poppins": 0.50,
-    "inter": 0.50,
-    "roboto": 0.49,
-    "oswald": 0.42,
-    "playfair display": 0.50,
-    "space mono": 0.60,
-    "bangers": 0.46,
+    "montserrat": 0.48,
+    "montserrat-bold": 0.50,
+    "poppins": 0.47,
+    "inter": 0.47,
+    "roboto": 0.46,
+    "oswald": 0.39,
+    "playfair display": 0.47,
+    "space mono": 0.57,
+    "bangers": 0.43,
 }
 
 

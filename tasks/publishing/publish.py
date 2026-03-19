@@ -421,17 +421,6 @@ def publish_clip_task(job_data: PublishClipJob) -> None:
         media = load_publication_media(
             str(delivery_storage_path),
             work_dir=work_dir,
-            master_storage_path=(
-                str(clip.get("master_storage_path"))
-                if clip.get("master_storage_path")
-                else None
-            ),
-            publish_profile=publish_profile,
-            delivery_profile=(
-                str(clip.get("delivery_profile"))
-                if clip.get("delivery_profile")
-                else None
-            ),
         )
         _validate_media_for_provider(account_context.provider, media.duration_seconds)
 
