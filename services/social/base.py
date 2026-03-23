@@ -33,7 +33,7 @@ class PublicationContext:
     clip_title: str | None
     caption: str
     youtube_title: str | None
-    scheduled_for: datetime
+    scheduled_for: datetime  # Always resolved to UTC by the task layer; never None at runtime
 
 
 @dataclass

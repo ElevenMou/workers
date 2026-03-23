@@ -1,5 +1,6 @@
 import os
 import logging
+import ipaddress
 from math import ceil
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -365,6 +366,35 @@ def _cors_origin_is_local(origin: str) -> bool:
     return hostname in _LOCAL_CORS_HOSTS or hostname.endswith(".localhost")
 
 
+def _is_public_network_target(raw_value: str | None) -> bool:
+    value = str(raw_value or "").strip()
+    if not value:
+        return False
+
+    candidate = value if "://" in value else f"https://{value}"
+    parsed = urlparse(candidate)
+    hostname = (parsed.hostname or "").strip().lower()
+    scheme = (parsed.scheme or "").strip().lower()
+    if scheme not in {"http", "https"} or not hostname:
+        return False
+    if hostname in _LOCAL_CORS_HOSTS or hostname.endswith(".localhost"):
+        return False
+
+    try:
+        host_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        return "." in hostname
+
+    return not (
+        host_ip.is_loopback
+        or host_ip.is_private
+        or host_ip.is_link_local
+        or host_ip.is_multicast
+        or host_ip.is_reserved
+        or host_ip.is_unspecified
+    )
+
+
 def validate_env(
     extra: list[str] | None = None,
     *,
@@ -395,6 +425,31 @@ def validate_env(
     current_environment = (os.getenv("ENVIRONMENT", ENVIRONMENT) or ENVIRONMENT).strip().lower()
     if current_environment not in {"production", "prod"}:
         return
+
+    minio_public_endpoint = os.getenv("MINIO_PUBLIC_ENDPOINT")
+    worker_public_base_url = os.getenv("WORKER_PUBLIC_BASE_URL")
+    caddy_domain = os.getenv("CADDY_DOMAIN")
+
+    if minio_public_endpoint and not _is_public_network_target(minio_public_endpoint):
+        logger.warning(
+            "Production MINIO_PUBLIC_ENDPOINT is not publicly reachable (%r). "
+            "Public presigned media URLs will be disabled until this is fixed.",
+            minio_public_endpoint,
+        )
+
+    if worker_public_base_url and not _is_public_network_target(worker_public_base_url):
+        logger.warning(
+            "Production WORKER_PUBLIC_BASE_URL is not publicly reachable (%r). "
+            "Worker-signed public media URLs will be disabled until this is fixed.",
+            worker_public_base_url,
+        )
+
+    if caddy_domain and not _is_public_network_target(caddy_domain):
+        logger.warning(
+            "Production CADDY_DOMAIN is not publicly reachable (%r). "
+            "Public worker media URLs may be unavailable until this is fixed.",
+            caddy_domain,
+        )
 
     cors_allowed_origins = _parse_cors_allowed_origins(os.getenv("CORS_ALLOWED_ORIGINS"))
     cors_origin_regex = (os.getenv("CORS_ALLOWED_ORIGIN_REGEX") or "").strip()

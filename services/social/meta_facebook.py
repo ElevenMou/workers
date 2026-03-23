@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from services.social.base import (
     PublicationContext,
@@ -14,11 +17,14 @@ from services.social.base import (
     SocialAccountContext,
     SocialProviderError,
 )
+from services.social.http import pooled_client, resilient_client_request, resilient_request
 
 _META_API_VERSION = (os.getenv("META_GRAPH_API_VERSION") or "v25.0").strip() or "v25.0"
 _GRAPH_BASE = f"https://graph.facebook.com/{_META_API_VERSION}"
 _REELS_POLL_INTERVAL_SECONDS = 5
 _REELS_PUBLISH_TIMEOUT_SECONDS = 300
+_FACEBOOK_REELS_MAX_DURATION_SECONDS = 90.0
+_FACEBOOK_REELS_ASPECT_RATIO_TOLERANCE = 0.02
 
 
 def _read_payload(response: httpx.Response) -> dict:
@@ -111,13 +117,20 @@ def _publishing_complete(status_payload: dict) -> bool:
     return False
 
 
+def _is_near_9_16(width: int, height: int) -> bool:
+    """Return True if the aspect ratio is within tolerance of 9:16."""
+    target_ratio = 9.0 / 16.0
+    actual_ratio = width / height
+    return abs(actual_ratio - target_ratio) <= _FACEBOOK_REELS_ASPECT_RATIO_TOLERANCE
+
+
 def _is_reel_eligible(media: PublicationMedia) -> bool:
-    """Return True if the clip meets Facebook Reel requirements (<=60s, 9:16)."""
-    if media.duration_seconds is None or media.duration_seconds > 60.0:
+    """Return True if the clip meets Facebook Reel requirements (<=90s, ~9:16)."""
+    if media.duration_seconds is None or media.duration_seconds > _FACEBOOK_REELS_MAX_DURATION_SECONDS:
         return False
     if media.width is None or media.height is None:
         return False
-    if media.width * 16 != media.height * 9:
+    if not _is_near_9_16(media.width, media.height):
         return False
     return True
 
@@ -128,9 +141,9 @@ def _validate_reel_media(media: PublicationMedia) -> None:
             "Facebook Reels publishing requires a clip duration.",
             code="facebook_reels_missing_duration",
         )
-    if media.duration_seconds > 60.0:
+    if media.duration_seconds > _FACEBOOK_REELS_MAX_DURATION_SECONDS:
         raise SocialProviderError(
-            "Facebook Reels requires clips that are 60 seconds or shorter.",
+            f"Facebook Reels requires clips that are {int(_FACEBOOK_REELS_MAX_DURATION_SECONDS)} seconds or shorter.",
             code="facebook_reels_duration_exceeded",
         )
     if media.width is None or media.height is None:
@@ -138,9 +151,9 @@ def _validate_reel_media(media: PublicationMedia) -> None:
             "Facebook Reels publishing requires clip dimensions.",
             code="facebook_reels_missing_dimensions",
         )
-    if media.width * 16 != media.height * 9:
+    if not _is_near_9_16(media.width, media.height):
         raise SocialProviderError(
-            "Facebook Reels requires a 9:16 video.",
+            "Facebook Reels requires a near 9:16 vertical video.",
             code="facebook_reels_invalid_aspect_ratio",
             provider_payload={
                 "width": media.width,
@@ -150,7 +163,8 @@ def _validate_reel_media(media: PublicationMedia) -> None:
 
 
 def _start_reel_upload(account: SocialAccountContext) -> tuple[str, str, dict]:
-    response = httpx.post(
+    response = resilient_request(
+        "POST",
         f"{_GRAPH_BASE}/me/video_reels",
         params={
             "access_token": account.tokens.access_token,
@@ -181,7 +195,8 @@ def _start_reel_upload(account: SocialAccountContext) -> tuple[str, str, dict]:
 def _upload_reel_bytes(upload_url: str, media: PublicationMedia, access_token: str) -> dict:
     try:
         with open(media.local_path, "rb") as handle:
-            response = httpx.post(
+            response = resilient_request(
+                "POST",
                 upload_url,
                 headers={
                     "Authorization": f"OAuth {access_token}",
@@ -189,8 +204,9 @@ def _upload_reel_bytes(upload_url: str, media: PublicationMedia, access_token: s
                     "file_size": str(media.file_size),
                     "Content-Type": "application/octet-stream",
                 },
-                content=handle.read(),
+                content=handle,
                 timeout=300.0,
+                max_retries=2,
             )
     except OSError as exc:
         raise SocialProviderError(
@@ -211,15 +227,18 @@ def _upload_reel_bytes(upload_url: str, media: PublicationMedia, access_token: s
     return payload
 
 
-def _fetch_reel_status(video_id: str, access_token: str) -> dict:
-    response = httpx.get(
-        f"{_GRAPH_BASE}/{video_id}",
-        params={
-            "access_token": access_token,
-            "fields": "status",
-        },
-        timeout=30.0,
-    )
+def _fetch_reel_status(
+    video_id: str,
+    access_token: str,
+    *,
+    client: httpx.Client | None = None,
+) -> dict:
+    url = f"{_GRAPH_BASE}/{video_id}"
+    params = {"access_token": access_token, "fields": "status"}
+    if client is not None:
+        response = resilient_client_request(client, "GET", url, params=params)
+    else:
+        response = resilient_request("GET", url, params=params, timeout=30.0)
     payload = _read_payload(response)
     if response.status_code >= 400:
         raise _coerce_meta_error(
@@ -234,18 +253,22 @@ def _fetch_reel_status(video_id: str, access_token: str) -> dict:
 def _wait_for_upload(video_id: str, access_token: str) -> dict:
     deadline = time.monotonic() + 60
     last_payload: dict = {}
-    while time.monotonic() < deadline:
-        payload = _fetch_reel_status(video_id, access_token)
-        last_payload = payload
-        if _upload_processing_failed(payload):
-            raise SocialProviderError(
-                "Facebook Reels upload failed during processing.",
-                code="facebook_reels_upload_processing_failed",
-                provider_payload=payload,
-            )
-        if _uploading_complete(payload):
-            return payload
-        time.sleep(_REELS_POLL_INTERVAL_SECONDS)
+    poll_delay = 2.0
+    with pooled_client(timeout=30.0) as client:
+        while time.monotonic() < deadline:
+            payload = _fetch_reel_status(video_id, access_token, client=client)
+            last_payload = payload
+            logger.debug("Facebook Reels upload status: %s (video_id=%s)", _extract_status(payload), video_id)
+            if _upload_processing_failed(payload):
+                raise SocialProviderError(
+                    "Facebook Reels upload failed during processing.",
+                    code="facebook_reels_upload_processing_failed",
+                    provider_payload=payload,
+                )
+            if _uploading_complete(payload):
+                return payload
+            time.sleep(poll_delay)
+            poll_delay = min(poll_delay + 1.0, 8.0)
 
     raise SocialProviderError(
         "Facebook Reels upload did not complete before timeout.",
@@ -262,7 +285,8 @@ def _finish_reel_publish(
     video_id: str,
 ) -> dict:
     title = (publication.clip_title or publication.caption or "").strip()[:100] or "Clipry clip"
-    response = httpx.post(
+    response = resilient_request(
+        "POST",
         f"{_GRAPH_BASE}/me/video_reels",
         data={
             "access_token": account.tokens.access_token,
@@ -287,18 +311,22 @@ def _finish_reel_publish(
 def _wait_for_publish(video_id: str, access_token: str) -> dict:
     deadline = time.monotonic() + _REELS_PUBLISH_TIMEOUT_SECONDS
     last_payload: dict = {}
-    while time.monotonic() < deadline:
-        payload = _fetch_reel_status(video_id, access_token)
-        last_payload = payload
-        if _upload_processing_failed(payload):
-            raise SocialProviderError(
-                "Facebook Reels publish failed during processing.",
-                code="facebook_reels_processing_failed",
-                provider_payload=payload,
-            )
-        if _publishing_complete(payload):
-            return payload
-        time.sleep(_REELS_POLL_INTERVAL_SECONDS)
+    poll_delay = 2.0
+    with pooled_client(timeout=30.0) as client:
+        while time.monotonic() < deadline:
+            payload = _fetch_reel_status(video_id, access_token, client=client)
+            last_payload = payload
+            logger.debug("Facebook Reels publish status: %s (video_id=%s)", _extract_status(payload), video_id)
+            if _upload_processing_failed(payload):
+                raise SocialProviderError(
+                    "Facebook Reels publish failed during processing.",
+                    code="facebook_reels_processing_failed",
+                    provider_payload=payload,
+                )
+            if _publishing_complete(payload):
+                return payload
+            time.sleep(poll_delay)
+            poll_delay = min(poll_delay + 1.0, 8.0)
 
     raise SocialProviderError(
         "Facebook Reels did not finish publishing before timeout.",
@@ -310,7 +338,8 @@ def _wait_for_publish(video_id: str, access_token: str) -> dict:
 
 def _fetch_reel_permalink(video_id: str, access_token: str) -> str | None:
     try:
-        response = httpx.get(
+        response = resilient_request(
+            "GET",
             f"{_GRAPH_BASE}/{video_id}",
             params={
                 "access_token": access_token,
@@ -347,7 +376,8 @@ def _upload_page_video(
 
     try:
         with open(media.local_path, "rb") as handle:
-            response = httpx.post(
+            response = resilient_request(
+                "POST",
                 f"{_GRAPH_BASE}/{page_id}/videos",
                 data={
                     "access_token": account.tokens.access_token,
@@ -356,6 +386,7 @@ def _upload_page_video(
                 },
                 files={"source": (os.path.basename(media.local_path), handle, media.content_type)},
                 timeout=300.0,
+                max_retries=2,
             )
     except OSError as exc:
         raise SocialProviderError(
@@ -383,6 +414,7 @@ def _upload_page_video(
         )
 
     permalink = f"https://www.facebook.com/watch/?v={video_id}"
+    logger.info("Facebook Page Video upload complete: video_id=%s", video_id)
 
     return PublicationResult(
         remote_post_id=video_id,
@@ -403,12 +435,17 @@ def publish_video(
     media: PublicationMedia,
 ) -> PublicationResult:
     if _is_reel_eligible(media):
+        logger.info(
+            "Starting Facebook Reels publish for publication %s (%d bytes, %.1fs)",
+            publication.id, media.file_size, media.duration_seconds or 0,
+        )
         _validate_reel_media(media)
 
         video_id, start_payload, upload_payload = "", {}, {}
         upload_status_payload, finish_payload, publish_status_payload = {}, {}, {}
 
         video_id, _upload_url, start_payload = _start_reel_upload(account)
+        logger.info("Facebook Reels upload session started: video_id=%s", video_id)
         upload_payload = _upload_reel_bytes(_upload_url, media, account.tokens.access_token)
         upload_status_payload = _wait_for_upload(video_id, account.tokens.access_token)
         finish_payload = _finish_reel_publish(
@@ -418,6 +455,7 @@ def publish_video(
         )
         publish_status_payload = _wait_for_publish(video_id, account.tokens.access_token)
         permalink = _fetch_reel_permalink(video_id, account.tokens.access_token)
+        logger.info("Facebook Reels publish complete: video_id=%s, permalink=%s", video_id, permalink)
 
         return PublicationResult(
             remote_post_id=video_id,
@@ -436,6 +474,10 @@ def publish_video(
             },
         )
 
+    logger.info(
+        "Starting Facebook Page Video upload for publication %s (%d bytes, %.1fs)",
+        publication.id, media.file_size, media.duration_seconds or 0,
+    )
     return _upload_page_video(
         account=account,
         publication=publication,

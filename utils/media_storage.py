@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import os
 import posixpath
 import shutil
@@ -11,15 +12,17 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from config import (
+    IS_PRODUCTION,
     LOCAL_MEDIA_ROOT,
     MINIO_CLIPS_BUCKET,
     MINIO_RAW_VIDEOS_BUCKET,
     RAW_VIDEO_CACHE_DIR,
     SOURCE_VIDEO_LOCK_TTL_SECONDS,
     SOURCE_VIDEO_LOCK_WAIT_SECONDS,
+    WORKER_INTERNAL_API_TOKEN,
     WORKER_MEDIA_SIGNING_SECRET,
     WORKER_PUBLIC_BASE_URL,
 )
@@ -138,9 +141,70 @@ def _content_type_for_path(path: str, fallback: str = "application/octet-stream"
     return _CONTENT_TYPE_BY_EXTENSION.get(suffix, fallback)
 
 
+def _is_public_http_url(url: str) -> bool:
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        return False
+
+    parsed = urlparse(raw_url)
+    scheme = str(parsed.scheme or "").strip().lower()
+    hostname = str(parsed.hostname or "").strip().lower()
+    if scheme not in {"http", "https"} or not hostname:
+        return False
+    if hostname in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or hostname.endswith(".localhost"):
+        return False
+
+    try:
+        host_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        return "." in hostname
+
+    return not (
+        host_ip.is_loopback
+        or host_ip.is_private
+        or host_ip.is_link_local
+        or host_ip.is_multicast
+        or host_ip.is_reserved
+        or host_ip.is_unspecified
+    )
+
+
+def _caddy_public_base_url() -> str:
+    caddy_domain = str(os.getenv("CADDY_DOMAIN") or "").strip().rstrip("/")
+    if not caddy_domain or caddy_domain.startswith(":"):
+        return ""
+
+    candidate = caddy_domain if "://" in caddy_domain else f"https://{caddy_domain}"
+    parsed = urlparse(candidate)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return candidate.rstrip("/")
+
+
+def _effective_worker_public_base_url() -> str:
+    configured_base_url = str(WORKER_PUBLIC_BASE_URL or "").strip().rstrip("/")
+    caddy_base_url = _caddy_public_base_url()
+
+    if _is_public_http_url(configured_base_url):
+        return configured_base_url
+    if _is_public_http_url(caddy_base_url):
+        return caddy_base_url
+    if not IS_PRODUCTION and configured_base_url:
+        return configured_base_url
+    if not IS_PRODUCTION and caddy_base_url:
+        return caddy_base_url
+    return ""
+
+
+def _effective_worker_media_signing_secret() -> str:
+    # Fall back to the required internal token so media URLs keep working
+    # when deploys omit the dedicated signing secret.
+    return str(WORKER_MEDIA_SIGNING_SECRET or WORKER_INTERNAL_API_TOKEN or "").strip()
+
+
 def _create_signature(path: str, expires_at: int) -> str:
     payload = f"{path}\n{int(expires_at)}".encode("utf-8")
-    secret = WORKER_MEDIA_SIGNING_SECRET.encode("utf-8")
+    secret = _effective_worker_media_signing_secret().encode("utf-8")
     return hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
 
@@ -149,7 +213,9 @@ def build_signed_worker_media_url(
     *,
     expires_in_seconds: int = 3600,
 ) -> str | None:
-    if not WORKER_PUBLIC_BASE_URL or not WORKER_MEDIA_SIGNING_SECRET:
+    public_base_url = _effective_worker_public_base_url()
+    signing_secret = _effective_worker_media_signing_secret()
+    if not public_base_url or not signing_secret:
         return None
 
     path = str(relative_path or "").strip()
@@ -163,7 +229,7 @@ def build_signed_worker_media_url(
             "sig": _create_signature(path, expires_at),
         }
     )
-    return f"{WORKER_PUBLIC_BASE_URL}{path}?{query}"
+    return f"{public_base_url}{path}?{query}"
 
 
 def verify_signed_worker_media_request(
@@ -172,7 +238,7 @@ def verify_signed_worker_media_request(
     expires: int,
     signature: str,
 ) -> bool:
-    if not WORKER_MEDIA_SIGNING_SECRET:
+    if not _effective_worker_media_signing_secret():
         return False
     if int(expires) < int(time.time()):
         return False

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from services.social.base import (
     PublicationContext,
@@ -16,6 +19,7 @@ from services.social.base import (
     SocialAccountContext,
     SocialProviderError,
 )
+from services.social.http import pooled_client, resilient_client_request, resilient_request
 
 _TIKTOK_BASE = "https://open.tiktokapis.com"
 _MIN_UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024
@@ -60,7 +64,9 @@ def refresh_access_token(account: SocialAccountContext) -> PublicationResult | N
     if not account.tokens.refresh_token:
         return None
 
-    response = httpx.post(
+    logger.info("Refreshing TikTok access token for account %s", account.id)
+    response = resilient_request(
+        "POST",
         f"{_TIKTOK_BASE}/v2/oauth/token/",
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
@@ -109,16 +115,26 @@ def refresh_access_token(account: SocialAccountContext) -> PublicationResult | N
     )
 
 
-def _authorized_post(path: str, *, token: str, json_body: dict) -> dict:
-    response = httpx.post(
-        f"{_TIKTOK_BASE}{path}",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=UTF-8",
-        },
-        json=json_body,
-        timeout=60.0,
-    )
+def _authorized_post(
+    path: str,
+    *,
+    token: str,
+    json_body: dict,
+    client: httpx.Client | None = None,
+) -> dict:
+    url = f"{_TIKTOK_BASE}{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=UTF-8",
+    }
+    if client is not None:
+        response = resilient_client_request(
+            client, "POST", url, headers=headers, json=json_body, timeout=60.0,
+        )
+    else:
+        response = resilient_request(
+            "POST", url, headers=headers, json=json_body, timeout=60.0,
+        )
     payload = _read_json_payload(response)
     if response.status_code >= 400:
         error = payload.get("error") or {}
@@ -213,7 +229,7 @@ def _plan_file_upload(file_size: int) -> tuple[int, int]:
         return file_size, 1
 
     chunk_size = _DEFAULT_UPLOAD_CHUNK_BYTES
-    total_chunk_count = file_size // chunk_size
+    total_chunk_count = math.ceil(file_size / chunk_size)
 
     if total_chunk_count > _MAX_UPLOAD_CHUNKS:
         chunk_size = max(_MIN_UPLOAD_CHUNK_BYTES, math.ceil(file_size / _MAX_UPLOAD_CHUNKS))
@@ -223,7 +239,7 @@ def _plan_file_upload(file_size: int) -> tuple[int, int]:
                 code="tiktok_file_too_large",
                 provider_payload={"file_size": file_size},
             )
-        total_chunk_count = file_size // chunk_size
+        total_chunk_count = math.ceil(file_size / chunk_size)
 
     if total_chunk_count < 1:
         total_chunk_count = 1
@@ -251,6 +267,11 @@ def _upload_file_chunks(
                 length = end - start + 1
                 payload = clip_file.read(length)
 
+                logger.debug(
+                    "TikTok upload chunk %d/%d (%d bytes, range %d-%d)",
+                    chunk_index + 1, total_chunk_count, length, start, end,
+                )
+
                 if len(payload) != length:
                     raise SocialProviderError(
                         "TikTok upload read fewer bytes than expected.",
@@ -264,7 +285,8 @@ def _upload_file_chunks(
                         },
                     )
 
-                response = httpx.put(
+                response = resilient_request(
+                    "PUT",
                     upload_url,
                     headers={
                         "Content-Type": media.content_type,
@@ -273,11 +295,13 @@ def _upload_file_chunks(
                     },
                     content=payload,
                     timeout=180.0,
+                    max_retries=2,
                 )
                 if response.status_code not in {201, 206}:
                     raise SocialProviderError(
                         "TikTok rejected uploaded video data.",
                         code="tiktok_upload_transfer_failed",
+                        recoverable=True,
                         provider_payload={
                             "publish_id": publish_id,
                             "chunk_index": chunk_index,
@@ -337,6 +361,10 @@ def publish_video(
             recoverable=True,
         )
 
+    logger.info(
+        "Starting TikTok publish for publication %s (%d bytes, %.1fs)",
+        publication.id, media.file_size, media.duration_seconds or 0,
+    )
     creator_info = _query_creator_info(account)
     max_duration = creator_info.get("max_video_post_duration_sec")
     try:
@@ -376,6 +404,10 @@ def publish_video(
             code="tiktok_missing_publish_id",
             provider_payload=init_payload,
         )
+    logger.info(
+        "TikTok publish initialized: publish_id=%s, chunks=%d, chunk_size=%d",
+        publish_id, total_chunk_count, chunk_size,
+    )
     upload_url = str(data.get("upload_url") or "").strip()
     if not upload_url:
         raise SocialProviderError(
@@ -394,47 +426,65 @@ def publish_video(
 
     deadline = time.monotonic() + 180
     last_status_payload: dict = {}
-    while time.monotonic() < deadline:
-        status_payload = _fetch_publish_status(account, str(publish_id))
-        last_status_payload = status_payload
-        status = str(status_payload.get("status") or "").upper()
-        if status == "PUBLISH_COMPLETE":
-            public_ids = _resolve_public_post_ids(status_payload)
-            remote_post_id = str(public_ids[0]) if public_ids else str(publish_id)
-            remote_post_url = None
-            if public_ids and account.handle:
-                remote_post_url = f"https://www.tiktok.com/@{account.handle}/video/{public_ids[0]}"
-            return PublicationResult(
-                remote_post_id=remote_post_id,
-                remote_post_url=remote_post_url,
-                provider_payload={
-                    "creator_info": creator_info,
-                    "init": init_payload,
-                    "status": status_payload,
-                },
-                result_payload={"platform": "tiktok", "publish_id": str(publish_id)},
+    poll_delay = 2.0
+    with pooled_client(timeout=60.0) as client:
+        while time.monotonic() < deadline:
+            status_payload = _authorized_post(
+                "/v2/post/publish/status/fetch/",
+                token=account.tokens.access_token,
+                json_body={"publish_id": str(publish_id)},
+                client=client,
             )
-        if status == "SEND_TO_USER_INBOX":
-            raise SocialProviderError(
-                "TikTok returned inbox delivery instead of direct publish. Reconnect the account or review app approval.",
-                code="tiktok_inbox_only",
-                provider_payload={
-                    "creator_info": creator_info,
-                    "init": init_payload,
-                    "status": status_payload,
-                },
-            )
-        if status == "FAILED":
-            raise SocialProviderError(
-                status_payload.get("fail_reason") or "TikTok direct post failed.",
-                code="tiktok_publish_failed",
-                provider_payload={
-                    "creator_info": creator_info,
-                    "init": init_payload,
-                    "status": status_payload,
-                },
-            )
-        time.sleep(5)
+            error = (status_payload.get("error") or {})
+            if error.get("code") not in {None, "", "ok"}:
+                raise SocialProviderError(
+                    error.get("message") or "TikTok status fetch failed.",
+                    code=str(error.get("code")),
+                    provider_payload=status_payload,
+                )
+            status_data = status_payload.get("data") or {}
+            last_status_payload = status_data
+            status = str(status_data.get("status") or "").upper()
+            logger.debug("TikTok publish status: %s (publish_id=%s)", status, publish_id)
+            if status == "PUBLISH_COMPLETE":
+                public_ids = _resolve_public_post_ids(status_data)
+                remote_post_id = str(public_ids[0]) if public_ids else str(publish_id)
+                remote_post_url = None
+                if public_ids and account.handle:
+                    remote_post_url = f"https://www.tiktok.com/@{account.handle}/video/{public_ids[0]}"
+                logger.info("TikTok publish complete: post_id=%s", remote_post_id)
+                return PublicationResult(
+                    remote_post_id=remote_post_id,
+                    remote_post_url=remote_post_url,
+                    provider_payload={
+                        "creator_info": creator_info,
+                        "init": init_payload,
+                        "status": status_data,
+                    },
+                    result_payload={"platform": "tiktok", "publish_id": str(publish_id)},
+                )
+            if status == "SEND_TO_USER_INBOX":
+                raise SocialProviderError(
+                    "TikTok returned inbox delivery instead of direct publish. Reconnect the account or review app approval.",
+                    code="tiktok_inbox_only",
+                    provider_payload={
+                        "creator_info": creator_info,
+                        "init": init_payload,
+                        "status": status_data,
+                    },
+                )
+            if status == "FAILED":
+                raise SocialProviderError(
+                    status_data.get("fail_reason") or "TikTok direct post failed.",
+                    code="tiktok_publish_failed",
+                    provider_payload={
+                        "creator_info": creator_info,
+                        "init": init_payload,
+                        "status": status_data,
+                    },
+                )
+            time.sleep(poll_delay)
+            poll_delay = min(poll_delay + 1.0, 8.0)
 
     raise SocialProviderError(
         "Timed out waiting for TikTok to finish direct publishing.",

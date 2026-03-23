@@ -21,6 +21,7 @@ from services.social.base import (
     SocialAccountContext,
     SocialProviderError,
 )
+from services.social.http import resilient_request
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,12 @@ _YOUTUBE_ERROR_MAP: dict[str, str] = {
     "invalidMetadata": "The video metadata was rejected by YouTube. Please check the title and description.",
     "videoNotFound": "YouTube could not process the uploaded video.",
     "processingFailure": "YouTube failed to process the video. Please try again.",
+    "notFound": "The YouTube resource was not found. The channel or video may have been deleted.",
+    "badRequest": "YouTube rejected the request. Please check the video format and metadata.",
+    "rateLimitExceeded": "YouTube rate limit reached. Please wait a few minutes and try again.",
+    "videoTooLong": "The video exceeds the maximum duration allowed by YouTube.",
+    "invalidVideoId": "YouTube returned an invalid video reference. Please try uploading again.",
+    "duplicate": "This video has already been uploaded to YouTube.",
 }
 
 
@@ -61,7 +68,8 @@ def refresh_access_token(account: SocialAccountContext) -> PublicationResult | N
     if not account.tokens.refresh_token:
         return None
 
-    response = httpx.post(
+    response = resilient_request(
+        "POST",
         _GOOGLE_TOKEN_URL,
         data={
             "client_id": _google_client_id(),
@@ -132,7 +140,7 @@ def _map_youtube_error(status_code: int, payload: dict) -> SocialProviderError:
         message,
         code=f"youtube_{reason}" if reason else "youtube_upload_failed",
         refresh_required=needs_reconnect,
-        recoverable=reason in {"quotaExceeded", "uploadLimitExceeded", "processingFailure"},
+        recoverable=reason in {"quotaExceeded", "uploadLimitExceeded", "processingFailure", "rateLimitExceeded"},
         provider_payload=payload if isinstance(payload, dict) else {"raw": payload},
     )
 
@@ -165,7 +173,8 @@ def _initiate_resumable_upload(
     content_type: str,
 ) -> str:
     """POST metadata to YouTube and return the resumable upload URI."""
-    response = httpx.post(
+    response = resilient_request(
+        "POST",
         _YOUTUBE_UPLOAD_URL,
         params={"uploadType": "resumable", "part": "snippet,status"},
         headers={
@@ -203,7 +212,8 @@ def _upload_video_bytes(
 ) -> dict:
     """PUT the video file to the resumable upload URI and return the response payload."""
     with open(local_path, "rb") as handle:
-        response = httpx.put(
+        response = resilient_request(
+            "PUT",
             upload_url,
             headers={
                 "Content-Type": content_type,
@@ -211,6 +221,7 @@ def _upload_video_bytes(
             },
             content=handle,
             timeout=_UPLOAD_TRANSFER_TIMEOUT,
+            max_retries=2,
         )
 
     try:

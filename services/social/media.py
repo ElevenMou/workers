@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import os
 import shutil
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 
 from services.social.base import PublicationMedia, SocialProviderError
 from utils.media_storage import (
     GENERATED_CLIPS_BUCKET,
     GeneratedClipStorageError,
+    build_worker_clip_url,
     create_signed_clip_url as create_minio_signed_clip_url,
     resolve_generated_clip_path,
 )
@@ -27,13 +30,56 @@ def _clip_id_from_storage_path(storage_path: str) -> str | None:
     return stem or None
 
 
+def is_publicly_reachable_url(url: str | None) -> bool:
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except Exception:
+        return False
+
+    scheme = str(parsed.scheme or "").strip().lower()
+    hostname = str(parsed.hostname or "").strip().lower()
+    if scheme not in {"http", "https"} or not hostname:
+        return False
+    if hostname in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or hostname.endswith(".localhost"):
+        return False
+
+    try:
+        host_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        if "." not in hostname:
+            return False
+        return True
+
+    return not (
+        host_ip.is_loopback
+        or host_ip.is_private
+        or host_ip.is_link_local
+        or host_ip.is_multicast
+        or host_ip.is_reserved
+        or host_ip.is_unspecified
+    )
+
+
 def create_signed_clip_url(storage_path: str, *, expires_in_seconds: int = 3600) -> str | None:
     clip_id = _clip_id_from_storage_path(storage_path)
-    return create_minio_signed_clip_url(
+    worker_signed_url = (
+        build_worker_clip_url(
+            clip_id,
+            expires_in_seconds=expires_in_seconds,
+        )
+        if clip_id
+        else None
+    )
+    minio_signed_url = create_minio_signed_clip_url(
         storage_path,
         clip_id=clip_id,
         expires_in_seconds=expires_in_seconds,
     )
+    if is_publicly_reachable_url(worker_signed_url):
+        return worker_signed_url
+    if is_publicly_reachable_url(minio_signed_url):
+        return minio_signed_url
+    return None
 
 
 def _generated_clip_object_name(storage_path: str) -> str | None:

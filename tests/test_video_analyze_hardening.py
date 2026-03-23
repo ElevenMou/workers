@@ -1535,6 +1535,8 @@ def test_validate_env_rejects_localhost_only_cors_in_production(monkeypatch):
     monkeypatch.setenv("MINIO_SECRET_KEY", "minio-secret")
     monkeypatch.setenv("MINIO_PUBLIC_ENDPOINT", "https://storage.example.com")
     monkeypatch.setenv("WORKER_INTERNAL_API_TOKEN", "internal-token")
+    monkeypatch.setenv("WORKER_PUBLIC_BASE_URL", "https://api.example.com")
+    monkeypatch.setenv("CADDY_DOMAIN", "api.example.com")
     monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
     monkeypatch.delenv("CORS_ALLOWED_ORIGIN_REGEX", raising=False)
 
@@ -1552,7 +1554,55 @@ def test_validate_env_accepts_public_cors_origin_in_production(monkeypatch):
     monkeypatch.setenv("MINIO_SECRET_KEY", "minio-secret")
     monkeypatch.setenv("MINIO_PUBLIC_ENDPOINT", "https://storage.example.com")
     monkeypatch.setenv("WORKER_INTERNAL_API_TOKEN", "internal-token")
+    monkeypatch.setenv("WORKER_PUBLIC_BASE_URL", "https://api.example.com")
+    monkeypatch.setenv("CADDY_DOMAIN", "api.example.com")
     monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://www.clipscut.pro")
     monkeypatch.delenv("CORS_ALLOWED_ORIGIN_REGEX", raising=False)
 
     config_module.validate_env(require_browser_cors=True)
+
+
+def test_validate_env_warns_on_local_worker_public_base_url_in_production(monkeypatch, caplog):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("MINIO_ENDPOINT", "minio:9000")
+    monkeypatch.setenv("MINIO_ACCESS_KEY", "minio-access")
+    monkeypatch.setenv("MINIO_SECRET_KEY", "minio-secret")
+    monkeypatch.setenv("MINIO_PUBLIC_ENDPOINT", "https://storage.example.com")
+    monkeypatch.setenv("WORKER_INTERNAL_API_TOKEN", "internal-token")
+    monkeypatch.setenv("WORKER_PUBLIC_BASE_URL", "http://localhost:8080")
+    monkeypatch.setenv("CADDY_DOMAIN", "api.example.com")
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://www.clipscut.pro")
+    monkeypatch.delenv("CORS_ALLOWED_ORIGIN_REGEX", raising=False)
+
+    config_module.validate_env(require_browser_cors=True)
+
+    assert any(
+        "WORKER_PUBLIC_BASE_URL is not publicly reachable" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_validate_env_warns_on_local_minio_public_endpoint_in_production(monkeypatch, caplog):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setenv("SUPABASE_SERVICE_KEY", "service-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-key")
+    monkeypatch.setenv("MINIO_ENDPOINT", "minio:9000")
+    monkeypatch.setenv("MINIO_ACCESS_KEY", "minio-access")
+    monkeypatch.setenv("MINIO_SECRET_KEY", "minio-secret")
+    monkeypatch.setenv("MINIO_PUBLIC_ENDPOINT", "http://localhost:9000")
+    monkeypatch.setenv("WORKER_INTERNAL_API_TOKEN", "internal-token")
+    monkeypatch.setenv("WORKER_PUBLIC_BASE_URL", "https://api.example.com")
+    monkeypatch.setenv("CADDY_DOMAIN", "api.example.com")
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://www.clipscut.pro")
+    monkeypatch.delenv("CORS_ALLOWED_ORIGIN_REGEX", raising=False)
+
+    config_module.validate_env(require_browser_cors=True)
+
+    assert any(
+        "MINIO_PUBLIC_ENDPOINT is not publicly reachable" in record.getMessage()
+        for record in caplog.records
+    )

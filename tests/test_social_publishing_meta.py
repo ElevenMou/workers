@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -470,47 +471,44 @@ def test_facebook_reels_publish_marks_oauth_errors_for_reconnect(tmp_path, monke
     assert exc.value.refresh_required is True
 
 
-def test_instagram_reels_publish_uses_resumable_upload(tmp_path, monkeypatch):
+def test_instagram_reels_publish_uses_video_url_container_flow(tmp_path, monkeypatch):
     media = _media(tmp_path)
-    post_calls: list[tuple[str, dict]] = []
+    request_calls: list[tuple[str, str, dict]] = []
     status_payloads = iter(
         [
             _FakeResponse(payload={"status_code": "IN_PROGRESS"}),
             _FakeResponse(payload={"status_code": "FINISHED"}),
         ]
     )
+    media.signed_url = "https://api.clipscut.pro/media/clips/clip-1?sig=test"
 
-    def _fake_post(url: str, **kwargs):
-        post_calls.append((url, kwargs))
+    def _fake_resilient_request(method: str, url: str, **kwargs):
+        request_calls.append((method, url, kwargs))
         if url.endswith("/account-1/media"):
-            assert kwargs["data"]["upload_type"] == "resumable"
             assert kwargs["data"]["media_type"] == "REELS"
-            return _FakeResponse(
-                payload={
-                    "id": "creation-123",
-                    "uri": "https://rupload.facebook.com/ig-api-upload/session-123",
-                }
-            )
-        if url == "https://rupload.facebook.com/ig-api-upload/session-123":
-            assert kwargs["headers"]["Authorization"] == "OAuth ig-token"
-            assert kwargs["headers"]["offset"] == "0"
-            assert kwargs["headers"]["file_size"] == str(media.file_size)
-            assert kwargs["content"] == b"clip-bytes"
-            return _FakeResponse(payload={"success": True})
+            assert kwargs["data"]["video_url"] == media.signed_url
+            assert "upload_type" not in kwargs["data"]
+            return _FakeResponse(payload={"id": "creation-123"})
         if url.endswith("/account-1/media_publish"):
             assert kwargs["data"]["creation_id"] == "creation-123"
             return _FakeResponse(payload={"id": "media-123"})
-        raise AssertionError(f"Unexpected POST URL: {url}")
-
-    def _fake_get(url: str, **kwargs):
-        if url.endswith("/creation-123"):
-            return next(status_payloads)
         if url.endswith("/media-123"):
             return _FakeResponse(payload={"permalink": "https://www.instagram.com/reel/media-123/"})
-        raise AssertionError(f"Unexpected GET URL: {url}")
+        raise AssertionError(f"Unexpected request: {method} {url}")
 
-    monkeypatch.setattr(meta_instagram.httpx, "post", _fake_post)
-    monkeypatch.setattr(meta_instagram.httpx, "get", _fake_get)
+    def _fake_resilient_client_request(_client, method: str, url: str, **kwargs):
+        assert method == "GET"
+        if url.endswith("/creation-123"):
+            return next(status_payloads)
+        raise AssertionError(f"Unexpected request: {method} {url}")
+
+    @contextmanager
+    def _fake_pooled_client(**_kwargs):
+        yield object()
+
+    monkeypatch.setattr(meta_instagram, "resilient_request", _fake_resilient_request)
+    monkeypatch.setattr(meta_instagram, "resilient_client_request", _fake_resilient_client_request)
+    monkeypatch.setattr(meta_instagram, "pooled_client", _fake_pooled_client)
     monkeypatch.setattr(meta_instagram.time, "sleep", lambda _seconds: None)
 
     result = meta_instagram.publish_reel(
@@ -522,10 +520,10 @@ def test_instagram_reels_publish_uses_resumable_upload(tmp_path, monkeypatch):
     assert result.remote_post_id == "media-123"
     assert result.remote_post_url == "https://www.instagram.com/reel/media-123/"
     assert result.provider_payload["container"]["id"] == "creation-123"
-    assert result.provider_payload["upload"]["success"] is True
-    assert result.provider_payload["upload_uri_host"] == "rupload.facebook.com"
+    assert result.provider_payload["upload"]["source"] == "video_url"
+    assert result.provider_payload["upload_mode"] == "video_url"
     assert result.result_payload == {"platform": "instagram_business", "media_id": "media-123"}
-    assert len(post_calls) == 3
+    assert len(request_calls) == 3
 
 
 def test_instagram_container_failure_includes_status_details_and_media_host(tmp_path, monkeypatch):
@@ -536,25 +534,24 @@ def test_instagram_container_failure_includes_status_details_and_media_host(tmp_
         "error_message": "Failed to fetch the video from the provided URL.",
     }
 
-    def _fake_post(url: str, **kwargs):
+    def _fake_resilient_request(method: str, url: str, **kwargs):
         if url.endswith("/account-1/media"):
-            return _FakeResponse(
-                payload={
-                    "id": "creation-123",
-                    "uri": "https://rupload.facebook.com/ig-api-upload/session-123",
-                }
-            )
-        if url == "https://rupload.facebook.com/ig-api-upload/session-123":
-            return _FakeResponse(payload={"success": True})
-        raise AssertionError(f"Unexpected POST URL: {url}")
+            return _FakeResponse(payload={"id": "creation-123"})
+        raise AssertionError(f"Unexpected request: {method} {url}")
 
-    def _fake_get(url: str, **kwargs):
+    def _fake_resilient_client_request(_client, method: str, url: str, **kwargs):
+        assert method == "GET"
         if url.endswith("/creation-123"):
             return _FakeResponse(payload=status_payload)
-        raise AssertionError(f"Unexpected GET URL: {url}")
+        raise AssertionError(f"Unexpected request: {method} {url}")
 
-    monkeypatch.setattr(meta_instagram.httpx, "post", _fake_post)
-    monkeypatch.setattr(meta_instagram.httpx, "get", _fake_get)
+    @contextmanager
+    def _fake_pooled_client(**_kwargs):
+        yield object()
+
+    monkeypatch.setattr(meta_instagram, "resilient_request", _fake_resilient_request)
+    monkeypatch.setattr(meta_instagram, "resilient_client_request", _fake_resilient_client_request)
+    monkeypatch.setattr(meta_instagram, "pooled_client", _fake_pooled_client)
     monkeypatch.setattr(meta_instagram.time, "sleep", lambda _seconds: None)
 
     with pytest.raises(SocialProviderError) as exc:
@@ -567,7 +564,6 @@ def test_instagram_container_failure_includes_status_details_and_media_host(tmp_
     assert exc.value.code == "instagram_container_failed"
     assert "Failed to fetch the video from the provided URL." in str(exc.value)
     assert exc.value.provider_payload["container"]["id"] == "creation-123"
-    assert exc.value.provider_payload["upload"]["success"] is True
+    assert exc.value.provider_payload["upload"]["source"] == "video_url"
     assert exc.value.provider_payload["status"]["status"]["error_message"] == status_payload["error_message"]
-    assert exc.value.provider_payload["upload_uri_host"] == "rupload.facebook.com"
     assert exc.value.provider_payload["media_url_host"] == "storage.clipscut.pro"

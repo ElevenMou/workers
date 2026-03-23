@@ -59,6 +59,57 @@ def test_signed_worker_clip_url_round_trips(monkeypatch):
     )
 
 
+def test_signed_worker_clip_url_uses_caddy_domain_when_public_base_url_missing(monkeypatch):
+    monkeypatch.setattr(media_storage, "WORKER_PUBLIC_BASE_URL", "")
+    monkeypatch.setattr(media_storage, "WORKER_MEDIA_SIGNING_SECRET", "test-media-secret")
+    monkeypatch.setenv("CADDY_DOMAIN", "api.clipscut.pro")
+
+    signed_url = media_storage.build_worker_clip_url("clip-123", expires_in_seconds=60)
+
+    assert signed_url is not None
+    parsed = urlparse(signed_url)
+    query = parse_qs(parsed.query)
+
+    assert parsed.scheme == "https"
+    assert parsed.netloc == "api.clipscut.pro"
+    assert media_storage.verify_signed_worker_media_request(
+        relative_path=parsed.path,
+        expires=int(query["expires"][0]),
+        signature=query["sig"][0],
+    )
+
+
+def test_signed_worker_clip_url_ignores_local_worker_base_url_in_production(monkeypatch):
+    monkeypatch.setattr(media_storage, "IS_PRODUCTION", True)
+    monkeypatch.setattr(media_storage, "WORKER_PUBLIC_BASE_URL", "http://localhost:8080")
+    monkeypatch.setattr(media_storage, "WORKER_MEDIA_SIGNING_SECRET", "test-media-secret")
+    monkeypatch.setenv("CADDY_DOMAIN", "api.clipscut.pro")
+
+    signed_url = media_storage.build_worker_clip_url("clip-123", expires_in_seconds=60)
+
+    assert signed_url is not None
+    parsed = urlparse(signed_url)
+    assert parsed.netloc == "api.clipscut.pro"
+
+
+def test_signed_worker_clip_url_uses_internal_token_when_media_secret_missing(monkeypatch):
+    monkeypatch.setattr(media_storage, "WORKER_PUBLIC_BASE_URL", "https://api.clipscut.pro")
+    monkeypatch.setattr(media_storage, "WORKER_MEDIA_SIGNING_SECRET", "")
+    monkeypatch.setattr(media_storage, "WORKER_INTERNAL_API_TOKEN", "internal-token")
+
+    signed_url = media_storage.build_worker_clip_url("clip-123", expires_in_seconds=60)
+
+    assert signed_url is not None
+    parsed = urlparse(signed_url)
+    query = parse_qs(parsed.query)
+
+    assert media_storage.verify_signed_worker_media_request(
+        relative_path=parsed.path,
+        expires=int(query["expires"][0]),
+        signature=query["sig"][0],
+    )
+
+
 def test_resolve_generated_clip_path_prefers_existing_local_file(tmp_path, monkeypatch):
     monkeypatch.setattr(media_storage, "LOCAL_MEDIA_ROOT", str(tmp_path / "media"))
 

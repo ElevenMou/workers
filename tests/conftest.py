@@ -10,6 +10,7 @@ os.environ.setdefault(
     "eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaXNzIjoic3VwYWJhc2UiLCJleHAiOjQxMDI0NDQ4MDB9."
     "test-signature",
 )
+os.environ.setdefault("ENVIRONMENT", "development")
 os.environ.setdefault("DISABLE_RATE_LIMITS", "true")
 os.environ.setdefault("RATE_LIMIT_FAIL_OPEN", "true")
 os.environ.setdefault("MEDIA_STORAGE_PROVIDER", "minio")
