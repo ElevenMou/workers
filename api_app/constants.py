@@ -2,6 +2,7 @@
 
 # Use string paths so the API process does not eagerly import heavy worker deps.
 ANALYZE_TASK_PATH = "tasks.analyze_video.analyze_video_task"
+SPLIT_VIDEO_TASK_PATH = "tasks.split_video.split_video_task"
 GENERATE_TASK_PATH = "tasks.generate_clip.generate_clip_task"
 CUSTOM_CLIP_TASK_PATH = "tasks.custom_clip.custom_clip_task"
 PUBLISH_TASK_PATH = "tasks.publishing.publish.publish_clip_task"

@@ -65,6 +65,35 @@ class AnalyzeVideoResponse(BaseModel):
     status: str
 
 
+class BatchSplitVideoRequest(BaseModel):
+    videoId: Optional[str] = Field(
+        default=None,
+        description="Optional existing video id to split into fixed-size parts.",
+    )
+    url: Optional[HttpUrl] = Field(
+        default=None,
+        description="Optional direct source URL when splitting a new video.",
+    )
+    segmentLengthSeconds: Literal[60, 90] = Field(
+        ...,
+        description="Fixed output part length in seconds.",
+    )
+    layoutId: Optional[str] = Field(
+        default=None,
+        description="Optional template/layout id applied to every generated part.",
+    )
+    workspaceTeamId: Optional[str] = Field(
+        default=None,
+        description="Optional workspace team id hint (server resolves active workspace).",
+    )
+
+
+class BatchSplitVideoResponse(BaseModel):
+    jobId: str
+    videoId: str
+    status: str
+
+
 class GenerateClipRequest(BaseModel):
     clipId: str = Field(..., description="Clip id to generate")
     layoutId: Optional[str] = Field(

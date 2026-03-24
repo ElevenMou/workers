@@ -2,14 +2,14 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Sequence
 
 from openai import NotFoundError, OpenAI
 try:
     from openai import LengthFinishReasonError
 except ImportError:  # older SDK versions
     LengthFinishReasonError = None  # type: ignore[assignment,misc]
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +217,35 @@ class ClipAnalysisResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     clips: list[ClipCandidate]
+
+
+class RemovableRangeCandidate(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    kind: Literal["intro", "outro", "ad"] | None = None
+    start_time: float | None = Field(default=None, alias="startTime")
+    end_time: float | None = Field(default=None, alias="endTime")
+    confidence: float | None = None
+    reason: str | None = None
+
+
+class RemovableRangeResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    segments: list[RemovableRangeCandidate] = Field(default_factory=list)
+
+
+class SegmentTitleCandidate(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    index: int | None = None
+    title: str | None = None
+
+
+class SegmentTitleResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    titles: list[SegmentTitleCandidate] = Field(default_factory=list)
 
 
 class AIAnalyzer:
@@ -566,6 +595,7 @@ class AIAnalyzer:
         max_tokens: int,
         system_prompt: str,
         user_message: str,
+        response_format: type[BaseModel] = ClipAnalysisResponse,
         model_candidates: list[str] | None = None,
         configured_model: str | None = None,
     ):
@@ -585,7 +615,7 @@ class AIAnalyzer:
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": user_message},
                             ],
-                            response_format=ClipAnalysisResponse,
+                            response_format=response_format,
                         )
                     except Exception as length_exc:
                         # Handle LengthFinishReasonError: the model hit
@@ -816,8 +846,9 @@ class AIAnalyzer:
                 system_prompt=system_prompt,
                 user_message=user_message,
                 model_candidates=model_candidates,
-                configured_model=configured_model,
-            )
+                        configured_model=configured_model,
+                        response_format=ClipAnalysisResponse,
+                    )
             AIAnalyzer._consecutive_failures = 0
 
             choices = list(getattr(completion, "choices", []) or [])
@@ -908,6 +939,83 @@ class AIAnalyzer:
                     _CIRCUIT_BREAKER_COOLDOWN,
                 )
             logger.exception("OpenAI analyzer call failed: %s", e)
+            raise
+
+    @staticmethod
+    def _extract_list_payload(value: Any, keys: Sequence[str]) -> list[Any] | None:
+        if isinstance(value, list):
+            return value
+        if not isinstance(value, dict):
+            return None
+        for key in keys:
+            child = value.get(key)
+            if isinstance(child, list):
+                return child
+        return None
+
+    def _request_structured_payload(
+        self,
+        *,
+        max_tokens: int,
+        system_prompt: str,
+        user_message: str,
+        response_format: type[BaseModel],
+        model_candidates: list[str] | None = None,
+        configured_model: str | None = None,
+    ) -> Any:
+        if AIAnalyzer._consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD:
+            if time.monotonic() < AIAnalyzer._circuit_open_until:
+                raise RuntimeError(
+                    f"OpenAI API circuit breaker open after {_CIRCUIT_BREAKER_THRESHOLD} "
+                    f"consecutive failures. Cooldown until "
+                    f"{AIAnalyzer._circuit_open_until - time.monotonic():.0f}s remaining."
+                )
+            logger.info("Circuit breaker cooldown expired, attempting probe request")
+            AIAnalyzer._consecutive_failures = 0
+
+        try:
+            completion = self._create_with_model_fallback(
+                max_tokens=max_tokens,
+                system_prompt=system_prompt,
+                user_message=user_message,
+                response_format=response_format,
+                model_candidates=model_candidates,
+                configured_model=configured_model,
+            )
+            AIAnalyzer._consecutive_failures = 0
+
+            choices = list(getattr(completion, "choices", []) or [])
+            if not choices:
+                raise RuntimeError("Analyzer returned no choices")
+
+            message = getattr(choices[0], "message", None)
+            if message is None:
+                raise RuntimeError("Analyzer returned no message")
+
+            refusal = str(getattr(message, "refusal", "") or "").strip()
+            if refusal:
+                raise RuntimeError(f"OpenAI analyzer refusal: {refusal}")
+
+            parsed = self._coerce_parsed_payload(getattr(message, "parsed", None))
+            if parsed is not None:
+                return parsed
+
+            response_text = self._message_text(getattr(message, "content", None))
+            if not response_text:
+                raise RuntimeError("Analyzer returned an empty response")
+            payload, _ = self._extract_json_payload(response_text)
+            return json.loads(payload)
+        except Exception as exc:
+            AIAnalyzer._consecutive_failures += 1
+            if AIAnalyzer._consecutive_failures >= _CIRCUIT_BREAKER_THRESHOLD:
+                AIAnalyzer._circuit_open_until = time.monotonic() + _CIRCUIT_BREAKER_COOLDOWN
+                logger.warning(
+                    "OpenAI API circuit breaker opened after %d consecutive failures. "
+                    "Cooldown: %.0fs",
+                    AIAnalyzer._consecutive_failures,
+                    _CIRCUIT_BREAKER_COOLDOWN,
+                )
+            logger.exception("OpenAI structured request failed: %s", exc)
             raise
 
     def _analyze_snippets(
@@ -1346,3 +1454,143 @@ class AIAnalyzer:
             video_duration=video_duration,
         )
         return list(detailed["clips"])[: max(1, int(num_clips))]
+
+    def find_removable_ranges(
+        self,
+        transcript: dict,
+        *,
+        video_title: str | None = None,
+        video_platform: str | None = None,
+        video_duration: float | None = None,
+    ) -> list[dict[str, Any]]:
+        snippets = self._build_snippets(transcript)
+        if not snippets:
+            return []
+
+        compact_snippets = self._truncate_snippets(
+            snippets,
+            max_chars=min(12000, max(4000, _ANALYZER_CHUNK_MAX_CHARS)),
+        )
+        system_prompt = """\
+You are helping preprocess a long-form video before it is split into fixed-length short parts.
+
+Return ONLY ranges that should be removed because they are:
+- intro
+- outro
+- ad
+
+Rules:
+- Use exact transcript-aligned boundaries only.
+- Keep the main content whenever uncertain.
+- Mark confidence below 0.70 if there is any ambiguity.
+- Ads can appear anywhere in the transcript.
+- Intro/outro ranges should usually be near the start or end of the video unless the transcript clearly indicates a separate promo break.
+
+Return a JSON object with top-level "segments". Each item must include:
+- kind: "intro" | "outro" | "ad"
+- startTime
+- endTime
+- confidence
+- reason
+"""
+        user_message = (
+            f"{self._video_context_section(video_title=video_title, video_platform=video_platform, video_duration=video_duration)}"
+            "Transcript lines are formatted as start|end|text.\n"
+            "Identify only removable intro/outro/ad ranges.\n\n"
+            f"{self._format_transcript_compact(compact_snippets)}"
+        )
+        result = self._request_structured_payload(
+            max_tokens=2048,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            response_format=RemovableRangeResponse,
+        )
+        raw_segments = self._extract_list_payload(result, ("segments", "ranges", "items")) or []
+        normalized: list[dict[str, Any]] = []
+        for item in raw_segments:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "").strip().lower()
+            start = self._as_float(item.get("start_time"))
+            if start is None:
+                start = self._as_float(item.get("startTime"))
+            end = self._as_float(item.get("end_time"))
+            if end is None:
+                end = self._as_float(item.get("endTime"))
+            confidence = self._as_float(item.get("confidence"))
+            if kind not in {"intro", "outro", "ad"} or start is None or end is None:
+                continue
+            if end <= start:
+                continue
+            normalized.append(
+                {
+                    "kind": kind,
+                    "start": float(start),
+                    "end": float(end),
+                    "confidence": max(0.0, min(1.0, float(confidence or 0.0))),
+                    "reason": str(item.get("reason") or "").strip() or None,
+                }
+            )
+        normalized.sort(key=lambda value: (float(value["start"]), float(value["end"])))
+        return normalized
+
+    def generate_segment_titles(
+        self,
+        segments: list[dict[str, Any]],
+        *,
+        language_hint: str | None = None,
+        video_title: str | None = None,
+    ) -> list[str]:
+        if not segments:
+            return []
+
+        lines = [
+            "Generate one short title for each segment.",
+            "Keep titles concise, specific, and natural for short-form video.",
+            "Use the video's language for the title text.",
+            "Do not include numbering, the word Part, or quotation marks.",
+        ]
+        language_text = str(language_hint or "").strip()
+        if language_text:
+            lines.append(f"Preferred language: {language_text}")
+        if video_title:
+            lines.append(f'Source video title: "{video_title}"')
+        lines.append("")
+        for segment in segments:
+            lines.extend(
+                [
+                    f"Segment {int(segment.get('index') or 0)}:",
+                    f"start={float(segment.get('start') or 0.0):.2f}",
+                    f"end={float(segment.get('end') or 0.0):.2f}",
+                    f"summary={str(segment.get('text') or '').strip()}",
+                    "",
+                ]
+            )
+
+        result = self._request_structured_payload(
+            max_tokens=max(1024, min(4096, 256 * len(segments) + 400)),
+            system_prompt=(
+                "You are a concise short-form video titling assistant. "
+                "Return a JSON object with top-level 'titles'."
+            ),
+            user_message="\n".join(lines).strip(),
+            response_format=SegmentTitleResponse,
+            model_candidates=self.synthesis_model_candidates,
+            configured_model=self.synthesis_configured_model,
+        )
+        raw_titles = self._extract_list_payload(result, ("titles", "items", "segments")) or []
+        titles_by_index: dict[int, str] = {}
+        for item in raw_titles:
+            if not isinstance(item, dict):
+                continue
+            index = self._as_int(item.get("index"))
+            title = str(item.get("title") or "").strip()
+            if index is None or index <= 0 or not title:
+                continue
+            titles_by_index[index] = title
+
+        ordered: list[str] = []
+        for fallback_index, segment in enumerate(segments, start=1):
+            requested_index = self._as_int(segment.get("index")) or fallback_index
+            ordered.append(titles_by_index.get(requested_index, ""))
+        return ordered

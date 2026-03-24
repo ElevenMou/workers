@@ -51,6 +51,33 @@ class GenerateClipJob(TypedDict):
     qualityPolicyProfile: NotRequired[str]
 
 
+class SplitVideoJob(TypedDict):
+    jobId: str
+    videoId: str
+    userId: str
+    segmentLengthSeconds: int
+    url: NotRequired[str | None]
+    layoutId: NotRequired[str | None]
+    expectedPartCount: NotRequired[int]
+    expectedGenerationCredits: NotRequired[int]
+    maxParts: NotRequired[int]
+    clipRetentionDays: NotRequired[int | None]
+    workspaceTeamId: NotRequired[str | None]
+    billingOwnerUserId: NotRequired[str | None]
+    chargeSource: NotRequired[str]
+    workspaceRole: NotRequired[str]
+    subscriptionTier: NotRequired[str]
+    priorityProcessing: NotRequired[bool]
+    sourceTitle: NotRequired[str | None]
+    sourceThumbnailUrl: NotRequired[str | None]
+    sourcePlatform: NotRequired[str | None]
+    sourceExternalId: NotRequired[str | None]
+    sourceDetectedLanguage: NotRequired[str | None]
+    sourceHasCaptions: NotRequired[bool | None]
+    sourceHasAudio: NotRequired[bool | None]
+    sourceDurationSeconds: NotRequired[int]
+
+
 class CustomClipJob(TypedDict):
     jobId: str
     videoId: str

@@ -492,11 +492,25 @@ def generate_clip_task(job_data: GenerateClipJob):
                 detail_key="downloading_source_video",
             )
 
+        source_video_storage_override = (
+            str(clip.get("source_video_storage_path_override") or "").strip() or None
+        )
+        effective_source_profile = (
+            f"{source_profile}_override"
+            if source_video_storage_override
+            else source_profile
+        )
         source_resolution = resolve_source_video(
             video_id=clip["video_id"],
             source_url=clip["videos"].get("url"),
-            initial_raw_video_path=clip["videos"].get("raw_video_path"),
-            initial_raw_video_storage_path=clip["videos"].get("raw_video_storage_path"),
+            initial_raw_video_path=(
+                None
+                if source_video_storage_override
+                else clip["videos"].get("raw_video_path")
+            ),
+            initial_raw_video_storage_path=(
+                source_video_storage_override or clip["videos"].get("raw_video_storage_path")
+            ),
             downloader=source_downloader,
             load_video_row=_load_video_source_row,
             persist_raw_video_path=_persist_video_raw_path,
@@ -504,7 +518,7 @@ def generate_clip_task(job_data: GenerateClipJob):
             logger=logger,
             job_id=job_id,
             source_max_height=quality_controls.effective_source_max_height,
-            source_profile=source_profile,
+            source_profile=effective_source_profile,
             prefer_fresh_download=quality_controls.prefer_fresh_source_download,
             on_wait_for_download=_emit_waiting_for_source,
             on_download_start=_emit_downloading_source,

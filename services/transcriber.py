@@ -1,9 +1,9 @@
+import importlib
 import logging
 import os
 import threading
 import time
 
-import whisper
 from config import WHISPER_MODEL
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,20 @@ _CHECKSUM_MISMATCH_MARKERS = (
     "sha256 checksum does not not match",
     "sha256 checksum does not match",
 )
+_whisper_module = None
+
+
+def _get_whisper_module():
+    global _whisper_module
+    if _whisper_module is not None:
+        return _whisper_module
+
+    try:
+        _whisper_module = importlib.import_module("whisper")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Whisper is not installed in this environment.") from exc
+
+    return _whisper_module
 
 
 def _resolve_model_name(model_name: str | None = None) -> str:
@@ -48,7 +62,8 @@ def _whisper_cache_dir() -> str:
 
 
 def _whisper_model_cache_path(model_name: str) -> str | None:
-    model_url = getattr(whisper, "_MODELS", {}).get(model_name)
+    whisper_module = _get_whisper_module()
+    model_url = getattr(whisper_module, "_MODELS", {}).get(model_name)
     if not model_url:
         return None
     return os.path.join(_whisper_cache_dir(), os.path.basename(str(model_url)))
@@ -156,11 +171,12 @@ class _InterProcessFileLock:
 
 
 def _load_model_with_repair(model_name: str):
+    whisper_module = _get_whisper_module()
     download_root = _whisper_cache_dir()
     os.makedirs(download_root, exist_ok=True)
     for attempt in range(2):
         try:
-            return whisper.load_model(model_name, download_root=download_root)
+            return whisper_module.load_model(model_name, download_root=download_root)
         except RuntimeError as exc:
             if attempt >= 1 or not _is_checksum_mismatch_error(exc):
                 raise

@@ -193,7 +193,7 @@ def admission_group_for_queue(queue_name: str) -> str | None:
 
 def admission_group_for_job_type(job_type: str | None) -> str | None:
     normalized = str(job_type or "").strip().lower()
-    if normalized == "analyze_video":
+    if normalized in {"analyze_video", "split_video"}:
         return "video"
     if normalized in {"generate_clip", "custom_clip"}:
         return "clip"

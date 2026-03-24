@@ -87,6 +87,10 @@ def _active_job_deduplication_key(row: dict) -> tuple[str, str] | None:
         video_id = str(row.get("video_id") or "").strip()
         if video_id:
             return ("analyze_video", video_id)
+    if job_type == "split_video":
+        video_id = str(row.get("video_id") or "").strip()
+        if video_id:
+            return ("split_video", video_id)
     if job_type == "generate_clip":
         clip_id = str(row.get("clip_id") or "").strip()
         if clip_id:

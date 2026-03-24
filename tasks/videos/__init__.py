@@ -9,6 +9,7 @@ from typing import Any
 
 __all__ = [
     "analyze_video_task",
+    "split_video_task",
     "cleanup_expired_raw_videos",
     "shift_transcript_timestamps",
     "transcript_has_word_timing",
@@ -19,6 +20,8 @@ __all__ = [
 def __getattr__(name: str) -> Any:
     if name == "analyze_video_task":
         return import_module("tasks.videos.analyze").analyze_video_task
+    if name == "split_video_task":
+        return import_module("tasks.videos.split_video").split_video_task
     if name == "cleanup_expired_raw_videos":
         return import_module("tasks.videos.cleanup").cleanup_expired_raw_videos
     if name in {

@@ -151,3 +151,28 @@ def test_count_logical_active_jobs_dedupes_superseded_analyze_rows():
     ]
 
     assert access_rules._count_logical_active_jobs(rows, max_rows=5) == 2
+
+
+def test_count_logical_active_jobs_dedupes_split_video_rows():
+    rows = [
+        {
+            "id": "job-new",
+            "type": "split_video",
+            "video_id": "video-1",
+            "clip_id": None,
+        },
+        {
+            "id": "job-old",
+            "type": "split_video",
+            "video_id": "video-1",
+            "clip_id": None,
+        },
+        {
+            "id": "job-other",
+            "type": "split_video",
+            "video_id": "video-2",
+            "clip_id": None,
+        },
+    ]
+
+    assert access_rules._count_logical_active_jobs(rows, max_rows=5) == 2

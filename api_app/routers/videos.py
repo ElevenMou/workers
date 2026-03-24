@@ -12,6 +12,7 @@ from api_app.auth import get_user_rate_key
 from api_app.access_rules import (
     UserAccessContext,
     enforce_analysis_duration_limit,
+    enforce_custom_clip_access,
     enforce_monthly_video_limit,
     enforce_processing_access_rules,
     get_user_access_context,
@@ -19,17 +20,20 @@ from api_app.access_rules import (
 )
 from api_app.auth import AuthenticatedUser, get_current_user
 
-from api_app.constants import ANALYZE_TASK_PATH
+from api_app.constants import ANALYZE_TASK_PATH, SPLIT_VIDEO_TASK_PATH
 from api_app.helpers import enqueue_or_fail, raise_on_error
 from api_app.models import (
     AnalyzeVideoRequest,
     AnalyzeVideoResponse,
+    BatchSplitVideoRequest,
+    BatchSplitVideoResponse,
     CreditsCostByUrlRequest,
     CreditsCostByUrlResponse,
 )
 from api_app.rate_limit import limiter
 from api_app.state import logger, whisper_ready
 from config import (
+    calculate_custom_clip_generation_cost,
     calculate_video_analysis_cost,
 )
 from services.video_downloader import VideoDownloader
@@ -257,6 +261,37 @@ def _max_clip_count_for_duration(
     seconds = max(int(duration_seconds), 0)
     clip_max = max(_ANALYZE_CLIP_MIN_SECONDS, int(selected_clip_max_seconds))
     return min(20, max(1, seconds // clip_max))
+
+
+def _load_workspace_video(
+    *,
+    video_id: str,
+    access_context: UserAccessContext,
+    actor_user_id: str,
+) -> dict | None:
+    response = (
+        supabase.table("videos")
+        .select(
+            "id,user_id,team_id,url,title,duration_seconds,thumbnail_url,platform,external_id,"
+            "raw_video_path,raw_video_storage_path,transcript,status"
+        )
+        .eq("id", video_id)
+        .limit(1)
+        .execute()
+    )
+    raise_on_error(response, "Failed to load video")
+    rows = response.data or []
+    if not rows:
+        return None
+
+    video = rows[0]
+    if access_context.workspace_team_id:
+        if video.get("team_id") != access_context.workspace_team_id:
+            return None
+    else:
+        if video.get("team_id") or video.get("user_id") != actor_user_id:
+            return None
+    return video
 
 
 def _raise_if_insufficient_credits(
@@ -568,6 +603,294 @@ async def analyze_video(
     )
 
     return AnalyzeVideoResponse(jobId=job_id, videoId=video_id, status="queued")
+
+
+@router.post("/videos/batch-split", response_model=BatchSplitVideoResponse)
+@limiter.limit("10/minute")
+@limiter.limit("5/minute", key_func=get_user_rate_key)
+async def batch_split_video(
+    request: Request,
+    payload: BatchSplitVideoRequest = Body(...),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> BatchSplitVideoResponse:
+    """Queue a fixed-window batch split job for a direct URL or existing video."""
+    user_id = current_user.id
+    access_context = enforce_processing_access_rules(user_id, supabase_client=supabase)
+    enforce_custom_clip_access(context=access_context)
+
+    if bool(payload.videoId) == bool(payload.url):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide exactly one of videoId or url.",
+        )
+
+    segment_length_seconds = int(payload.segmentLengthSeconds)
+    if segment_length_seconds > int(access_context.max_clip_duration_seconds):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Selected segment length is outside your plan limits. "
+                f"Allowed maximum: {int(access_context.max_clip_duration_seconds)} seconds."
+            ),
+        )
+
+    video_row: dict | None = None
+    created_video_for_request = False
+    source_probe: dict | None = None
+    if payload.videoId:
+        video_row = _load_workspace_video(
+            video_id=str(payload.videoId),
+            access_context=access_context,
+            actor_user_id=user_id,
+        )
+        if video_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Video not found in the active workspace.",
+            )
+        video_id = str(video_row["id"])
+        source_url = str(video_row.get("url") or "").strip()
+        if not source_url:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This video no longer has a valid source URL.",
+            )
+    else:
+        source_url = str(payload.url)
+        existing_query = supabase.table("videos").select("id").eq("url", source_url)
+        if access_context.workspace_team_id:
+            existing_query = existing_query.eq("team_id", access_context.workspace_team_id)
+        else:
+            existing_query = existing_query.eq("user_id", user_id).is_("team_id", "null")
+        existing_response = existing_query.limit(1).execute()
+        raise_on_error(existing_response, "Failed to query existing split-video source")
+        existing_rows = existing_response.data or []
+        if existing_rows:
+            video_id = str(existing_rows[0]["id"])
+            video_row = _load_workspace_video(
+                video_id=video_id,
+                access_context=access_context,
+                actor_user_id=user_id,
+            )
+        else:
+            enforce_monthly_video_limit(user_id, supabase_client=supabase)
+            video_id = str(uuid4())
+            created_video_for_request = True
+
+        try:
+            source_probe = await asyncio.wait_for(
+                asyncio.to_thread(_probe_credit_cost_for_url, source_url),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Video URL probe timed out. Please try again.",
+            )
+        if not source_probe["valid_url"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Video URL cannot be split. Ensure it is downloadable and has "
+                    "captions (or audio for transcription)."
+                ),
+            )
+
+    active_job_query = (
+        supabase.table("jobs")
+        .select("id,status")
+        .eq("video_id", video_id)
+        .eq("type", "split_video")
+        .in_("status", list(_ACTIVE_ANALYZE_JOB_STATUSES))
+    )
+    if access_context.workspace_team_id:
+        active_job_query = active_job_query.eq("team_id", access_context.workspace_team_id)
+    else:
+        active_job_query = active_job_query.eq("user_id", user_id).is_("team_id", "null")
+    active_job_response = (
+        active_job_query
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    raise_on_error(active_job_response, "Failed to check active split-video job")
+    active_job_rows = active_job_response.data or []
+    if active_job_rows:
+        active_job = active_job_rows[0]
+        return BatchSplitVideoResponse(
+            jobId=str(active_job["id"]),
+            videoId=video_id,
+            status=str(active_job.get("status") or "queued"),
+        )
+
+    if video_row and (
+        not int(video_row.get("duration_seconds") or 0)
+        or not str(video_row.get("platform") or "").strip()
+    ):
+        try:
+            source_probe = await asyncio.wait_for(
+                asyncio.to_thread(_probe_credit_cost_for_url, source_url),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Video URL probe timed out. Please try again.",
+            )
+        if source_probe and not source_probe["valid_url"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This video source is no longer valid for processing.",
+            )
+
+    source_duration_seconds = int(
+        (source_probe or {}).get("duration_seconds")
+        or (video_row or {}).get("duration_seconds")
+        or 0
+    )
+    if source_duration_seconds <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Could not determine the source video duration for batch split.",
+        )
+
+    estimated_part_count = min(
+        20,
+        max(1, int(ceil(source_duration_seconds / max(1, segment_length_seconds)))),
+    )
+    expected_generation_credits = int(
+        estimated_part_count
+        * calculate_custom_clip_generation_cost(False, access_context.tier)
+    )
+    _raise_if_insufficient_credits(
+        context=access_context,
+        actor_user_id=user_id,
+        required_credits=expected_generation_credits,
+    )
+
+    billing_owner_user_id = access_context.billing_owner_user_id or user_id
+    source_title = (
+        str((source_probe or {}).get("video_title") or "").strip()
+        or str((video_row or {}).get("title") or "").strip()
+        or None
+    )
+    source_thumbnail_url = (
+        str((source_probe or {}).get("thumbnail_url") or "").strip()
+        or str((video_row or {}).get("thumbnail_url") or "").strip()
+        or None
+    )
+    source_platform = (
+        str((source_probe or {}).get("platform") or "").strip().lower()
+        or str((video_row or {}).get("platform") or "").strip().lower()
+        or None
+    )
+    source_external_id = (
+        str((source_probe or {}).get("external_id") or "").strip()
+        or str((video_row or {}).get("external_id") or "").strip()
+        or None
+    )
+    source_detected_language = (
+        str((source_probe or {}).get("detected_language") or "").strip() or None
+    )
+    source_has_audio = (
+        source_probe.get("has_audio") if source_probe is not None else None
+    )
+    source_has_captions = (
+        source_probe.get("has_captions") if source_probe is not None else None
+    )
+
+    video_upsert_payload = {
+        "id": video_id,
+        "user_id": user_id,
+        "team_id": access_context.workspace_team_id,
+        "billing_owner_user_id": billing_owner_user_id,
+        "url": source_url,
+        "status": (
+            "pending"
+            if created_video_for_request
+            else str((video_row or {}).get("status") or "pending")
+        ),
+    }
+    if source_title:
+        video_upsert_payload["title"] = source_title
+    if source_thumbnail_url:
+        video_upsert_payload["thumbnail_url"] = source_thumbnail_url
+    if source_platform:
+        video_upsert_payload["platform"] = source_platform
+    if source_external_id:
+        video_upsert_payload["external_id"] = source_external_id
+    if source_duration_seconds > 0:
+        video_upsert_payload["duration_seconds"] = source_duration_seconds
+
+    video_response = (
+        supabase.table("videos")
+        .upsert(video_upsert_payload, on_conflict="id")
+        .execute()
+    )
+    raise_on_error(video_response, "Failed to upsert split-video source")
+
+    job_id = str(uuid4())
+    job_data = {
+        "jobId": job_id,
+        "videoId": video_id,
+        "userId": user_id,
+        "url": source_url,
+        "layoutId": payload.layoutId,
+        "segmentLengthSeconds": segment_length_seconds,
+        "expectedPartCount": estimated_part_count,
+        "expectedGenerationCredits": expected_generation_credits,
+        "maxParts": 20,
+        "clipRetentionDays": access_context.clip_retention_days,
+        "workspaceTeamId": access_context.workspace_team_id,
+        "billingOwnerUserId": billing_owner_user_id,
+        "chargeSource": access_context.charge_source,
+        "workspaceRole": access_context.workspace_role,
+        "subscriptionTier": access_context.tier,
+        "priorityProcessing": access_context.priority_processing,
+        "sourceTitle": source_title,
+        "sourceThumbnailUrl": source_thumbnail_url,
+        "sourcePlatform": source_platform,
+        "sourceExternalId": source_external_id,
+        "sourceDetectedLanguage": source_detected_language,
+        "sourceHasCaptions": source_has_captions,
+        "sourceHasAudio": source_has_audio,
+        "sourceDurationSeconds": source_duration_seconds,
+    }
+    job_response = (
+        supabase.table("jobs")
+        .upsert(
+            {
+                "id": job_id,
+                "user_id": user_id,
+                "team_id": access_context.workspace_team_id,
+                "billing_owner_user_id": billing_owner_user_id,
+                "video_id": video_id,
+                "type": "split_video",
+                "status": "queued",
+                "input_data": job_data,
+            },
+            on_conflict="id",
+        )
+        .execute()
+    )
+    raise_on_error(job_response, "Failed to upsert split-video job")
+
+    def _cleanup_split_queue_full() -> None:
+        if created_video_for_request:
+            _best_effort_delete_video(video_id)
+
+    enqueue_or_fail(
+        queue_name=_video_queue_for_context(access_context),
+        task_path=SPLIT_VIDEO_TASK_PATH,
+        job_data=job_data,
+        job_id=job_id,
+        user_id=user_id,
+        job_type="split_video",
+        video_id=video_id,
+        on_queue_full_cleanup=_cleanup_split_queue_full,
+    )
+
+    return BatchSplitVideoResponse(jobId=job_id, videoId=video_id, status="queued")
 
 
 @router.post("/credits/cost", response_model=CreditsCostByUrlResponse)
