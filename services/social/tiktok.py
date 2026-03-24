@@ -229,7 +229,10 @@ def _plan_file_upload(file_size: int) -> tuple[int, int]:
         return file_size, 1
 
     chunk_size = _DEFAULT_UPLOAD_CHUNK_BYTES
-    total_chunk_count = math.ceil(file_size / chunk_size)
+    # TikTok expects total_chunk_count to be video_size / chunk_size rounded down.
+    # Any trailing bytes are absorbed into the final chunk, which may be larger
+    # than chunk_size (up to 128 MB).
+    total_chunk_count = file_size // chunk_size
 
     if total_chunk_count > _MAX_UPLOAD_CHUNKS:
         chunk_size = max(_MIN_UPLOAD_CHUNK_BYTES, math.ceil(file_size / _MAX_UPLOAD_CHUNKS))
@@ -239,7 +242,7 @@ def _plan_file_upload(file_size: int) -> tuple[int, int]:
                 code="tiktok_file_too_large",
                 provider_payload={"file_size": file_size},
             )
-        total_chunk_count = math.ceil(file_size / chunk_size)
+        total_chunk_count = file_size // chunk_size
 
     if total_chunk_count < 1:
         total_chunk_count = 1
