@@ -8,6 +8,7 @@ import shutil
 import socket
 import time
 from glob import glob
+from pathlib import Path
 from urllib.parse import urlparse
 
 import ffmpeg as ffmpeg_lib
@@ -93,6 +94,17 @@ _YOUTUBE_BOT_CHECK_MESSAGES = (
     "sign in to confirm you’re not a bot",
     "sign in to confirm you’re not a bot",
 )
+
+
+_YOUTUBE_MEDIA_DOWNLOAD_BLOCK_MESSAGES = (
+    "http error 403",
+    "unable to download video data",
+    "requires a gvs po token",
+    "po token",
+    "requested format is not available",
+)
+_LOGGED_COOKIE_SOURCE_WARNINGS: set[str] = set()
+_INCOMPLETE_DOWNLOAD_SUFFIXES = {".part", ".ytdl", ".temp", ".tmp"}
 
 
 _SUPPORTED_SUBTITLE_EXTENSIONS = ("json3", "vtt", "srt")
@@ -284,6 +296,12 @@ class VideoProbeError(RuntimeError):
         self.failure_reason = reason
 
 
+class VideoDownloadError(RuntimeError):
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.failure_reason = reason
+
+
 def classify_yt_dlp_error(exc: Exception) -> str:
     message = str(exc).strip().lower()
     if "read-only file system" in message and "cookie" in message:
@@ -340,9 +358,26 @@ class VideoDownloader:
     def __init__(self, work_dir: str | None = None):
         self.temp_dir = work_dir or TEMP_DIR
         os.makedirs(self.temp_dir, exist_ok=True)
+        self._warn_if_configured_cookie_source_unreadable()
 
     def _default_runtime_cookiefile(self) -> str:
         return os.path.join(self.temp_dir, "yt-dlp", "cookies.txt")
+
+    @staticmethod
+    def _warn_cookie_source_unreadable_once(path: str) -> None:
+        normalized = os.path.abspath(path)
+        if normalized in _LOGGED_COOKIE_SOURCE_WARNINGS:
+            return
+        _LOGGED_COOKIE_SOURCE_WARNINGS.add(normalized)
+        logger.warning(
+            "yt-dlp cookie source is configured but not readable: %s; continuing without cookies",
+            path,
+        )
+
+    def _warn_if_configured_cookie_source_unreadable(self) -> None:
+        source_cookie_path = YTDLP_COOKIES_SOURCE_FILE
+        if source_cookie_path and not self._is_readable_cookie_path(source_cookie_path):
+            self._warn_cookie_source_unreadable_once(source_cookie_path)
 
     @staticmethod
     def _is_readable_cookie_path(path: str | None) -> bool:
@@ -405,10 +440,7 @@ class VideoDownloader:
 
         if source_cookie_path:
             if not self._is_readable_cookie_path(source_cookie_path):
-                logger.warning(
-                    "yt-dlp cookie source is not readable: %s; continuing without cookies",
-                    source_cookie_path,
-                )
+                self._warn_cookie_source_unreadable_once(source_cookie_path)
                 return None
 
             runtime_target = self._prepare_runtime_cookie_target(
@@ -508,11 +540,11 @@ class VideoDownloader:
             # Prefer the highest-quality source first and fall back to
             # compatibility-oriented selectors only if needed.
             "format": self._format_selector_for_max_height(max_height),
-            "max_filesize": MAX_VIDEO_SIZE_MB * 1024 * 1024,
             "merge_output_format": "mkv",
             "noplaylist": True,
             # Let yt-dlp use its built-in default User-Agent (keeps Chrome
             # version current and avoids stale-UA bot detection).
+            "js_runtimes": {"node": {}},
             "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
             "retries": YTDLP_DOWNLOAD_RETRIES,
             "fragment_retries": YTDLP_FRAGMENT_RETRIES,
@@ -594,15 +626,26 @@ class VideoDownloader:
         return "video" in stream_types and "audio" in stream_types
 
     @staticmethod
-    def _resolve_output_path(expected_path: str) -> str:
+    def _is_incomplete_download_artifact(path: str) -> bool:
+        suffixes = {suffix.lower() for suffix in Path(str(path)).suffixes}
+        return bool(suffixes & _INCOMPLETE_DOWNLOAD_SUFFIXES)
+
+    @staticmethod
+    def _resolve_output_path(expected_path: str, *, require_video: bool = False) -> str:
         base, _ = os.path.splitext(expected_path)
         candidate_pool: list[str] = []
-        if os.path.isfile(expected_path):
+        if os.path.isfile(expected_path) and not VideoDownloader._is_incomplete_download_artifact(
+            expected_path
+        ):
             candidate_pool.append(expected_path)
         candidate_pool.extend(
             path
             for path in glob(f"{base}.*")
-            if os.path.isfile(path) and path not in candidate_pool
+            if (
+                os.path.isfile(path)
+                and path not in candidate_pool
+                and not VideoDownloader._is_incomplete_download_artifact(path)
+            )
         )
         candidates = candidate_pool
         if not candidates:
@@ -617,12 +660,60 @@ class VideoDownloader:
         video_candidates = [path for path in candidates if VideoDownloader._has_video_stream(path)]
         if video_candidates:
             return max(video_candidates, key=os.path.getmtime)
+        if require_video:
+            return expected_path
         return max(candidates, key=os.path.getmtime)
 
     @staticmethod
     def _is_youtube_url(url: str) -> bool:
         hostname = (urlparse(url).hostname or "").strip().lower()
         return hostname in _YOUTUBE_DOMAINS
+
+    @staticmethod
+    def _has_cookie_configuration() -> bool:
+        return bool(YTDLP_COOKIES_SOURCE_FILE) or VideoDownloader._is_readable_cookie_path(
+            YTDLP_COOKIES_FILE
+        )
+
+    @staticmethod
+    def _has_proxy_configuration() -> bool:
+        return bool(_build_proxy_list())
+
+    @staticmethod
+    def _youtube_direct_public_overrides() -> dict[str, object]:
+        return {
+            "cookiefile": None,
+            "proxy": None,
+        }
+
+    @staticmethod
+    def _merge_ydl_overrides(*overrides: dict[str, object] | None) -> dict[str, object] | None:
+        merged: dict[str, object] = {}
+        for override in overrides:
+            if not override:
+                continue
+            for key, value in override.items():
+                if (
+                    key == "extractor_args"
+                    and isinstance(value, dict)
+                    and isinstance(merged.get(key), dict)
+                ):
+                    merged_extractor_args = dict(merged[key])
+                    for extractor_name, extractor_value in value.items():
+                        if (
+                            isinstance(extractor_value, dict)
+                            and isinstance(merged_extractor_args.get(extractor_name), dict)
+                        ):
+                            merged_extractor_args[extractor_name] = {
+                                **merged_extractor_args[extractor_name],
+                                **extractor_value,
+                            }
+                        else:
+                            merged_extractor_args[extractor_name] = extractor_value
+                    merged[key] = merged_extractor_args
+                else:
+                    merged[key] = value
+        return merged or None
 
     def _download_with_opts(
         self,
@@ -645,6 +736,8 @@ class VideoDownloader:
         )
         if ydl_overrides:
             ydl_opts.update(ydl_overrides)
+        if ydl_opts.get("cookiefile") is None:
+            ydl_opts.pop("cookiefile", None)
         started_at = time.monotonic()
         video_hint = os.path.splitext(os.path.basename(output_path))[0]
         logger.info(
@@ -657,15 +750,21 @@ class VideoDownloader:
             ydl_opts.get("extractor_retries"),
             bool(ydl_opts.get("proxy")),
         )
-        proxies = _build_proxy_list()
         last_exc: Exception | None = None
-        # Try with current proxy, then rotate on bot-check failures.
-        attempts = [ydl_opts.get("proxy")] + [
-            p for p in proxies if p != ydl_opts.get("proxy")
-        ]
+        explicit_proxy_override = bool(ydl_overrides and "proxy" in ydl_overrides)
+        if explicit_proxy_override:
+            attempts = [ydl_opts.get("proxy")]
+        else:
+            proxies = _build_proxy_list()
+            # Try with current proxy, then rotate on bot-check failures.
+            attempts = [ydl_opts.get("proxy")] + [
+                p for p in proxies if p != ydl_opts.get("proxy")
+            ]
         for attempt_idx, proxy in enumerate(attempts):
             if proxy:
                 ydl_opts["proxy"] = proxy
+            else:
+                ydl_opts.pop("proxy", None)
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -695,6 +794,25 @@ class VideoDownloader:
         raise last_exc
 
     @staticmethod
+    def _friendly_youtube_download_error(exc: Exception) -> VideoDownloadError:
+        message = str(exc).strip()
+        normalized_message = message.lower()
+        reason = classify_yt_dlp_error(exc)
+        if (
+            reason in {"youtube_bot_check", "youtube_auth_required"}
+            or any(token in normalized_message for token in _YOUTUBE_MEDIA_DOWNLOAD_BLOCK_MESSAGES)
+        ):
+            return VideoDownloadError(
+                "youtube_media_download_blocked",
+                "YouTube media download blocked; refresh mounted cookies and retry. "
+                f"yt-dlp reported: {message}",
+            )
+        return VideoDownloadError(
+            "youtube_download_failed",
+            f"YouTube media download failed: {message}",
+        )
+
+    @staticmethod
     def _check_disk_space(target_dir: str) -> None:
         try:
             usage = shutil.disk_usage(target_dir)
@@ -709,6 +827,86 @@ class VideoDownloader:
         except Exception as exc:
             logger.warning("Could not check disk space for %s: %s", target_dir, exc)
 
+    def _download_youtube_with_fallbacks(
+        self,
+        url: str,
+        output_path: str,
+        *,
+        format_selector: str,
+        attempt_label: str,
+        direct_public_label: str,
+        legacy_label: str,
+        video_id: str,
+        max_height: int | None = 1080,
+        ydl_overrides: dict[str, object] | None = None,
+    ) -> dict:
+        legacy_client_overrides = {
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["tv_downgraded", "web_safari", "web"]
+                }
+            }
+        }
+        try:
+            return self._download_with_opts(
+                url,
+                output_path,
+                format_selector=format_selector,
+                attempt_label=attempt_label,
+                max_height=max_height,
+                ydl_overrides=ydl_overrides,
+            )
+        except yt_dlp.utils.DownloadError as exc:
+            direct_public_allowed = (
+                self._has_cookie_configuration() or self._has_proxy_configuration()
+            )
+            if direct_public_allowed:
+                logger.warning(
+                    "yt-dlp download failed (%s) for %s; retrying with direct public YouTube access: %s",
+                    attempt_label,
+                    video_id,
+                    exc,
+                )
+                try:
+                    return self._download_with_opts(
+                        url,
+                        output_path,
+                        format_selector=format_selector,
+                        attempt_label=direct_public_label,
+                        max_height=max_height,
+                        ydl_overrides=self._merge_ydl_overrides(
+                            ydl_overrides,
+                            self._youtube_direct_public_overrides(),
+                        ),
+                    )
+                except yt_dlp.utils.DownloadError as direct_exc:
+                    logger.warning(
+                        "yt-dlp direct-public YouTube download failed for %s; retrying with legacy YouTube clients: %s",
+                        video_id,
+                        direct_exc,
+                    )
+            else:
+                logger.warning(
+                    "yt-dlp download failed (%s) for %s; retrying with legacy YouTube clients: %s",
+                    attempt_label,
+                    video_id,
+                    exc,
+                )
+            try:
+                return self._download_with_opts(
+                    url,
+                    output_path,
+                    format_selector=format_selector,
+                    attempt_label=legacy_label,
+                    max_height=max_height,
+                    ydl_overrides=self._merge_ydl_overrides(
+                        ydl_overrides,
+                        legacy_client_overrides,
+                    ),
+                )
+            except yt_dlp.utils.DownloadError as final_exc:
+                raise self._friendly_youtube_download_error(final_exc) from final_exc
+
     def download(self, url: str, video_id: str, *, max_height: int | None = 1080) -> dict:
         """Download video and return metadata."""
         _validate_url(url)
@@ -719,10 +917,18 @@ class VideoDownloader:
         compatibility_selector = self._compatibility_selector_for_max_height(
             normalized_max_height
         )
-        legacy_client_overrides = {
-            "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}
-        }
-        try:
+        if self._is_youtube_url(url):
+            info = self._download_youtube_with_fallbacks(
+                url,
+                output_path,
+                format_selector=primary_selector,
+                attempt_label="best_source_default",
+                direct_public_label="best_source_direct_public",
+                legacy_label="best_source_legacy_clients",
+                video_id=video_id,
+                max_height=normalized_max_height,
+            )
+        else:
             info = self._download_with_opts(
                 url,
                 output_path,
@@ -730,23 +936,7 @@ class VideoDownloader:
                 attempt_label="best_source_default",
                 max_height=normalized_max_height,
             )
-        except yt_dlp.utils.DownloadError as exc:
-            if not self._is_youtube_url(url):
-                raise
-            logger.warning(
-                "yt-dlp best-source download failed for %s; retrying with legacy YouTube clients: %s",
-                video_id,
-                exc,
-            )
-            info = self._download_with_opts(
-                url,
-                output_path,
-                format_selector=primary_selector,
-                attempt_label="best_source_legacy_clients",
-                max_height=normalized_max_height,
-                ydl_overrides=legacy_client_overrides,
-            )
-        downloaded_path = self._resolve_output_path(output_path)
+        downloaded_path = self._resolve_output_path(output_path, require_video=True)
 
         if not self._has_audio_stream(downloaded_path):
             logger.warning(
@@ -758,14 +948,31 @@ class VideoDownloader:
             except OSError:
                 pass
 
-            info = self._download_with_opts(
-                url,
-                output_path,
-                format_selector=compatibility_selector,
-                attempt_label="compatibility_fallback",
-                max_height=normalized_max_height,
-            )
-            downloaded_path = self._resolve_output_path(output_path)
+            try:
+                if self._is_youtube_url(url):
+                    info = self._download_youtube_with_fallbacks(
+                        url,
+                        output_path,
+                        format_selector=compatibility_selector,
+                        attempt_label="compatibility_fallback",
+                        direct_public_label="compatibility_direct_public",
+                        legacy_label="compatibility_legacy_clients",
+                        video_id=video_id,
+                        max_height=normalized_max_height,
+                    )
+                else:
+                    info = self._download_with_opts(
+                        url,
+                        output_path,
+                        format_selector=compatibility_selector,
+                        attempt_label="compatibility_fallback",
+                        max_height=normalized_max_height,
+                    )
+            except yt_dlp.utils.DownloadError as exc:
+                if self._is_youtube_url(url):
+                    raise self._friendly_youtube_download_error(exc) from exc
+                raise
+            downloaded_path = self._resolve_output_path(output_path, require_video=True)
 
         if not self._has_audio_stream(downloaded_path):
             logger.warning("Downloaded media for %s still has no audio stream", video_id)
@@ -784,44 +991,35 @@ class VideoDownloader:
         """Download source audio without fetching the full video stream."""
         _validate_url(url)
         output_template = os.path.join(self.temp_dir, f"{video_id}.audio.%(ext)s")
-        legacy_client_overrides = {
-            "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}
-        }
-
-        try:
-            info = self._download_with_opts(
+        audio_selector = (
+            "bestaudio[acodec!=none]/"
+            "bestaudio/"
+            "b[acodec!=none]"
+        )
+        if self._is_youtube_url(url):
+            info = self._download_youtube_with_fallbacks(
                 url,
                 output_template,
-                format_selector=(
-                    "bestaudio[acodec!=none]/"
-                    "bestaudio/"
-                    "b[acodec!=none]"
-                ),
+                format_selector=audio_selector,
                 attempt_label="audio_only_default",
+                direct_public_label="audio_only_direct_public",
+                legacy_label="audio_only_legacy_clients",
+                video_id=video_id,
                 max_height=None,
                 ydl_overrides={
                     "noplaylist": True,
                 },
             )
-        except yt_dlp.utils.DownloadError as exc:
-            if not self._is_youtube_url(url):
-                raise
-            logger.warning(
-                "yt-dlp default-client audio download failed for %s; retrying with legacy YouTube clients: %s",
-                video_id,
-                exc,
-            )
+        else:
             info = self._download_with_opts(
                 url,
                 output_template,
-                format_selector=(
-                    "bestaudio[acodec!=none]/"
-                    "bestaudio/"
-                    "b[acodec!=none]"
-                ),
-                attempt_label="audio_only_legacy_clients",
+                format_selector=audio_selector,
+                attempt_label="audio_only_default",
                 max_height=None,
-                ydl_overrides=legacy_client_overrides,
+                ydl_overrides={
+                    "noplaylist": True,
+                },
             )
 
         downloaded_path = self._resolve_output_path(output_template)

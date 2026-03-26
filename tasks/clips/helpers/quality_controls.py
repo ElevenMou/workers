@@ -45,9 +45,12 @@ def resolve_quality_controls(
     normalized_policy_height = _normalize_source_max_height(policy_source_max_height)
 
     if normalized_quality == "high":
+        # Reuse cached/raw canonical sources when they are available. Source
+        # freshness is bounded by the 12-hour raw-video expiry/cleanup cycle
+        # rather than forcing a redownload on every high-quality clip request.
         return ClipQualityControls(
             effective_source_max_height=None,
-            prefer_fresh_source_download=True,
+            prefer_fresh_source_download=False,
             allow_upload_reencode=True,
             smart_cleanup_crf=10,
             smart_cleanup_preset="slow",

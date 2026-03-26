@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ from config import (
     YTDLP_SOCKET_TIMEOUT_SECONDS,
 )
 from services import video_downloader as video_downloader_module
-from services.video_downloader import VideoDownloader
+from services.video_downloader import VideoDownloadError, VideoDownloader
 from tasks.clips.helpers import source_video
 from utils import minio_client as minio_client_module
 
@@ -313,6 +314,58 @@ def test_resolve_source_video_downloads_from_canonical_storage_before_url(
 
     assert result.strategy == "downloaded_from_storage"
     assert Path(result.video_path).is_file()
+
+
+def test_resolve_source_video_prefers_fresh_download_over_initial_storage(
+    monkeypatch,
+    tmp_path: Path,
+):
+    fresh_path = tmp_path / "fresh.mp4"
+    download_called = {"value": False}
+    storage_fetches = {"count": 0}
+
+    class _FakeDownloader:
+        def download(self, _url: str, _video_id: str):
+            download_called["value"] = True
+            fresh_path.write_bytes(b"fresh-video")
+            return {"path": str(fresh_path), "duration": 60}
+
+    class _TrackingMinioClient:
+        def fget_object(self, _bucket: str, _object_name: str, target_path: str):
+            storage_fetches["count"] += 1
+            Path(target_path).write_bytes(b"stored-video")
+
+    monkeypatch.setattr(source_video, "RAW_VIDEO_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(source_video, "probe_video_size", lambda _path: (1920, 1080))
+    monkeypatch.setattr(source_video, "get_redis_connection", lambda: None)
+    monkeypatch.setattr(minio_client_module, "get_minio_client", lambda: _TrackingMinioClient())
+    monkeypatch.setattr(
+        source_video,
+        "upload_raw_video_to_storage",
+        lambda **_kwargs: ("raw/video-storage-fresh.mp4", "etag-storage-fresh"),
+    )
+
+    result = source_video.resolve_source_video(
+        video_id="video-storage-fresh",
+        source_url="https://example.com/watch?v=storage-fresh",
+        initial_raw_video_path=None,
+        initial_raw_video_storage_path="raw/video-storage-fresh.mp4",
+        downloader=_FakeDownloader(),
+        load_video_row=lambda _video_id: {
+            "raw_video_path": None,
+            "raw_video_storage_path": "raw/video-storage-fresh.mp4",
+            "url": "https://example.com/watch?v=storage-fresh",
+        },
+        persist_raw_video_path=lambda *_args, **_kwargs: None,
+        logger=type("Logger", (), {"warning": lambda *args, **kwargs: None})(),
+        job_id="job-storage-fresh",
+        prefer_fresh_download=True,
+    )
+
+    assert download_called["value"] is True
+    assert storage_fetches["count"] == 0
+    assert result.strategy == "downloaded_now"
+    assert result.video_path == str(fresh_path)
 
 
 def test_resolve_source_video_prefers_fresh_but_reuses_waited_download(
@@ -639,16 +692,94 @@ def test_resolve_source_video_times_out_when_lock_is_never_released(monkeypatch)
     assert wait_events["count"] > 0
 
 
+def test_build_raw_video_metadata_update_sets_12_hour_expiry(monkeypatch, tmp_path: Path):
+    raw_video_path = tmp_path / "raw-source.mp4"
+    raw_video_path.write_bytes(b"video")
+    monkeypatch.setattr(source_video, "build_video_source_probe_update", lambda _path: {})
+
+    before = datetime.now(timezone.utc)
+    payload = source_video.build_raw_video_metadata_update(
+        str(raw_video_path),
+        raw_video_storage_path="raw/video-123__source_best.mkv",
+    )
+    expires_at = datetime.fromisoformat(payload["raw_video_expires_at"])
+
+    assert payload["raw_video_path"] == str(raw_video_path)
+    assert payload["raw_video_storage_path"] == "raw/video-123__source_best.mkv"
+    assert timedelta(hours=11, minutes=59) <= (expires_at - before) <= timedelta(
+        hours=12, minutes=1
+    )
+
+
+def test_raw_cache_path_preserves_literal_media_suffix(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(source_video, "RAW_VIDEO_CACHE_DIR", str(tmp_path))
+
+    cache_path = source_video._raw_cache_path(
+        "video-123",
+        "source_best_2160",
+        suffix=".mkv",
+    )
+
+    assert cache_path.endswith("__source_best_2160.mkv")
+
+
 def test_video_downloader_base_options_include_hardening_flags():
     opts = VideoDownloader()._base_ydl_opts()
     assert opts["format"] == VideoDownloader._format_selector_for_max_height(1080)
     assert "height<=720" not in opts["format"]
+    assert "max_filesize" not in opts
     assert opts["noplaylist"] is True
     assert "extractor_args" not in opts
+    assert opts["js_runtimes"] == {"node": {}}
     assert opts["socket_timeout"] == YTDLP_SOCKET_TIMEOUT_SECONDS
     assert opts["retries"] == YTDLP_DOWNLOAD_RETRIES
     assert opts["fragment_retries"] == YTDLP_FRAGMENT_RETRIES
     assert opts["extractor_retries"] == YTDLP_EXTRACTOR_RETRIES
+
+
+def test_video_downloader_explicit_proxy_override_disables_rotation(
+    monkeypatch,
+    tmp_path: Path,
+):
+    seen_proxies: list[object] = []
+
+    class _FakeYDL:
+        def __init__(self, opts: dict):
+            seen_proxies.append(opts.get("proxy"))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, _url: str, *, download: bool):
+            assert download is True
+            return {
+                "title": "Video",
+                "duration": 10,
+                "thumbnail": None,
+                "extractor_key": "youtube",
+                "id": "abc123",
+            }
+
+    monkeypatch.setattr(
+        video_downloader_module,
+        "_build_proxy_list",
+        lambda: ["http://proxy-a", "http://proxy-b"],
+    )
+    monkeypatch.setattr(video_downloader_module.yt_dlp, "YoutubeDL", _FakeYDL)
+
+    downloader = VideoDownloader(work_dir=str(tmp_path))
+    downloader._download_with_opts(
+        "https://example.com/video",
+        str(tmp_path / "video.mp4"),
+        format_selector="b",
+        attempt_label="no_proxy_override",
+        ydl_overrides={"proxy": None},
+    )
+
+    assert seen_proxies == [None]
 
 
 def test_video_downloader_uses_writable_runtime_cookie_file(monkeypatch, tmp_path: Path):
@@ -815,6 +946,20 @@ def test_video_downloader_resolve_output_path_prefers_muxed_output_over_video_on
     assert resolved == str(merged_output)
 
 
+def test_video_downloader_resolve_output_path_ignores_incomplete_video_sidecars_when_video_required(
+    tmp_path: Path,
+):
+    expected = tmp_path / "video-123.mp4"
+    incomplete_video = tmp_path / "video-123.f137.mp4.part"
+    audio_only = tmp_path / "video-123.f140.m4a"
+    incomplete_video.write_bytes(b"incomplete-video")
+    audio_only.write_bytes(b"audio")
+
+    resolved = VideoDownloader._resolve_output_path(str(expected), require_video=True)
+
+    assert resolved == str(expected)
+
+
 def test_video_downloader_fallback_selector_is_not_720_limited(
     monkeypatch,
     tmp_path: Path,
@@ -844,7 +989,11 @@ def test_video_downloader_fallback_selector_is_not_720_limited(
     audio_checks = iter([False, True])
     monkeypatch.setattr(video_downloader_module, "_validate_url", lambda _url: None)
     monkeypatch.setattr(VideoDownloader, "_download_with_opts", _fake_download_with_opts)
-    monkeypatch.setattr(VideoDownloader, "_resolve_output_path", lambda _self, path: path)
+    monkeypatch.setattr(
+        VideoDownloader,
+        "_resolve_output_path",
+        lambda _self, path, **_kwargs: path,
+    )
     monkeypatch.setattr(VideoDownloader, "_has_audio_stream", lambda _self, _path: next(audio_checks))
 
     downloader = VideoDownloader(work_dir=str(tmp_path))
@@ -889,8 +1038,18 @@ def test_video_downloader_retries_legacy_clients_for_youtube_on_primary_error(
 
     monkeypatch.setattr(video_downloader_module, "_validate_url", lambda _url: None)
     monkeypatch.setattr(VideoDownloader, "_download_with_opts", _fake_download_with_opts)
-    monkeypatch.setattr(VideoDownloader, "_resolve_output_path", lambda _self, path: path)
+    monkeypatch.setattr(
+        VideoDownloader,
+        "_resolve_output_path",
+        lambda _self, path, **_kwargs: path,
+    )
     monkeypatch.setattr(VideoDownloader, "_has_audio_stream", lambda _self, _path: True)
+    monkeypatch.setattr(
+        VideoDownloader, "_has_cookie_configuration", staticmethod(lambda: False)
+    )
+    monkeypatch.setattr(
+        VideoDownloader, "_has_proxy_configuration", staticmethod(lambda: False)
+    )
 
     downloader = VideoDownloader(work_dir=str(tmp_path))
     result = downloader.download("https://www.youtube.com/watch?v=abc123", "video-123")
@@ -899,9 +1058,70 @@ def test_video_downloader_retries_legacy_clients_for_youtube_on_primary_error(
     assert attempts[0] == ("best_source_default", None)
     assert attempts[1] == (
         "best_source_legacy_clients",
-        {"extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}}},
+        {
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["tv_downgraded", "web_safari", "web"]
+                }
+            }
+        },
     )
     assert len(attempts) == 2
+
+
+def test_video_downloader_retries_direct_public_before_legacy_for_youtube_when_configured(
+    monkeypatch,
+    tmp_path: Path,
+):
+    attempts: list[tuple[str, dict[str, object] | None]] = []
+
+    def _fake_download_with_opts(
+        self,
+        url: str,
+        output_path: str,
+        *,
+        format_selector: str,
+        attempt_label: str,
+        max_height: int | None = 1080,
+        ydl_overrides: dict[str, object] | None = None,
+    ):
+        del self, url, output_path, format_selector, max_height
+        attempts.append((attempt_label, ydl_overrides))
+        if attempt_label == "best_source_default":
+            raise yt_dlp.utils.DownloadError("primary failed")
+        if attempt_label == "best_source_direct_public":
+            return {
+                "title": "Video",
+                "duration": 10,
+                "thumbnail": None,
+                "extractor_key": "youtube",
+                "id": "abc123",
+            }
+        raise AssertionError("legacy fallback should not be reached when direct public succeeds")
+
+    monkeypatch.setattr(video_downloader_module, "_validate_url", lambda _url: None)
+    monkeypatch.setattr(VideoDownloader, "_download_with_opts", _fake_download_with_opts)
+    monkeypatch.setattr(
+        VideoDownloader,
+        "_resolve_output_path",
+        lambda _self, path, **_kwargs: path,
+    )
+    monkeypatch.setattr(VideoDownloader, "_has_audio_stream", lambda _self, _path: True)
+    monkeypatch.setattr(
+        VideoDownloader, "_has_cookie_configuration", staticmethod(lambda: True)
+    )
+    monkeypatch.setattr(
+        VideoDownloader, "_has_proxy_configuration", staticmethod(lambda: True)
+    )
+
+    downloader = VideoDownloader(work_dir=str(tmp_path))
+    result = downloader.download("https://www.youtube.com/watch?v=abc123", "video-123")
+
+    assert result["path"].endswith("video-123.mp4")
+    assert attempts == [
+        ("best_source_default", None),
+        ("best_source_direct_public", {"cookiefile": None, "proxy": None}),
+    ]
 
 
 def test_video_downloader_no_legacy_retry_when_primary_succeeds(
@@ -932,7 +1152,11 @@ def test_video_downloader_no_legacy_retry_when_primary_succeeds(
 
     monkeypatch.setattr(video_downloader_module, "_validate_url", lambda _url: None)
     monkeypatch.setattr(VideoDownloader, "_download_with_opts", _fake_download_with_opts)
-    monkeypatch.setattr(VideoDownloader, "_resolve_output_path", lambda _self, path: path)
+    monkeypatch.setattr(
+        VideoDownloader,
+        "_resolve_output_path",
+        lambda _self, path, **_kwargs: path,
+    )
     monkeypatch.setattr(VideoDownloader, "_has_audio_stream", lambda _self, _path: True)
 
     downloader = VideoDownloader(work_dir=str(tmp_path))
@@ -940,3 +1164,112 @@ def test_video_downloader_no_legacy_retry_when_primary_succeeds(
 
     assert result["path"].endswith("video-123.mp4")
     assert attempts == [("best_source_default", None)]
+
+
+def test_video_downloader_raises_friendly_error_for_youtube_403_after_fallback(
+    monkeypatch,
+    tmp_path: Path,
+):
+    attempts: list[tuple[str, dict[str, object] | None]] = []
+
+    def _fake_download_with_opts(
+        self,
+        url: str,
+        output_path: str,
+        *,
+        format_selector: str,
+        attempt_label: str,
+        max_height: int | None = 1080,
+        ydl_overrides: dict[str, object] | None = None,
+    ):
+        del self, url, output_path, format_selector, max_height
+        attempts.append((attempt_label, ydl_overrides))
+        if attempt_label == "best_source_default":
+            raise yt_dlp.utils.DownloadError("primary failed")
+        raise yt_dlp.utils.DownloadError(
+            "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+        )
+
+    monkeypatch.setattr(video_downloader_module, "_validate_url", lambda _url: None)
+    monkeypatch.setattr(VideoDownloader, "_download_with_opts", _fake_download_with_opts)
+    monkeypatch.setattr(
+        VideoDownloader,
+        "_resolve_output_path",
+        lambda _self, path, **_kwargs: path,
+    )
+    monkeypatch.setattr(VideoDownloader, "_has_audio_stream", lambda _self, _path: True)
+    monkeypatch.setattr(
+        VideoDownloader, "_has_cookie_configuration", staticmethod(lambda: False)
+    )
+    monkeypatch.setattr(
+        VideoDownloader, "_has_proxy_configuration", staticmethod(lambda: False)
+    )
+
+    downloader = VideoDownloader(work_dir=str(tmp_path))
+    with pytest.raises(VideoDownloadError, match="YouTube media download blocked") as exc_info:
+        downloader.download("https://www.youtube.com/watch?v=abc123", "video-123")
+
+    assert exc_info.value.failure_reason == "youtube_media_download_blocked"
+    assert "refresh mounted cookies" in str(exc_info.value)
+    assert attempts[0] == ("best_source_default", None)
+    assert attempts[1][0] == "best_source_legacy_clients"
+
+
+def test_video_downloader_audio_only_retries_direct_public_before_legacy_for_youtube(
+    monkeypatch,
+    tmp_path: Path,
+):
+    attempts: list[tuple[str, dict[str, object] | None]] = []
+
+    def _fake_download_with_opts(
+        self,
+        url: str,
+        output_path: str,
+        *,
+        format_selector: str,
+        attempt_label: str,
+        max_height: int | None = 1080,
+        ydl_overrides: dict[str, object] | None = None,
+    ):
+        del self, url, output_path, format_selector, max_height
+        attempts.append((attempt_label, ydl_overrides))
+        if attempt_label == "audio_only_default":
+            raise yt_dlp.utils.DownloadError("primary failed")
+        if attempt_label == "audio_only_direct_public":
+            return {
+                "title": "Audio",
+                "duration": 10,
+                "thumbnail": None,
+                "extractor_key": "youtube",
+                "id": "abc123",
+            }
+        raise AssertionError("legacy fallback should not be reached when direct public succeeds")
+
+    monkeypatch.setattr(video_downloader_module, "_validate_url", lambda _url: None)
+    monkeypatch.setattr(VideoDownloader, "_download_with_opts", _fake_download_with_opts)
+    monkeypatch.setattr(
+        VideoDownloader,
+        "_resolve_output_path",
+        lambda _self, path, **_kwargs: path,
+    )
+    monkeypatch.setattr(
+        VideoDownloader, "_has_cookie_configuration", staticmethod(lambda: True)
+    )
+    monkeypatch.setattr(
+        VideoDownloader, "_has_proxy_configuration", staticmethod(lambda: True)
+    )
+
+    downloader = VideoDownloader(work_dir=str(tmp_path))
+    result = downloader.download_audio_only(
+        "https://www.youtube.com/watch?v=abc123",
+        "video-123",
+    )
+
+    assert result["path"].endswith("video-123.audio.%(ext)s")
+    assert attempts == [
+        ("audio_only_default", {"noplaylist": True}),
+        (
+            "audio_only_direct_public",
+            {"noplaylist": True, "cookiefile": None, "proxy": None},
+        ),
+    ]

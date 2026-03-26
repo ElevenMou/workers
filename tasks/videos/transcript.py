@@ -10,6 +10,7 @@ import ffmpeg as ffmpeg_lib
 
 from config import WHISPER_CLIP_MODEL
 from services.transcriber import Transcriber
+from tasks.clips.helpers.media import probe_has_audio_stream
 
 _ANALYSIS_SEGMENT_WORD_CHUNK_SIZE = 8
 
@@ -320,11 +321,22 @@ def transcribe_clip_window_with_whisper(
     window_duration = max(1.0, window_end - window_start)
 
     clip_audio_path = os.path.join(work_dir, f"{clip_id}_window_audio.mp3")
-    ffmpeg_lib.input(media_path, ss=window_start, t=window_duration).output(
-        clip_audio_path,
-        ac=1,
-        ar=16000,
-    ).overwrite_output().run(quiet=True)
+    if not probe_has_audio_stream(media_path):
+        raise RuntimeError(
+            f"Source media has no usable audio stream for Whisper clip-window transcription: {media_path}"
+        )
+    try:
+        ffmpeg_lib.input(media_path, ss=window_start, t=window_duration).output(
+            clip_audio_path,
+            ac=1,
+            ar=16000,
+        ).overwrite_output().run(quiet=True)
+    except ffmpeg_lib.Error as exc:
+        stderr = (getattr(exc, "stderr", None) or b"").decode("utf-8", errors="ignore").strip()
+        detail = stderr.splitlines()[-1].strip() if stderr else str(exc)
+        raise RuntimeError(
+            f"Failed to extract clip-window audio for Whisper transcription: {detail}"
+        ) from exc
 
     selected_model = str(model_name or WHISPER_CLIP_MODEL).strip() or WHISPER_CLIP_MODEL
     transcriber = Transcriber(model_name=selected_model)

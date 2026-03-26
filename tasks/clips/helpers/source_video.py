@@ -32,6 +32,20 @@ _WAIT_STAGE_NOTIFY_INTERVAL_SECONDS = 5.0
 _WAIT_POLL_INTERVAL_SECONDS = 1.0
 _UNSET_SOURCE_MAX_HEIGHT = object()
 _RAW_VIDEO_STORAGE_BUCKET = MINIO_RAW_VIDEOS_BUCKET
+_INCOMPLETE_MEDIA_SUFFIXES = {".part", ".ytdl", ".temp", ".tmp"}
+_KNOWN_MEDIA_SUFFIXES = {
+    ".mp4",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".webm",
+    ".avi",
+    ".ts",
+    ".m2ts",
+    ".mts",
+    ".mpg",
+    ".mpeg",
+}
 
 
 @dataclass(slots=True)
@@ -138,10 +152,20 @@ def _default_source_profile(source_max_height: int | None | object) -> str:
 
 
 def _normalize_media_suffix(path: str | None, fallback: str = ".mp4") -> str:
-    suffix = Path(str(path or "")).suffix.lower().strip()
-    if suffix and suffix.startswith(".") and len(suffix) <= 8:
+    raw_value = str(path or "").strip().lower()
+    if raw_value in _KNOWN_MEDIA_SUFFIXES:
+        return raw_value
+    suffix = Path(raw_value).suffix.lower().strip()
+    if suffix in _KNOWN_MEDIA_SUFFIXES:
         return suffix
     return fallback
+
+
+def _is_incomplete_media_path(path: str | None) -> bool:
+    if not path:
+        return False
+    suffixes = {suffix.lower() for suffix in Path(str(path)).suffixes}
+    return bool(suffixes & _INCOMPLETE_MEDIA_SUFFIXES)
 
 
 def _raw_cache_path(video_id: str, source_profile: str, *, suffix: str = ".mp4") -> str:
@@ -180,6 +204,14 @@ def _resolve_storage_video_path(
     force_refresh_cache: bool = False,
 ) -> tuple[str, int, int] | None:
     if not raw_video_storage_path:
+        return None
+    if _is_incomplete_media_path(raw_video_storage_path):
+        logger.warning(
+            "[%s] Canonical raw source path is incomplete for %s (%s); forcing a new download",
+            job_id,
+            video_id,
+            raw_video_storage_path,
+        )
         return None
 
     cache_path = _raw_cache_path(
@@ -235,6 +267,14 @@ def _resolve_existing_video_path(
     raw_video_path: str | None,
 ) -> tuple[str, int, int] | None:
     if not raw_video_path:
+        return None
+    if _is_incomplete_media_path(raw_video_path):
+        logger.warning(
+            "[%s] Existing raw video path is incomplete for %s (%s); forcing a new download",
+            job_id,
+            video_id,
+            raw_video_path,
+        )
         return None
     if not os.path.isfile(raw_video_path):
         return None
@@ -341,6 +381,11 @@ def _try_resolve_waited_video(
     Shared by both the in-loop and post-loop resolution paths.
     """
     def _resolve_storage_candidate() -> SourceVideoResolution | None:
+        if prefer_fresh_download and not _value_is_fresh(
+            latest_storage_path,
+            entry_raw_storage_path,
+        ):
+            return None
         storage_is_fresh = _should_force_storage_cache_refresh(
             latest_storage_path=latest_storage_path,
             entry_raw_storage_path=entry_raw_storage_path,
@@ -436,6 +481,7 @@ def resolve_source_video(
     )
     entry_raw_video_path = _normalize_optional_text(initial_raw_video_path)
     entry_raw_storage_path = _normalize_optional_text(initial_raw_video_storage_path)
+
     def _initial_local_candidate() -> SourceVideoResolution | None:
         existing = _resolve_existing_video_path(
             video_id=video_id,
@@ -481,7 +527,9 @@ def resolve_source_video(
         )
 
     for candidate in preferred_source_video_order():
-        if candidate == "local" and prefer_fresh_download:
+        # A fresh source request must bypass both local and canonical-storage
+        # snapshots on the first pass so we don't keep reusing a stale raw asset.
+        if prefer_fresh_download and candidate in {"local", "storage"}:
             continue
         resolved = (
             _initial_local_candidate()
@@ -622,12 +670,23 @@ def resolve_source_video(
                 )
 
             def _latest_storage_candidate() -> SourceVideoResolution | None:
+                if prefer_fresh_download and not _value_is_fresh(
+                    latest_storage_path,
+                    entry_raw_storage_path,
+                ):
+                    return None
+                storage_is_fresh = _should_force_storage_cache_refresh(
+                    latest_storage_path=latest_storage_path,
+                    entry_raw_storage_path=entry_raw_storage_path,
+                    prefer_fresh_download=prefer_fresh_download,
+                )
                 latest_storage_existing = _resolve_storage_video_path(
                     video_id=video_id,
                     source_profile=normalized_source_profile,
                     job_id=job_id,
                     logger=logger,
                     raw_video_storage_path=latest_storage_path,
+                    force_refresh_cache=storage_is_fresh,
                 )
                 if latest_storage_existing is None:
                     return None
