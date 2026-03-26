@@ -10,7 +10,10 @@ import traceback
 from typing import Any
 from uuid import uuid4
 
-from config import calculate_custom_clip_generation_cost
+from config import (
+    WHISPER_FULL_TRANSCRIPT_WORD_TIMESTAMPS,
+    calculate_custom_clip_generation_cost,
+)
 from services.ai_analyzer import AIAnalyzer
 from services.clips.quality_policy import resolve_clip_quality_policy
 from services.clips.render_profiles import (
@@ -758,7 +761,11 @@ def split_video_task(job_data: SplitVideoJob) -> None:
             if source_has_audio is False:
                 raise RuntimeError("Source has no usable audio for transcript fallback")
             audio_path = downloader.extract_audio(source_video_path)
-            transcript_payload = Transcriber().transcribe(audio_path, language_hint=language_hint)
+            transcript_payload = Transcriber().transcribe(
+                audio_path,
+                language_hint=language_hint,
+                word_timestamps=WHISPER_FULL_TRANSCRIPT_WORD_TIMESTAMPS,
+            )
             transcript_payload["source"] = "whisper"
             return transcript_payload, True
 

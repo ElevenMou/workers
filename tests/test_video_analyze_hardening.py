@@ -106,6 +106,12 @@ class _FakeSupabaseQuery:
         return self
 
     def execute(self):
+        if self.table_name == "videos" and self._mode == "select":
+            row = dict(self.supabase.video_row or {})
+            if not row:
+                return _FakeResponse([])
+            return _FakeResponse([row])
+
         if self.table_name == "videos" and self._mode == "update":
             payload = dict(self._payload or {})
             self.supabase.video_updates.append(payload)
@@ -156,12 +162,14 @@ class _FakeSupabase:
         *,
         existing_clips: list[dict[str, Any]] | None = None,
         fail_first_completed_finalize: bool = False,
+        video_row: dict[str, Any] | None = None,
     ):
         self.existing_clips = list(existing_clips or [])
         self.inserted_clips: list[dict[str, Any]] = []
         self.video_updates: list[dict[str, Any]] = []
         self.fail_first_completed_finalize = fail_first_completed_finalize
         self.completed_finalize_attempts = 0
+        self.video_row = dict(video_row or {})
 
     def table(self, table_name: str):
         return _FakeSupabaseQuery(self, table_name)
@@ -485,6 +493,123 @@ def test_analysis_uses_precomputed_source_metadata_before_any_media_download(
     assert downloader.download_calls == 0
     assert downloader.download_audio_only_calls == 0
     assert downloader.extract_audio_calls == 0
+
+
+def test_analysis_reuses_stored_transcript_before_whisper_fallback(
+    monkeypatch, tmp_path: Path
+):
+    stored_transcript = {
+        "source": "whisper",
+        "language": "en",
+        "languageCode": "en",
+        "segments": [
+            {"start": 0.0, "end": 60.0, "text": "stored one"},
+            {"start": 60.0, "end": 120.0, "text": "stored two"},
+            {"start": 120.0, "end": 180.0, "text": "stored three"},
+        ],
+    }
+    supabase = _FakeSupabase(video_row={"transcript": stored_transcript})
+    downloader = _FakeDownloader(
+        work_dir=str(tmp_path),
+        transcript=None,
+        duration_seconds=180,
+        has_captions=False,
+        has_audio=True,
+    )
+    _install_common_patches(
+        monkeypatch,
+        tmp_path=tmp_path,
+        supabase=supabase,
+        downloader=downloader,
+        analyzer_clips=[],
+        transcriber_factory=lambda: (_ for _ in ()).throw(
+            RuntimeError("transcriber should not be initialized")
+        ),
+    )
+    monkeypatch.setattr(
+        analyze_task_module,
+        "AIAnalyzer",
+        lambda: SimpleNamespace(find_best_clips=lambda *_a, **_k: []),
+    )
+
+    analyze_task_module.analyze_video_task(
+        _job_data(
+            analysisDurationSeconds=180,
+            sourceTitle="Stored transcript video",
+            sourceThumbnailUrl="https://example.com/thumb.jpg",
+            sourcePlatform="youtube",
+            sourceExternalId="yt123",
+            sourceDetectedLanguage="en",
+            sourceHasCaptions=False,
+            sourceHasAudio=True,
+        )
+    )
+
+    assert downloader.probe_calls == 0
+    assert downloader.download_calls == 0
+    assert downloader.download_audio_only_calls == 0
+    assert downloader.extract_audio_calls == 0
+
+
+def test_analysis_whisper_fallback_disables_full_word_timestamps_by_default(
+    monkeypatch, tmp_path: Path
+):
+    supabase = _FakeSupabase()
+    downloader = _FakeDownloader(
+        work_dir=str(tmp_path),
+        transcript=None,
+        duration_seconds=180,
+        has_captions=False,
+        has_audio=True,
+    )
+    transcribe_calls: list[dict[str, Any]] = []
+
+    def _transcriber_factory():
+        return SimpleNamespace(
+            transcribe=lambda _audio_path, **kwargs: (
+                transcribe_calls.append(dict(kwargs))
+                or {
+                    "source": "whisper",
+                    "language": "en",
+                    "segments": [
+                        {"start": 0.0, "end": 90.0, "text": "whisper transcript"}
+                    ],
+                }
+            )
+        )
+
+    _install_common_patches(
+        monkeypatch,
+        tmp_path=tmp_path,
+        supabase=supabase,
+        downloader=downloader,
+        analyzer_clips=[],
+        transcriber_factory=_transcriber_factory,
+    )
+    monkeypatch.setattr(
+        analyze_task_module,
+        "WHISPER_FULL_TRANSCRIPT_WORD_TIMESTAMPS",
+        False,
+    )
+
+    analyze_task_module.analyze_video_task(
+        _job_data(
+            analysisDurationSeconds=180,
+            sourceTitle="Whisper fallback video",
+            sourceThumbnailUrl="https://example.com/thumb.jpg",
+            sourcePlatform="youtube",
+            sourceExternalId="yt123",
+            sourceDetectedLanguage="en",
+            sourceHasCaptions=False,
+            sourceHasAudio=True,
+        )
+    )
+
+    assert transcribe_calls == [
+        {"language_hint": "en", "word_timestamps": False}
+    ]
+    assert downloader.download_audio_only_calls == 1
+    assert downloader.extract_audio_calls == 1
 
 
 def test_owner_wallet_retry_after_post_charge_failure_is_idempotent(monkeypatch, tmp_path: Path):

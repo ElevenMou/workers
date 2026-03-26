@@ -829,6 +829,7 @@ def test_analyze_video_queues_range_based_analysis_credits(client, monkeypatch):
     )
 
     checked_amounts: list[int] = []
+    enqueued_timeout_seconds: int | None = None
 
     def _fake_has_sufficient_credits(*, user_id, amount, **_kwargs):
         assert user_id == "user-id"
@@ -839,7 +840,9 @@ def test_analyze_video_queues_range_based_analysis_credits(client, monkeypatch):
 
     def _fake_enqueue_or_fail(*, job_data, **_kwargs):
         nonlocal enqueued_payload
+        nonlocal enqueued_timeout_seconds
         enqueued_payload = dict(job_data)
+        enqueued_timeout_seconds = _kwargs.get("job_timeout_seconds")
 
     monkeypatch.setattr(videos_router, "supabase", _FakeAnalyzeSupabase())
     monkeypatch.setattr(videos_router, "raise_on_error", lambda *_a, **_k: None)
@@ -899,6 +902,18 @@ def test_analyze_video_queues_range_based_analysis_credits(client, monkeypatch):
     assert enqueued_payload["sourceExternalId"] == "yt123"
     assert enqueued_payload["sourceHasCaptions"] is True
     assert enqueued_payload["sourceHasAudio"] is True
+    assert enqueued_timeout_seconds == videos_router.VIDEO_JOB_TIMEOUT
+
+
+def test_compute_video_job_timeout_seconds_extends_for_likely_whisper_fallback():
+    timeout_seconds = videos_router._compute_video_job_timeout_seconds(
+        duration_seconds=16 * 60 + 24,
+        source_has_captions=False,
+        source_has_audio=True,
+    )
+
+    assert timeout_seconds > videos_router.VIDEO_JOB_TIMEOUT
+    assert timeout_seconds <= videos_router.WHISPER_FALLBACK_JOB_TIMEOUT_MAX_SECONDS
 
 
 def test_analyze_video_supersedes_prior_active_jobs_for_same_video(client, monkeypatch):

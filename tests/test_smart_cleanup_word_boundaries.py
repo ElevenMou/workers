@@ -186,6 +186,22 @@ def test_plan_requires_whisper_word_timing():
         )
 
 
+def test_word_level_caption_styles_retranscribe_when_whisper_transcript_has_no_words():
+    transcript = {
+        "source": "whisper",
+        "segments": [{"start": 0.0, "end": 2.0, "text": "hello world"}],
+    }
+
+    assert generate_task_module.needs_whisper_retranscription(transcript, "karaoke") is True
+    assert generate_task_module.needs_whisper_retranscription(transcript, "highlight") is True
+    assert generate_task_module.needs_whisper_retranscription(transcript, "grouped") is False
+
+
+def test_word_level_caption_styles_retranscribe_when_transcript_is_missing():
+    assert generate_task_module.needs_whisper_retranscription(None, "highlight_box") is True
+    assert generate_task_module.needs_whisper_retranscription(None, "grouped") is False
+
+
 class _StopAfterCleanup(RuntimeError):
     pass
 

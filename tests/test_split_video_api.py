@@ -231,10 +231,13 @@ def test_batch_split_video_queues_new_job_from_url(client, monkeypatch):
     )
     fake_supabase = _FakeBatchSplitSupabase()
     enqueued_payload: dict | None = None
+    enqueued_timeout_seconds: int | None = None
 
     def _fake_enqueue_or_fail(*, job_data, **_kwargs):
         nonlocal enqueued_payload
+        nonlocal enqueued_timeout_seconds
         enqueued_payload = dict(job_data)
+        enqueued_timeout_seconds = _kwargs.get("job_timeout_seconds")
 
     monkeypatch.setattr(videos_router, "supabase", fake_supabase)
     monkeypatch.setattr(videos_router, "enforce_processing_access_rules", lambda *_a, **_k: _basic_access_context())
@@ -275,5 +278,56 @@ def test_batch_split_video_queues_new_job_from_url(client, monkeypatch):
     assert enqueued_payload["expectedPartCount"] == 4
     assert enqueued_payload["expectedGenerationCredits"] == 12
     assert enqueued_payload["sourceDetectedLanguage"] == "es"
+    assert enqueued_timeout_seconds == videos_router.VIDEO_JOB_TIMEOUT
     assert fake_supabase.video_upserts[0]["title"] == "Long source"
     assert fake_supabase.job_upserts[0]["type"] == "split_video"
+
+
+def test_batch_split_video_extends_timeout_for_likely_whisper_fallback(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    fake_supabase = _FakeBatchSplitSupabase()
+    enqueued_timeout_seconds: int | None = None
+
+    def _fake_enqueue_or_fail(**_kwargs):
+        nonlocal enqueued_timeout_seconds
+        enqueued_timeout_seconds = _kwargs.get("job_timeout_seconds")
+
+    monkeypatch.setattr(videos_router, "supabase", fake_supabase)
+    monkeypatch.setattr(videos_router, "enforce_processing_access_rules", lambda *_a, **_k: _basic_access_context())
+    monkeypatch.setattr(videos_router, "has_sufficient_credits", lambda **_k: True)
+    monkeypatch.setattr(videos_router, "enforce_monthly_video_limit", lambda *_a, **_k: None)
+    monkeypatch.setattr(videos_router, "enqueue_or_fail", _fake_enqueue_or_fail)
+    monkeypatch.setattr(
+        videos_router,
+        "_probe_credit_cost_for_url",
+        lambda _url: {
+            "valid_url": True,
+            "duration_seconds": 16 * 60 + 24,
+            "video_title": "Audio only source",
+            "thumbnail_url": "https://image.test/thumb.jpg",
+            "platform": "youtube",
+            "external_id": "abc123",
+            "has_captions": False,
+            "has_audio": True,
+            "detected_language": "en",
+        },
+    )
+
+    response = client.post(
+        "/videos/batch-split",
+        json={
+            "url": "https://www.youtube.com/watch?v=abc123",
+            "segmentLengthSeconds": 60,
+            "layoutId": "layout-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert enqueued_timeout_seconds is not None
+    assert enqueued_timeout_seconds > videos_router.VIDEO_JOB_TIMEOUT

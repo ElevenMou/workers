@@ -164,6 +164,21 @@ NUM_SOCIAL_WORKERS = int(os.getenv("NUM_SOCIAL_WORKERS", 1))
 VIDEO_JOB_TIMEOUT = int(os.getenv("VIDEO_JOB_TIMEOUT", 1800))  # 30 min
 CLIP_JOB_TIMEOUT = int(os.getenv("CLIP_JOB_TIMEOUT", 1800))  # 30 min
 SOCIAL_JOB_TIMEOUT = int(os.getenv("SOCIAL_JOB_TIMEOUT", 1800))  # 30 min
+WHISPER_FALLBACK_JOB_TIMEOUT_MULTIPLIER = _env_float(
+    "WHISPER_FALLBACK_JOB_TIMEOUT_MULTIPLIER",
+    3.0,
+    minimum=1.0,
+)
+WHISPER_FALLBACK_JOB_TIMEOUT_PADDING_SECONDS = _env_int(
+    "WHISPER_FALLBACK_JOB_TIMEOUT_PADDING_SECONDS",
+    300,
+    minimum=0,
+)
+WHISPER_FALLBACK_JOB_TIMEOUT_MAX_SECONDS = _env_int(
+    "WHISPER_FALLBACK_JOB_TIMEOUT_MAX_SECONDS",
+    7200,
+    minimum=VIDEO_JOB_TIMEOUT,
+)
 RAW_VIDEO_CLEANUP_INTERVAL_SECONDS = int(
     os.getenv("RAW_VIDEO_CLEANUP_INTERVAL_SECONDS", 300)
 )
@@ -309,6 +324,13 @@ POLAR_USAGE_EVENT_GENERATION_NAME = os.getenv(
 # Processing
 # ---------------------------------------------------------------------------
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+# Full-video transcript jobs only need segment text/boundaries for AI analysis.
+# Keep word-level timing off by default and let clip generation re-transcribe
+# the selected window when it needs precise word timing.
+WHISPER_FULL_TRANSCRIPT_WORD_TIMESTAMPS = _env_bool(
+    "WHISPER_FULL_TRANSCRIPT_WORD_TIMESTAMPS",
+    False,
+)
 # Clip-window retranscription can use a smaller model for better latency.
 # Set to WHISPER_MODEL to keep a single-model behavior.
 WHISPER_CLIP_MODEL = os.getenv("WHISPER_CLIP_MODEL", "tiny")

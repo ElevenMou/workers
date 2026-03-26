@@ -48,6 +48,7 @@ def enqueue_or_fail(
     queue_name: str,
     task_path: str,
     job_data: dict,
+    job_timeout_seconds: int | None = None,
     job_id: str,
     user_id: str,
     job_type: str,
@@ -58,7 +59,13 @@ def enqueue_or_fail(
 ):
     """Enqueue a background job and mark DB job failed if enqueue fails."""
     try:
-        enqueue_job(queue_name, task_path, job_data, job_id=job_id)
+        enqueue_job(
+            queue_name,
+            task_path,
+            job_data,
+            job_id=job_id,
+            job_timeout_seconds=job_timeout_seconds,
+        )
     except QueueFullError as exc:
         logger.warning("Backpressure: job %s rejected - %s", job_id, exc)
 

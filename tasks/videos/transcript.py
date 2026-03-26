@@ -110,17 +110,15 @@ def needs_whisper_retranscription(
 ) -> bool:
     """Return True when the clip needs Whisper for accurate word timing.
 
-    Conditions:
-    1. The caption style requires word-level timing (karaoke, highlight, or highlight_box).
-    2. The transcript is not already Whisper-backed and has no usable word timings.
+    Word-level caption styles need real per-word timing data. Even if the
+    source transcript originally came from Whisper, long-form jobs may choose
+    to store only segment-level timings for speed.
     """
     if caption_style.strip().lower() not in _WORD_LEVEL_STYLES:
         return False
     if not isinstance(transcript, dict):
-        return False
-    if transcript_has_word_timing(transcript):
-        return False
-    return str(transcript.get("source") or "").strip().lower() != "whisper"
+        return True
+    return not transcript_has_word_timing(transcript)
 
 
 def _split_plain_segment_into_chunks(
@@ -330,7 +328,11 @@ def transcribe_clip_window_with_whisper(
 
     selected_model = str(model_name or WHISPER_CLIP_MODEL).strip() or WHISPER_CLIP_MODEL
     transcriber = Transcriber(model_name=selected_model)
-    transcript = transcriber.transcribe(clip_audio_path, language_hint=language_hint)
+    transcript = transcriber.transcribe(
+        clip_audio_path,
+        language_hint=language_hint,
+        word_timestamps=True,
+    )
     transcript = shift_transcript_timestamps(transcript, window_start)
     transcript["source"] = "whisper"
     return transcript

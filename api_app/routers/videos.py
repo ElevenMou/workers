@@ -33,6 +33,10 @@ from api_app.models import (
 from api_app.rate_limit import limiter
 from api_app.state import logger, whisper_ready
 from config import (
+    VIDEO_JOB_TIMEOUT,
+    WHISPER_FALLBACK_JOB_TIMEOUT_MAX_SECONDS,
+    WHISPER_FALLBACK_JOB_TIMEOUT_MULTIPLIER,
+    WHISPER_FALLBACK_JOB_TIMEOUT_PADDING_SECONDS,
     calculate_custom_clip_generation_cost,
     calculate_video_analysis_cost,
 )
@@ -147,6 +151,32 @@ def _best_effort_supersede_prior_analyze_jobs(
 
 def _video_queue_for_context(context: UserAccessContext) -> str:
     return _PRIORITY_VIDEO_QUEUE if context.priority_processing else _STANDARD_VIDEO_QUEUE
+
+
+def _compute_video_job_timeout_seconds(
+    *,
+    duration_seconds: int,
+    source_has_captions: bool | None,
+    source_has_audio: bool | None,
+) -> int:
+    """Return a queue timeout sized for likely Whisper fallback work."""
+    default_timeout = int(VIDEO_JOB_TIMEOUT)
+    if source_has_captions:
+        return default_timeout
+    if source_has_audio is False:
+        return default_timeout
+
+    duration = max(0, int(duration_seconds))
+    if duration <= 0:
+        return default_timeout
+
+    whisper_timeout = int(
+        ceil(duration * float(WHISPER_FALLBACK_JOB_TIMEOUT_MULTIPLIER))
+    ) + int(WHISPER_FALLBACK_JOB_TIMEOUT_PADDING_SECONDS)
+    return min(
+        int(WHISPER_FALLBACK_JOB_TIMEOUT_MAX_SECONDS),
+        max(default_timeout, whisper_timeout),
+    )
 
 
 def _resolve_legacy_clip_range(*, clip_length_seconds: int, plan_max_seconds: int) -> tuple[int, int]:
@@ -561,6 +591,11 @@ async def analyze_video(
         "chargeSource": access_context.charge_source,
         "workspaceRole": access_context.workspace_role,
     }
+    job_timeout_seconds = _compute_video_job_timeout_seconds(
+        duration_seconds=analysis_duration_seconds,
+        source_has_captions=url_probe.get("has_captions"),
+        source_has_audio=url_probe.get("has_audio"),
+    )
 
     job_resp = (
         supabase.table("jobs")
@@ -589,6 +624,7 @@ async def analyze_video(
         queue_name=_video_queue_for_context(access_context),
         task_path=ANALYZE_TASK_PATH,
         job_data=job_data,
+        job_timeout_seconds=job_timeout_seconds,
         job_id=job_id,
         user_id=user_id,
         job_type="analyze_video",
@@ -874,6 +910,11 @@ async def batch_split_video(
         .execute()
     )
     raise_on_error(job_response, "Failed to upsert split-video job")
+    job_timeout_seconds = _compute_video_job_timeout_seconds(
+        duration_seconds=source_duration_seconds,
+        source_has_captions=source_has_captions,
+        source_has_audio=source_has_audio,
+    )
 
     def _cleanup_split_queue_full() -> None:
         if created_video_for_request:
@@ -883,6 +924,7 @@ async def batch_split_video(
         queue_name=_video_queue_for_context(access_context),
         task_path=SPLIT_VIDEO_TASK_PATH,
         job_data=job_data,
+        job_timeout_seconds=job_timeout_seconds,
         job_id=job_id,
         user_id=user_id,
         job_type="split_video",

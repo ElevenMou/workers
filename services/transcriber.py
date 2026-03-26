@@ -234,10 +234,13 @@ class Transcriber:
         audio_path: str,
         *,
         language_hint: str | None = None,
+        word_timestamps: bool = True,
     ) -> dict:
         """Transcribe audio with word-level timestamps."""
         logger.info("Transcribing %s (Whisper model '%s')", audio_path, self.model_name)
-        transcribe_kwargs = {"word_timestamps": True}
+        transcribe_kwargs: dict[str, object] = {}
+        if word_timestamps:
+            transcribe_kwargs["word_timestamps"] = True
         normalized_hint = self._normalize_language_hint(language_hint)
         if normalized_hint:
             transcribe_kwargs["language"] = normalized_hint

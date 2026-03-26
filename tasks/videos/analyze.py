@@ -6,7 +6,10 @@ from datetime import datetime, timedelta, timezone
 from math import ceil
 from typing import Any
 
-from config import calculate_video_analysis_cost
+from config import (
+    WHISPER_FULL_TRANSCRIPT_WORD_TIMESTAMPS,
+    calculate_video_analysis_cost,
+)
 from services.ai_analyzer import AIAnalyzer
 from services.clips.render_profiles import DEFAULT_SOURCE_PROFILE
 from services.transcriber import Transcriber
@@ -369,6 +372,32 @@ def _count_video_clips(video_id: str) -> int:
     return len(response.data or [])
 
 
+def _load_existing_video_transcript(video_id: str) -> dict[str, Any] | None:
+    """Best-effort transcript reuse for re-analysis of an existing video row."""
+    try:
+        response = (
+            supabase.table("videos")
+            .select("transcript")
+            .eq("id", video_id)
+            .limit(1)
+            .execute()
+        )
+        assert_response_ok(response, f"Failed to load transcript for {video_id}")
+    except Exception as exc:
+        logger.warning("[%s] Failed to load existing transcript for reuse: %s", video_id, exc)
+        return None
+
+    data = response.data
+    row = data if isinstance(data, dict) else (data[0] if isinstance(data, list) and data else None)
+    if not isinstance(row, dict):
+        return None
+
+    transcript = row.get("transcript")
+    if isinstance(transcript, dict) and transcript.get("segments"):
+        return transcript
+    return None
+
+
 def analyze_video_task(job_data: AnalyzeVideoJob):
     """Main task for video analysis.
 
@@ -469,6 +498,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
     reservation_id: str | None = None
     reservation_captured = False
     team_wallet_already_charged = False
+    existing_transcript: dict[str, Any] | None = None
 
     try:
         _update_analysis_job_progress(job_id, 0, "starting", billing_state=billing_state)
@@ -776,6 +806,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             transcript_payload = transcriber.transcribe(
                 audio_path,
                 language_hint=language_hint,
+                word_timestamps=WHISPER_FULL_TRANSCRIPT_WORD_TIMESTAMPS,
             )
             transcript_payload["source"] = "whisper"
             _update_analysis_job_progress(
@@ -786,8 +817,10 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             )
             return transcript_payload, True
 
+        existing_transcript = _load_existing_video_transcript(video_id)
+
         transcript_resolution = resolve_source_transcript(
-            existing_transcript=None,
+            existing_transcript=existing_transcript,
             downloader=downloader,
             source_url=url,
             source_platform=str(source_info.get("platform") or "").strip().lower() or None,

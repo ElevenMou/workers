@@ -354,7 +354,14 @@ def reconcile_admission_counts(conn: redis.Redis | None = None) -> dict[str, int
     return reconciled
 
 
-def enqueue_job(queue_name: str, task_path: str, job_data: dict, *, job_id: str):
+def enqueue_job(
+    queue_name: str,
+    task_path: str,
+    job_data: dict,
+    *,
+    job_id: str,
+    job_timeout_seconds: int | None = None,
+):
     """Enqueue a job after atomic admission control."""
     conn = get_redis_connection()
     group_key = admission_group_for_queue(queue_name)
@@ -378,13 +385,18 @@ def enqueue_job(queue_name: str, task_path: str, job_data: dict, *, job_id: str)
         "admission_token": admission_token,
     }
     retry_policy = Retry(max=_DEFAULT_RETRY_MAX, interval=list(_DEFAULT_RETRY_INTERVALS_SECONDS))
+    enqueue_kwargs = {
+        "job_id": job_id,
+        "meta": job_meta,
+        "retry": retry_policy,
+    }
+    if job_timeout_seconds is not None:
+        enqueue_kwargs["job_timeout"] = max(1, int(job_timeout_seconds))
     try:
         return queue.enqueue(
             task_path,
             job_data,
-            job_id=job_id,
-            meta=job_meta,
-            retry=retry_policy,
+            **enqueue_kwargs,
         )
     except Exception:
         if group_key is not None:

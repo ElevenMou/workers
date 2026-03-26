@@ -52,7 +52,7 @@ def test_get_model_retries_after_checksum_mismatch_and_clears_cache(monkeypatch,
     monkeypatch.setattr(transcriber_module, "_InterProcessFileLock", _NoOpLock)
     monkeypatch.setattr(
         transcriber_module,
-        "whisper",
+        "_whisper_module",
         SimpleNamespace(
             _MODELS={"tiny": "https://example.com/expected-sha256/tiny.pt"},
             load_model=_fake_load_model,
