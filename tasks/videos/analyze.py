@@ -1059,6 +1059,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                     "start_time": start,
                     "end_time": end,
                     "title": clip["title"],
+                    "origin": "ai_suggested",
                     "ai_score": round(score, 2) if score is not None else None,
                     "transcript_excerpt": (
                         clip_transcript_text

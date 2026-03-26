@@ -486,6 +486,7 @@ def custom_clip(
         "start_time": payload.startTime,
         "end_time": payload.endTime,
         "title": payload.title,
+        "origin": "custom",
         "status": "pending",
     }
     if payload.layoutId:

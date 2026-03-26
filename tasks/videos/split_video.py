@@ -966,6 +966,7 @@ def split_video_task(job_data: SplitVideoJob) -> None:
                 "start_time": clip_start,
                 "end_time": clip_end,
                 "title": record["title"],
+                "origin": "batch_split",
                 "transcript": record["transcript"],
                 "status": "pending",
                 "source_video_storage_path_override": cleaned_storage_path,
