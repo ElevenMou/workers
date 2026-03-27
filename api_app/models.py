@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, HttpUrl
+from services.social.publish_config import PublishDestinationConfig
 
 
 class AnalyzeVideoRequest(BaseModel):
@@ -221,20 +222,14 @@ class CaptionPresetsResponse(BaseModel):
 
 class CreateClipPublicationsRequest(BaseModel):
     clipId: str = Field(..., description="Completed clip id to publish")
-    socialAccountIds: list[str] = Field(
+    destinations: list[PublishDestinationConfig] = Field(
         ...,
         min_length=1,
         max_length=12,
-        description="One or more linked social-account ids in the active workspace.",
+        description=(
+            "Validated per-destination publish configs for the active workspace."
+        ),
     )
-    caption: str = Field(..., min_length=1, max_length=2200)
-    youtubeTitle: Optional[str] = Field(default=None, max_length=100)
-    mode: Literal["now", "schedule"]
-    scheduledAt: Optional[datetime] = Field(
-        default=None,
-        description="Client local scheduled datetime with offset when mode=schedule.",
-    )
-    timeZone: str = Field(..., min_length=1, max_length=128)
     clientRequestId: str = Field(..., min_length=1, max_length=255)
 
 
@@ -253,6 +248,7 @@ class ClipPublicationResponse(BaseModel):
     attemptCount: int = 0
     captionSnapshot: Optional[str] = None
     youtubeTitleSnapshot: Optional[str] = None
+    resolvedConfig: Optional[PublishDestinationConfig] = None
     queuedAt: Optional[str] = None
     startedAt: Optional[str] = None
     publishedAt: Optional[str] = None

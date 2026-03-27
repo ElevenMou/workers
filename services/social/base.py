@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from services.social.publish_config import PublishDestinationConfig
+
 
 @dataclass
 class SocialAccountTokens:
@@ -34,6 +36,7 @@ class PublicationContext:
     caption: str
     youtube_title: str | None
     scheduled_for: datetime  # Always resolved to UTC by the task layer; never None at runtime
+    resolved_config: PublishDestinationConfig | None = None
 
 
 @dataclass

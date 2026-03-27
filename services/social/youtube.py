@@ -148,6 +148,9 @@ def _map_youtube_error(status_code: int, payload: dict) -> SocialProviderError:
 def _build_metadata(
     title: str,
     caption: str,
+    *,
+    privacy_status: str,
+    self_declared_made_for_kids: bool,
 ) -> dict:
     description = caption
     if "#Shorts" not in description:
@@ -160,8 +163,8 @@ def _build_metadata(
             "categoryId": "22",
         },
         "status": {
-            "privacyStatus": "public",
-            "selfDeclaredMadeForKids": False,
+            "privacyStatus": privacy_status,
+            "selfDeclaredMadeForKids": self_declared_made_for_kids,
         },
     }
 
@@ -171,12 +174,18 @@ def _initiate_resumable_upload(
     metadata: dict,
     file_size: int,
     content_type: str,
+    *,
+    notify_subscribers: bool,
 ) -> str:
     """POST metadata to YouTube and return the resumable upload URI."""
     response = resilient_request(
         "POST",
         _YOUTUBE_UPLOAD_URL,
-        params={"uploadType": "resumable", "part": "snippet,status"},
+        params={
+            "uploadType": "resumable",
+            "part": "snippet,status",
+            "notifySubscribers": str(notify_subscribers).lower(),
+        },
         headers={
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json; charset=UTF-8",
@@ -261,7 +270,27 @@ def publish_video(
         )
 
     caption = (publication.caption or "")[:5000]
-    metadata = _build_metadata(title, caption)
+    youtube_config = (
+        publication.resolved_config
+        if publication.resolved_config is not None
+        and getattr(publication.resolved_config, "provider", None) == "youtube_channel"
+        else None
+    )
+    youtube_settings = getattr(youtube_config, "youtube", None)
+    metadata = _build_metadata(
+        title,
+        caption,
+        privacy_status=(
+            str(youtube_settings.privacyStatus)
+            if youtube_settings is not None
+            else "public"
+        ),
+        self_declared_made_for_kids=(
+            bool(youtube_settings.selfDeclaredMadeForKids)
+            if youtube_settings is not None
+            else False
+        ),
+    )
 
     logger.info("Initiating YouTube resumable upload for publication %s (%d bytes)", publication.id, media.file_size)
 
@@ -270,6 +299,11 @@ def publish_video(
         metadata=metadata,
         file_size=media.file_size,
         content_type=media.content_type,
+        notify_subscribers=(
+            bool(youtube_settings.notifySubscribers)
+            if youtube_settings is not None
+            else True
+        ),
     )
 
     logger.info("Uploading video bytes for publication %s", publication.id)

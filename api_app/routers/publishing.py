@@ -24,6 +24,10 @@ from api_app.models import (
 )
 from utils.supabase_client import supabase
 from utils.media_storage import GeneratedClipStorageError, ensure_generated_clip_available
+from services.social.publish_config import (
+    PublishDestinationConfig,
+    destination_schedule_identity,
+)
 
 router = APIRouter()
 _SOCIAL_PRIORITY_QUEUE = "social-publishing-priority"
@@ -36,15 +40,38 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _normalize_scheduled_for(payload: CreateClipPublicationsRequest) -> datetime:
-    if payload.mode == "now":
+def _trim_optional_text(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _sort_destinations(
+    destinations: list[PublishDestinationConfig],
+) -> list[PublishDestinationConfig]:
+    return sorted(
+        destinations,
+        key=lambda destination: (
+            str(destination.provider),
+            str(destination.socialAccountId),
+        ),
+    )
+
+
+def _dump_destination_configs(
+    destinations: list[PublishDestinationConfig],
+) -> list[dict]:
+    return [destination.model_dump(mode="json") for destination in destinations]
+
+
+def _normalize_scheduled_for(schedule) -> datetime:
+    if schedule.mode == "now":
         return _utc_now()
-    if payload.scheduledAt is None:
+    if schedule.scheduledAt is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="scheduledAt is required when mode=schedule",
         )
-    scheduled_for = payload.scheduledAt
+    scheduled_for = schedule.scheduledAt
     if scheduled_for.tzinfo is None:
         scheduled_for = scheduled_for.replace(tzinfo=timezone.utc)
     else:
@@ -55,6 +82,62 @@ def _normalize_scheduled_for(payload: CreateClipPublicationsRequest) -> datetime
             detail="Scheduled publish time must be in the future.",
         )
     return scheduled_for
+
+
+def _resolve_destinations(
+    payload: CreateClipPublicationsRequest,
+) -> list[PublishDestinationConfig]:
+    destinations = _sort_destinations(list(payload.destinations))
+    if not destinations:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one destination is required.",
+        )
+
+    destination_clip_ids = {destination.clipId for destination in destinations}
+    if destination_clip_ids != {payload.clipId}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Every destination must target the same clipId as the request.",
+        )
+
+    unique_account_ids = {destination.socialAccountId for destination in destinations}
+    if len(unique_account_ids) != len(destinations):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Each destination account can only appear once per publish request.",
+        )
+
+    first_schedule = destination_schedule_identity(destinations[0])
+    if any(destination_schedule_identity(destination) != first_schedule for destination in destinations[1:]):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="All destinations in a single publish request must share the same schedule.",
+        )
+
+    return destinations
+
+
+def _batch_caption_from_destinations(
+    destinations: list[PublishDestinationConfig],
+) -> str:
+    for destination in destinations:
+        caption = _trim_optional_text(destination.content.caption)
+        if caption is not None:
+            return caption
+    return ""
+
+
+def _batch_youtube_title_from_destinations(
+    destinations: list[PublishDestinationConfig],
+) -> str | None:
+    for destination in destinations:
+        if destination.provider != "youtube_channel":
+            continue
+        title = _trim_optional_text(destination.content.title)
+        if title is not None:
+            return title
+    return None
 
 
 def _normalize_timestamp(value: object) -> datetime | None:
@@ -101,6 +184,7 @@ def _publication_response(row: dict) -> ClipPublicationResponse:
             if row.get("youtube_title_snapshot")
             else None
         ),
+        resolvedConfig=row.get("resolved_config_json") or None,
         queuedAt=(str(row["queued_at"]) if row.get("queued_at") else None),
         startedAt=(str(row["started_at"]) if row.get("started_at") else None),
         publishedAt=(str(row["published_at"]) if row.get("published_at") else None),
@@ -169,6 +253,34 @@ def _load_social_accounts_for_workspace(
     return rows
 
 
+def _assert_destination_accounts_match(
+    *,
+    destinations: list[PublishDestinationConfig],
+    social_accounts: list[dict],
+) -> None:
+    accounts_by_id = {
+        str(row["id"]): row
+        for row in social_accounts
+        if row.get("id")
+    }
+    for destination in destinations:
+        account = accounts_by_id.get(str(destination.socialAccountId))
+        if account is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="One or more publish destinations are missing an account mapping.",
+            )
+        account_provider = str(account.get("provider") or "")
+        if account_provider != str(destination.provider):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Destination provider {destination.provider} does not match "
+                    f"the connected account provider {account_provider}."
+                ),
+            )
+
+
 def _resolve_publish_access(user_id: str):
     context = get_user_access_context(user_id, supabase_client=supabase)
     if context.status == "past_due":
@@ -185,7 +297,11 @@ def _resolve_publish_access(user_id: str):
     return context
 
 
-def _validate_provider_specific_constraints(*, clip: dict, social_accounts: list[dict]) -> None:
+def _validate_provider_specific_constraints(
+    *,
+    clip: dict,
+    destinations: list[PublishDestinationConfig],
+) -> None:
     raw_duration = clip.get("duration_seconds")
     try:
         duration_seconds = float(raw_duration) if raw_duration is not None else None
@@ -195,7 +311,7 @@ def _validate_provider_specific_constraints(*, clip: dict, social_accounts: list
     if duration_seconds is None:
         return
 
-    providers = {str(row.get("provider") or "") for row in social_accounts}
+    providers = {str(destination.provider) for destination in destinations}
 
     if "youtube_channel" in providers and duration_seconds > float(YOUTUBE_SHORTS_MAX_DURATION_SECONDS):
         raise HTTPException(
@@ -208,6 +324,21 @@ def _validate_provider_specific_constraints(*, clip: dict, social_accounts: list
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Instagram Reels requires clips that are 15 minutes or shorter.",
         )
+
+    tiktok_destinations = [
+        destination
+        for destination in destinations
+        if destination.provider == "tiktok"
+    ]
+    for destination in tiktok_destinations:
+        max_duration = destination.tiktok.creatorInfo.maxVideoPostDurationSec
+        if max_duration is not None and duration_seconds > float(max_duration):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"TikTok account only supports videos up to {max_duration} seconds."
+                ),
+            )
 
 
 def _assert_clip_storage_ready_for_publish(clip: dict) -> None:
@@ -288,9 +419,7 @@ def _assert_existing_batch_matches_request(
     batch: dict,
     publications: list[dict],
     clip_id: str,
-    social_account_ids: list[str],
-    caption: str,
-    youtube_title: str | None,
+    requested_config_json: list[dict],
     scheduled_for: datetime,
     mode: str,
     time_zone: str,
@@ -300,14 +429,17 @@ def _assert_existing_batch_matches_request(
         for row in publications
         if row.get("social_account_id")
     }
-    requested_account_ids = {str(value) for value in social_account_ids}
+    requested_account_ids = {
+        str(row.get("socialAccountId") or "")
+        for row in requested_config_json
+        if row.get("socialAccountId")
+    }
     existing_scheduled_for = _normalize_timestamp(batch.get("scheduled_for"))
     mismatch = (
         str(batch.get("clip_id")) != clip_id
         or str(batch.get("publish_mode") or "") != mode
         or str(batch.get("scheduled_timezone") or "") != time_zone
-        or str(batch.get("caption") or "") != caption
-        or ((str(batch.get("youtube_title")) if batch.get("youtube_title") else None) != youtube_title)
+        or (batch.get("requested_config_json") or []) != requested_config_json
         or not existing_account_ids.issubset(requested_account_ids)
     )
     if mode == "schedule":
@@ -402,9 +534,7 @@ def _ensure_batch_publications(
     *,
     batch: dict,
     clip: dict,
-    social_accounts: list[dict],
-    caption: str,
-    youtube_title: str | None,
+    destinations: list[PublishDestinationConfig],
     scheduled_for: datetime,
     user_id: str,
 ) -> list[dict]:
@@ -418,20 +548,27 @@ def _ensure_batch_publications(
     publish_mode = str(batch.get("publish_mode") or "schedule")
     missing_rows: list[dict] = []
 
-    for social_account in social_accounts:
-        social_account_id = str(social_account["id"])
+    for destination in destinations:
+        social_account_id = str(destination.socialAccountId)
         if social_account_id in existing_account_ids:
             continue
+        caption = _trim_optional_text(destination.content.caption) or ""
+        youtube_title = (
+            _trim_optional_text(destination.content.title)
+            if destination.provider == "youtube_channel"
+            else None
+        )
         missing_rows.append(
             {
                 "id": str(uuid4()),
                 "batch_id": batch_id,
                 "clip_id": clip["id"],
-                "social_account_id": social_account["id"],
-                "provider": social_account["provider"],
+                "social_account_id": social_account_id,
+                "provider": destination.provider,
                 "status": "queued" if publish_mode == "now" else "scheduled",
                 "caption_snapshot": caption,
                 "youtube_title_snapshot": youtube_title,
+                "resolved_config_json": destination.model_dump(mode="json"),
                 "scheduled_for": scheduled_for.isoformat(),
                 "scheduled_timezone": batch["scheduled_timezone"],
                 "queued_at": _utc_now().isoformat() if publish_mode == "now" else None,
@@ -560,12 +697,9 @@ def create_clip_publications(
 ) -> CreateClipPublicationsResponse:
     user_id = current_user.id
     access_context = _resolve_publish_access(user_id)
-    caption = payload.caption.strip()
-    if not caption:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Caption is required.",
-        )
+    destinations = _resolve_destinations(payload)
+    requested_config_json = _dump_destination_configs(destinations)
+    shared_schedule = destinations[0].schedule
 
     clip = _load_workspace_clip(
         clip_id=payload.clipId,
@@ -582,20 +716,22 @@ def create_clip_publications(
     _assert_clip_storage_ready_for_publish(clip)
 
     social_accounts = _load_social_accounts_for_workspace(
-        social_account_ids=payload.socialAccountIds,
+        social_account_ids=[destination.socialAccountId for destination in destinations],
         user_id=user_id,
         workspace_team_id=access_context.workspace_team_id,
     )
-    youtube_selected = any(str(row.get("provider") or "") == "youtube_channel" for row in social_accounts)
-    youtube_title = (payload.youtubeTitle or "").strip() or str(clip.get("title") or "").strip() or None
-    if youtube_selected and not youtube_title:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="YouTube publishing requires a title.",
-        )
-    _validate_provider_specific_constraints(clip=clip, social_accounts=social_accounts)
+    _assert_destination_accounts_match(
+        destinations=destinations,
+        social_accounts=social_accounts,
+    )
+    _validate_provider_specific_constraints(clip=clip, destinations=destinations)
 
-    scheduled_for = _normalize_scheduled_for(payload)
+    scheduled_for = _normalize_scheduled_for(shared_schedule)
+    batch_caption = _batch_caption_from_destinations(destinations)
+    batch_youtube_title = (
+        _batch_youtube_title_from_destinations(destinations)
+        or _trim_optional_text(clip.get("title"))
+    )
     batch, created_batch = _create_or_load_batch(
         batch_payload={
             "id": str(uuid4()),
@@ -603,12 +739,13 @@ def create_clip_publications(
             "user_id": user_id,
             "team_id": access_context.workspace_team_id,
             "billing_owner_user_id": access_context.billing_owner_user_id or user_id,
-            "caption": caption,
-            "youtube_title": youtube_title,
+            "caption": batch_caption,
+            "youtube_title": batch_youtube_title,
             "scheduled_for": scheduled_for.isoformat(),
-            "scheduled_timezone": payload.timeZone,
-            "publish_mode": payload.mode,
+            "scheduled_timezone": shared_schedule.timeZone,
+            "publish_mode": shared_schedule.mode,
             "client_request_id": payload.clientRequestId,
+            "requested_config_json": requested_config_json,
         },
         client_request_id=payload.clientRequestId,
         user_id=user_id,
@@ -621,12 +758,10 @@ def create_clip_publications(
             batch=batch,
             publications=existing_publications,
             clip_id=str(clip["id"]),
-            social_account_ids=payload.socialAccountIds,
-            caption=caption,
-            youtube_title=youtube_title,
+            requested_config_json=requested_config_json,
             scheduled_for=scheduled_for,
-            mode=payload.mode,
-            time_zone=payload.timeZone,
+            mode=shared_schedule.mode,
+            time_zone=shared_schedule.timeZone,
         )
 
     _assert_no_duplicate_active_publications(
@@ -638,14 +773,12 @@ def create_clip_publications(
     publications = _ensure_batch_publications(
         batch=batch,
         clip=clip,
-        social_accounts=social_accounts,
-        caption=caption,
-        youtube_title=youtube_title,
+        destinations=destinations,
         scheduled_for=scheduled_for,
         user_id=user_id,
     )
 
-    if payload.mode == "now":
+    if shared_schedule.mode == "now":
         _ensure_dispatch_jobs_for_publications(
             publications=publications,
             clip=clip,

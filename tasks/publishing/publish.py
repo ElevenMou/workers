@@ -8,6 +8,8 @@ import shutil
 import traceback
 from datetime import datetime, timezone
 
+from pydantic import TypeAdapter
+
 from config import YOUTUBE_SHORTS_MAX_DURATION_SECONDS
 from services.social import publish_to_provider
 from services.social.base import (
@@ -17,6 +19,7 @@ from services.social.base import (
     SocialAccountTokens,
     SocialProviderError,
 )
+from services.social.publish_config import PublishDestinationConfig
 from services.clips.render_profiles import publish_profile_for_provider
 from services.social.crypto import (
     decrypt_text,
@@ -32,6 +35,7 @@ from utils.supabase_client import assert_response_ok, supabase, update_job_statu
 from utils.workdirs import create_work_dir
 
 logger = logging.getLogger(__name__)
+_PUBLISH_DESTINATION_CONFIG_ADAPTER = TypeAdapter(PublishDestinationConfig)
 
 
 def _utc_now_iso() -> str:
@@ -172,6 +176,19 @@ def _build_publication_context(publication: dict, clip: dict) -> PublicationCont
         scheduled_for = scheduled_for.replace(tzinfo=timezone.utc)
     else:
         scheduled_for = scheduled_for.astimezone(timezone.utc)
+    resolved_config_payload = publication.get("resolved_config_json") or None
+    try:
+        resolved_config = (
+            _PUBLISH_DESTINATION_CONFIG_ADAPTER.validate_python(resolved_config_payload)
+            if resolved_config_payload
+            else None
+        )
+    except Exception as exc:
+        raise SocialProviderError(
+            "The stored publish configuration is invalid. Recreate the publication and try again.",
+            code="publication_config_invalid",
+            provider_payload={"resolved_config_json": resolved_config_payload},
+        ) from exc
 
     return PublicationContext(
         id=str(publication["id"]),
@@ -184,6 +201,7 @@ def _build_publication_context(publication: dict, clip: dict) -> PublicationCont
             else None
         ),
         scheduled_for=scheduled_for,
+        resolved_config=resolved_config,
     )
 
 

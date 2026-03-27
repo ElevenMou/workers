@@ -20,6 +20,7 @@ from services.social.base import (
     SocialProviderError,
 )
 from services.social.http import pooled_client, resilient_client_request, resilient_request
+from services.social.media import is_publicly_reachable_url
 
 _TIKTOK_BASE = "https://open.tiktokapis.com"
 _MIN_UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024
@@ -327,26 +328,47 @@ def _init_video_publish(
     caption: str,
     privacy_level: str,
     media: PublicationMedia,
-    chunk_size: int,
-    total_chunk_count: int,
+    chunk_size: int | None = None,
+    total_chunk_count: int | None = None,
+    disable_duet: bool,
+    disable_comment: bool,
+    disable_stitch: bool,
+    brand_content_toggle: bool,
+    brand_organic_toggle: bool,
+    video_cover_timestamp_ms: int | None = None,
+    video_url: str | None = None,
 ) -> dict:
+    source_info = (
+        {
+            "source": "PULL_FROM_URL",
+            "video_url": video_url,
+        }
+        if video_url
+        else {
+            "source": "FILE_UPLOAD",
+            "video_size": media.file_size,
+            "chunk_size": chunk_size,
+            "total_chunk_count": total_chunk_count,
+        }
+    )
+    post_info = {
+        "title": caption[:2200],
+        "privacy_level": privacy_level,
+        "disable_duet": disable_duet,
+        "disable_comment": disable_comment,
+        "disable_stitch": disable_stitch,
+        "brand_content_toggle": brand_content_toggle,
+        "brand_organic_toggle": brand_organic_toggle,
+    }
+    if video_cover_timestamp_ms is not None:
+        post_info["video_cover_timestamp_ms"] = video_cover_timestamp_ms
+
     return _authorized_post(
         "/v2/post/publish/video/init/",
         token=account.tokens.access_token,
         json_body={
-            "post_info": {
-                "title": caption[:2200],
-                "privacy_level": privacy_level,
-                "disable_duet": False,
-                "disable_comment": False,
-                "disable_stitch": False,
-            },
-            "source_info": {
-                "source": "FILE_UPLOAD",
-                "video_size": media.file_size,
-                "chunk_size": chunk_size,
-                "total_chunk_count": total_chunk_count,
-            },
+            "post_info": post_info,
+            "source_info": source_info,
         },
     )
 
@@ -386,8 +408,23 @@ def publish_video(
         )
 
     privacy_options = creator_info.get("privacy_level_options") or []
-    privacy_level = _select_privacy_level(list(privacy_options))
-    chunk_size, total_chunk_count = _plan_file_upload(media.file_size)
+    tiktok_config = (
+        publication.resolved_config
+        if publication.resolved_config is not None
+        and getattr(publication.resolved_config, "provider", None) == "tiktok"
+        else None
+    )
+    tiktok_settings = getattr(tiktok_config, "tiktok", None)
+    privacy_level = (
+        str(tiktok_settings.privacyLevel)
+        if tiktok_settings is not None
+        else _select_privacy_level(list(privacy_options))
+    )
+    public_media_url = str(media.signed_url or "").strip()
+    use_pull_from_url = is_publicly_reachable_url(public_media_url)
+    chunk_size, total_chunk_count = (
+        _plan_file_upload(media.file_size) if not use_pull_from_url else (None, None)
+    )
 
     caption = publication.caption or ""
     init_payload = _init_video_publish(
@@ -397,6 +434,37 @@ def publish_video(
         media=media,
         chunk_size=chunk_size,
         total_chunk_count=total_chunk_count,
+        disable_duet=(
+            not bool(tiktok_settings.allowDuet)
+            if tiktok_settings is not None
+            else False
+        ),
+        disable_comment=(
+            not bool(tiktok_settings.allowComment)
+            if tiktok_settings is not None
+            else False
+        ),
+        disable_stitch=(
+            not bool(tiktok_settings.allowStitch)
+            if tiktok_settings is not None
+            else False
+        ),
+        brand_content_toggle=(
+            bool(tiktok_settings.brandContentToggle)
+            if tiktok_settings is not None
+            else False
+        ),
+        brand_organic_toggle=(
+            bool(tiktok_settings.brandOrganicToggle)
+            if tiktok_settings is not None
+            else False
+        ),
+        video_cover_timestamp_ms=(
+            publication.resolved_config.content.coverTimestampMs
+            if tiktok_config is not None
+            else None
+        ),
+        video_url=public_media_url if use_pull_from_url else None,
     )
 
     data = init_payload.get("data") or {}
@@ -412,20 +480,21 @@ def publish_video(
         publish_id, total_chunk_count, chunk_size,
     )
     upload_url = str(data.get("upload_url") or "").strip()
-    if not upload_url:
-        raise SocialProviderError(
-            "TikTok direct post initialization did not return an upload URL.",
-            code="tiktok_missing_upload_url",
-            provider_payload=init_payload,
-        )
+    if not use_pull_from_url:
+        if not upload_url:
+            raise SocialProviderError(
+                "TikTok direct post initialization did not return an upload URL.",
+                code="tiktok_missing_upload_url",
+                provider_payload=init_payload,
+            )
 
-    _upload_file_chunks(
-        upload_url=upload_url,
-        media=media,
-        chunk_size=chunk_size,
-        total_chunk_count=total_chunk_count,
-        publish_id=str(publish_id),
-    )
+        _upload_file_chunks(
+            upload_url=upload_url,
+            media=media,
+            chunk_size=int(chunk_size or 0),
+            total_chunk_count=int(total_chunk_count or 0),
+            publish_id=str(publish_id),
+        )
 
     deadline = time.monotonic() + 180
     last_status_payload: dict = {}
@@ -463,6 +532,7 @@ def publish_video(
                         "creator_info": creator_info,
                         "init": init_payload,
                         "status": status_data,
+                        "source": "PULL_FROM_URL" if use_pull_from_url else "FILE_UPLOAD",
                     },
                     result_payload={"platform": "tiktok", "publish_id": str(publish_id)},
                 )

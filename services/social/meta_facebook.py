@@ -162,6 +162,13 @@ def _validate_reel_media(media: PublicationMedia) -> None:
         )
 
 
+def _publication_title(publication: PublicationContext) -> str:
+    resolved_title = None
+    if publication.resolved_config is not None:
+        resolved_title = publication.resolved_config.content.title
+    return (resolved_title or publication.clip_title or publication.caption or "").strip()[:100] or "Clipry clip"
+
+
 def _start_reel_upload(account: SocialAccountContext) -> tuple[str, str, dict]:
     response = resilient_request(
         "POST",
@@ -284,7 +291,7 @@ def _finish_reel_publish(
     publication: PublicationContext,
     video_id: str,
 ) -> dict:
-    title = (publication.clip_title or publication.caption or "").strip()[:100] or "Clipry clip"
+    title = _publication_title(publication)
     response = resilient_request(
         "POST",
         f"{_GRAPH_BASE}/me/video_reels",
@@ -372,7 +379,7 @@ def _upload_page_video(
         )
 
     page_id = account.external_account_id
-    title = (publication.clip_title or publication.caption or "").strip()[:100] or "Clipry clip"
+    title = _publication_title(publication)
 
     try:
         with open(media.local_path, "rb") as handle:
