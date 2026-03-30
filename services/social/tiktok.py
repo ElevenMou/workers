@@ -12,6 +12,10 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+from config import (
+    TIKTOK_PREFER_PULL_FROM_URL,
+    TIKTOK_VERIFIED_SOURCE_URL_PREFIXES,
+)
 from services.social.base import (
     PublicationContext,
     PublicationMedia,
@@ -27,6 +31,7 @@ _MIN_UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024
 _DEFAULT_UPLOAD_CHUNK_BYTES = 10 * 1024 * 1024
 _MAX_UPLOAD_CHUNK_BYTES = 64 * 1024 * 1024
 _MAX_UPLOAD_CHUNKS = 1000
+_TIKTOK_QUOTA_ERROR_CODE = "tiktok_publish_rate_limited"
 
 
 def _read_json_payload(response: httpx.Response) -> dict:
@@ -45,6 +50,122 @@ def _read_oauth_error_message(payload: dict, fallback: str) -> str:
         or payload.get("error")
         or fallback
     )
+
+
+def _normalize_error_code(value: object, default: str = "tiktok_api_error") -> str:
+    normalized = str(value or "").strip()
+    return normalized or default
+
+
+def _is_access_token_invalid(code: object) -> bool:
+    normalized = str(code or "").strip().lower()
+    return normalized in {
+        "access_token_invalid",
+        "invalid_access_token",
+        "invalid_token",
+    }
+
+
+def _is_url_ownership_unverified(code: object) -> bool:
+    return str(code or "").strip().lower() == "url_ownership_unverified"
+
+
+def _looks_like_quota_or_spam_error(code: object, message: object) -> bool:
+    normalized_code = str(code or "").strip().lower()
+    normalized_message = str(message or "").strip().lower()
+    return any(
+        token in normalized_code
+        for token in ("quota", "rate_limit", "too_many", "spam", "cap")
+    ) or any(
+        token in normalized_message
+        for token in ("quota", "rate limit", "too many", "spam", "cap")
+    )
+
+
+def _normalize_provider_error(
+    payload: dict,
+    fallback: str,
+    *,
+    status_code: int | None = None,
+) -> SocialProviderError:
+    error = payload.get("error") or {}
+    code = _normalize_error_code(error.get("code"))
+    message = str(error.get("message") or fallback).strip() or fallback
+    recoverable = False
+
+    if code == "unaudited_client_can_only_post_to_private_accounts":
+        message = (
+            "TikTok blocked direct publish because this app is unaudited. "
+            "Use a private TikTok account for testing or complete TikTok Content Posting API audit."
+        )
+    elif code == "scope_not_authorized":
+        message = (
+            "TikTok publishing permissions are missing. Reconnect the account and approve "
+            "user.info.basic and video.publish."
+        )
+    elif _is_access_token_invalid(code):
+        message = "TikTok access expired or was revoked. Reconnect the account and try again."
+    elif _is_url_ownership_unverified(code):
+        message = (
+            "TikTok rejected the source URL because its domain is not verified in TikTok "
+            "development configuration. Falling back to file upload is required."
+        )
+    elif _looks_like_quota_or_spam_error(code, message):
+        code = _TIKTOK_QUOTA_ERROR_CODE
+        message = (
+            "TikTok temporarily blocked publishing because the account or app hit a posting "
+            "limit. Wait and try again."
+        )
+        recoverable = True
+
+    return SocialProviderError(
+        message,
+        code=code,
+        recoverable=recoverable,
+        refresh_required=bool(status_code == 401 or _is_access_token_invalid(code)),
+        provider_payload=payload,
+    )
+
+
+def _raise_for_api_error(
+    payload: dict,
+    fallback: str,
+    *,
+    status_code: int | None = None,
+) -> None:
+    error = payload.get("error") or {}
+    if error.get("code") in {None, "", "ok"}:
+        return
+    raise _normalize_provider_error(payload, fallback, status_code=status_code)
+
+
+def _url_matches_verified_source_prefix(url: str) -> bool:
+    normalized_url = str(url or "").strip()
+    if not normalized_url:
+        return False
+    return any(
+        normalized_url.startswith(prefix)
+        for prefix in TIKTOK_VERIFIED_SOURCE_URL_PREFIXES
+    )
+
+
+def _should_use_pull_from_url(url: str) -> bool:
+    if not TIKTOK_PREFER_PULL_FROM_URL:
+        return False
+    if not is_publicly_reachable_url(url):
+        return False
+    return _url_matches_verified_source_prefix(url)
+
+
+def _normalize_publish_failure(fail_reason: object) -> tuple[str, str, bool]:
+    message = str(fail_reason or "TikTok direct post failed.").strip()
+    if _looks_like_quota_or_spam_error("", message):
+        return (
+            _TIKTOK_QUOTA_ERROR_CODE,
+            "TikTok temporarily blocked publishing because the account or app hit a posting limit. Wait and try again.",
+            True,
+        )
+    return ("tiktok_publish_failed", message or "TikTok direct post failed.", False)
 
 
 def _tiktok_client_key() -> str:
@@ -138,19 +259,10 @@ def _authorized_post(
         )
     payload = _read_json_payload(response)
     if response.status_code >= 400:
-        error = payload.get("error") or {}
-        error_code = str(error.get("code") or "tiktok_api_error")
-        message = error.get("message") or "TikTok API request failed."
-        if error_code == "unaudited_client_can_only_post_to_private_accounts":
-            message = (
-                "TikTok blocked direct publish because this app is unaudited. "
-                "Use a private TikTok account for testing or complete TikTok Content Posting API audit."
-            )
-        raise SocialProviderError(
-            message,
-            code=error_code,
-            refresh_required=response.status_code == 401,
-            provider_payload=payload,
+        raise _normalize_provider_error(
+            payload,
+            "TikTok API request failed.",
+            status_code=response.status_code,
         )
     return payload if isinstance(payload, dict) else {"raw": payload}
 
@@ -161,13 +273,7 @@ def _query_creator_info(account: SocialAccountContext) -> dict:
         token=account.tokens.access_token,
         json_body={},
     )
-    error = payload.get("error") or {}
-    if error.get("code") not in {None, "", "ok"}:
-        raise SocialProviderError(
-            error.get("message") or "TikTok creator info query failed.",
-            code=str(error.get("code")),
-            provider_payload=payload,
-        )
+    _raise_for_api_error(payload, "TikTok creator info query failed.")
     return payload.get("data") or {}
 
 
@@ -196,13 +302,7 @@ def _fetch_publish_status(account: SocialAccountContext, publish_id: str) -> dic
         token=account.tokens.access_token,
         json_body={"publish_id": publish_id},
     )
-    error = payload.get("error") or {}
-    if error.get("code") not in {None, "", "ok"}:
-        raise SocialProviderError(
-            error.get("message") or "TikTok status fetch failed.",
-            code=str(error.get("code")),
-            provider_payload=payload,
-        )
+    _raise_for_api_error(payload, "TikTok status fetch failed.")
     return payload.get("data") or {}
 
 
@@ -335,6 +435,7 @@ def _init_video_publish(
     disable_stitch: bool,
     brand_content_toggle: bool,
     brand_organic_toggle: bool,
+    is_aigc: bool,
     video_cover_timestamp_ms: int | None = None,
     video_url: str | None = None,
 ) -> dict:
@@ -359,11 +460,12 @@ def _init_video_publish(
         "disable_stitch": disable_stitch,
         "brand_content_toggle": brand_content_toggle,
         "brand_organic_toggle": brand_organic_toggle,
+        "is_aigc": is_aigc,
     }
     if video_cover_timestamp_ms is not None:
         post_info["video_cover_timestamp_ms"] = video_cover_timestamp_ms
 
-    return _authorized_post(
+    payload = _authorized_post(
         "/v2/post/publish/video/init/",
         token=account.tokens.access_token,
         json_body={
@@ -371,6 +473,8 @@ def _init_video_publish(
             "source_info": source_info,
         },
     )
+    _raise_for_api_error(payload, "TikTok direct post initialization failed.")
+    return payload
 
 
 def publish_video(
@@ -421,51 +525,78 @@ def publish_video(
         else _select_privacy_level(list(privacy_options))
     )
     public_media_url = str(media.signed_url or "").strip()
-    use_pull_from_url = is_publicly_reachable_url(public_media_url)
+    use_pull_from_url = _should_use_pull_from_url(public_media_url)
     chunk_size, total_chunk_count = (
-        _plan_file_upload(media.file_size) if not use_pull_from_url else (None, None)
+        (None, None) if use_pull_from_url else _plan_file_upload(media.file_size)
     )
+    initial_source = "PULL_FROM_URL" if use_pull_from_url else "FILE_UPLOAD"
 
     caption = publication.caption or ""
-    init_payload = _init_video_publish(
-        account=account,
-        caption=caption,
-        privacy_level=privacy_level,
-        media=media,
-        chunk_size=chunk_size,
-        total_chunk_count=total_chunk_count,
-        disable_duet=(
+    init_kwargs = {
+        "account": account,
+        "caption": caption,
+        "privacy_level": privacy_level,
+        "media": media,
+        "disable_duet": (
             not bool(tiktok_settings.allowDuet)
             if tiktok_settings is not None
             else False
         ),
-        disable_comment=(
+        "disable_comment": (
             not bool(tiktok_settings.allowComment)
             if tiktok_settings is not None
             else False
         ),
-        disable_stitch=(
+        "disable_stitch": (
             not bool(tiktok_settings.allowStitch)
             if tiktok_settings is not None
             else False
         ),
-        brand_content_toggle=(
+        "brand_content_toggle": (
             bool(tiktok_settings.brandContentToggle)
             if tiktok_settings is not None
             else False
         ),
-        brand_organic_toggle=(
+        "brand_organic_toggle": (
             bool(tiktok_settings.brandOrganicToggle)
             if tiktok_settings is not None
             else False
         ),
-        video_cover_timestamp_ms=(
+        "is_aigc": (
+            bool(tiktok_settings.isAigc)
+            if tiktok_settings is not None
+            else False
+        ),
+        "video_cover_timestamp_ms": (
             publication.resolved_config.content.coverTimestampMs
             if tiktok_config is not None
             else None
         ),
-        video_url=public_media_url if use_pull_from_url else None,
-    )
+    }
+
+    try:
+        init_payload = _init_video_publish(
+            chunk_size=chunk_size,
+            total_chunk_count=total_chunk_count,
+            video_url=public_media_url if use_pull_from_url else None,
+            **init_kwargs,
+        )
+    except SocialProviderError as exc:
+        if use_pull_from_url and _is_url_ownership_unverified(exc.code):
+            logger.warning(
+                "TikTok rejected URL ownership for %s; retrying with file upload",
+                publication.id,
+            )
+            use_pull_from_url = False
+            chunk_size, total_chunk_count = _plan_file_upload(media.file_size)
+            init_payload = _init_video_publish(
+                chunk_size=chunk_size,
+                total_chunk_count=total_chunk_count,
+                video_url=None,
+                **init_kwargs,
+            )
+        else:
+            raise
 
     data = init_payload.get("data") or {}
     publish_id = data.get("publish_id")
@@ -476,8 +607,11 @@ def publish_video(
             provider_payload=init_payload,
         )
     logger.info(
-        "TikTok publish initialized: publish_id=%s, chunks=%d, chunk_size=%d",
-        publish_id, total_chunk_count, chunk_size,
+        "TikTok publish initialized: publish_id=%s, source=%s, chunks=%s, chunk_size=%s",
+        publish_id,
+        "PULL_FROM_URL" if use_pull_from_url else "FILE_UPLOAD",
+        total_chunk_count,
+        chunk_size,
     )
     upload_url = str(data.get("upload_url") or "").strip()
     if not use_pull_from_url:
@@ -507,13 +641,7 @@ def publish_video(
                 json_body={"publish_id": str(publish_id)},
                 client=client,
             )
-            error = (status_payload.get("error") or {})
-            if error.get("code") not in {None, "", "ok"}:
-                raise SocialProviderError(
-                    error.get("message") or "TikTok status fetch failed.",
-                    code=str(error.get("code")),
-                    provider_payload=status_payload,
-                )
+            _raise_for_api_error(status_payload, "TikTok status fetch failed.")
             status_data = status_payload.get("data") or {}
             last_status_payload = status_data
             status = str(status_data.get("status") or "").upper()
@@ -532,6 +660,7 @@ def publish_video(
                         "creator_info": creator_info,
                         "init": init_payload,
                         "status": status_data,
+                        "initial_source": initial_source,
                         "source": "PULL_FROM_URL" if use_pull_from_url else "FILE_UPLOAD",
                     },
                     result_payload={"platform": "tiktok", "publish_id": str(publish_id)},
@@ -547,13 +676,19 @@ def publish_video(
                     },
                 )
             if status == "FAILED":
+                failure_code, failure_message, failure_recoverable = _normalize_publish_failure(
+                    status_data.get("fail_reason")
+                )
                 raise SocialProviderError(
-                    status_data.get("fail_reason") or "TikTok direct post failed.",
-                    code="tiktok_publish_failed",
+                    failure_message,
+                    code=failure_code,
+                    recoverable=failure_recoverable,
                     provider_payload={
                         "creator_info": creator_info,
                         "init": init_payload,
                         "status": status_data,
+                        "initial_source": initial_source,
+                        "source": "PULL_FROM_URL" if use_pull_from_url else "FILE_UPLOAD",
                     },
                 )
             time.sleep(poll_delay)
@@ -567,5 +702,7 @@ def publish_video(
             "creator_info": creator_info,
             "init": init_payload,
             "status": last_status_payload,
+            "initial_source": initial_source,
+            "source": "PULL_FROM_URL" if use_pull_from_url else "FILE_UPLOAD",
         },
     )

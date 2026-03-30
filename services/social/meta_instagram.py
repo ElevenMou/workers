@@ -106,15 +106,52 @@ def _create_video_url_reel_container(
     publication: PublicationContext,
     video_url: str,
 ) -> tuple[str, dict]:
+    instagram_config = (
+        publication.resolved_config
+        if publication.resolved_config is not None
+        and getattr(publication.resolved_config, "provider", None) == "instagram_business"
+        else None
+    )
+    instagram_settings = getattr(instagram_config, "instagram", None)
+    data: dict[str, str] = {
+        "access_token": account.tokens.access_token,
+        "media_type": "REELS",
+        "video_url": video_url,
+        "caption": publication.caption or "",
+    }
+    if instagram_settings is not None:
+        if instagram_settings.audioName:
+            data["audio_name"] = str(instagram_settings.audioName)
+        if instagram_settings.collaborators:
+            data["collaborators"] = json.dumps(
+                [str(username) for username in instagram_settings.collaborators]
+            )
+        if instagram_settings.coverUrl is not None:
+            data["cover_url"] = str(instagram_settings.coverUrl)
+        if instagram_settings.locationId:
+            data["location_id"] = str(instagram_settings.locationId)
+        if instagram_settings.thumbOffsetSeconds is not None:
+            data["thumb_offset"] = str(instagram_settings.thumbOffsetSeconds)
+        if instagram_settings.userTags:
+            data["user_tags"] = json.dumps(
+                [tag.model_dump(mode="json") for tag in instagram_settings.userTags]
+            )
+        if instagram_settings.trialEnabled:
+            data["trial_params"] = json.dumps(
+                {
+                    "is_enabled": True,
+                    "graduation_strategy": (
+                        str(instagram_settings.trialGraduationStrategy)
+                        if instagram_settings.trialGraduationStrategy is not None
+                        else "MANUAL"
+                    ),
+                }
+            )
+
     response = resilient_request(
         "POST",
         f"{_GRAPH_BASE}/{account.external_account_id}/media",
-        data={
-            "access_token": account.tokens.access_token,
-            "media_type": "REELS",
-            "video_url": video_url,
-            "caption": publication.caption or "",
-        },
+        data=data,
         timeout=60.0,
     )
     payload = _read_payload(response)
@@ -225,6 +262,16 @@ def publish_reel(
     creation_id = ""
     upload_mode = "video_url"
     upload_payload = {"source": "video_url"}
+    requested_post_publish_actions: dict[str, object] = {}
+    instagram_config = (
+        publication.resolved_config
+        if publication.resolved_config is not None
+        and getattr(publication.resolved_config, "provider", None) == "instagram_business"
+        else None
+    )
+    instagram_settings = getattr(instagram_config, "instagram", None)
+    if instagram_settings is not None and not bool(instagram_settings.commentsEnabled):
+        requested_post_publish_actions["commentsEnabled"] = False
 
     creation_id, create_payload = _create_video_url_reel_container(
         account=account,
@@ -311,6 +358,7 @@ def publish_reel(
             "publish": publish_payload,
             "upload_mode": upload_mode,
             "media_url_host": _instagram_media_url_host(media),
+            "requested_post_publish_actions": requested_post_publish_actions,
         },
         result_payload={"platform": "instagram_business", "media_id": str(media_id)},
     )

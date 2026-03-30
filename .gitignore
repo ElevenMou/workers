@@ -14,3 +14,4 @@ __pycache__/
 .env.test
 .env.production
 secrets/
+cookies.txt

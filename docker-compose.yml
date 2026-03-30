@@ -51,14 +51,14 @@ services:
 
   # ---------- Caddy (TLS termination + load balancer) ----------
   # Automatically provisions Let's Encrypt certificates for CADDY_DOMAIN.
-  # Local development listens on :8080 without TLS.
+  # Local development listens on :7050 without TLS.
   # For a real domain with automatic TLS, publish 80/443 instead.
   caddy:
     image: caddy:2-alpine
     ports:
-      - "8080:8080"
+      - "7050:7050"
     environment:
-      - CADDY_DOMAIN=${CADDY_DOMAIN:-:8080}
+      - CADDY_DOMAIN=${CADDY_DOMAIN:-:7050}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

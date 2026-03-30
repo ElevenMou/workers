@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -169,6 +170,32 @@ def _publication_title(publication: PublicationContext) -> str:
     return (resolved_title or publication.clip_title or publication.caption or "").strip()[:100] or "Clipry clip"
 
 
+def _facebook_config(publication: PublicationContext):
+    if (
+        publication.resolved_config is None
+        or getattr(publication.resolved_config, "provider", None) != "facebook_page"
+    ):
+        return None
+    return publication.resolved_config.facebook
+
+
+def _facebook_follow_up_requests(publication: PublicationContext) -> dict[str, object]:
+    facebook_settings = _facebook_config(publication)
+    if facebook_settings is None:
+        return {}
+    return {
+        "collaboratorPageId": (
+            str(facebook_settings.collaboratorPageId)
+            if facebook_settings.collaboratorPageId
+            else None
+        ),
+        "crosspostPageIds": [str(page_id) for page_id in facebook_settings.crosspostPageIds],
+        "allowBusinessManagerCrossposting": bool(
+            facebook_settings.allowBusinessManagerCrossposting
+        ),
+    }
+
+
 def _start_reel_upload(account: SocialAccountContext) -> tuple[str, str, dict]:
     response = resilient_request(
         "POST",
@@ -292,17 +319,21 @@ def _finish_reel_publish(
     video_id: str,
 ) -> dict:
     title = _publication_title(publication)
+    facebook_settings = _facebook_config(publication)
+    data = {
+        "access_token": account.tokens.access_token,
+        "video_id": video_id,
+        "upload_phase": "finish",
+        "video_state": "PUBLISHED",
+        "description": publication.caption or "",
+        "title": title,
+    }
+    if facebook_settings is not None and facebook_settings.placeId:
+        data["place"] = str(facebook_settings.placeId)
     response = resilient_request(
         "POST",
         f"{_GRAPH_BASE}/me/video_reels",
-        data={
-            "access_token": account.tokens.access_token,
-            "video_id": video_id,
-            "upload_phase": "finish",
-            "video_state": "PUBLISHED",
-            "description": publication.caption or "",
-            "title": title,
-        },
+        data=data,
         timeout=60.0,
     )
     payload = _read_payload(response)
@@ -380,17 +411,38 @@ def _upload_page_video(
 
     page_id = account.external_account_id
     title = _publication_title(publication)
+    facebook_settings = _facebook_config(publication)
+    data = {
+        "access_token": account.tokens.access_token,
+        "description": publication.caption or "",
+        "title": title,
+    }
+    if facebook_settings is not None:
+        if facebook_settings.placeId:
+            data["place"] = str(facebook_settings.placeId)
+        if facebook_settings.contentCategory is not None:
+            data["content_category"] = str(facebook_settings.contentCategory)
+        if facebook_settings.contentTags:
+            data["content_tags"] = json.dumps(
+                [str(tag) for tag in facebook_settings.contentTags]
+            )
+        if facebook_settings.hideFromNewsfeed:
+            data["hide_from_newsfeed"] = "true"
+        if facebook_settings.feedTargeting is not None:
+            data["feed_targeting"] = json.dumps(
+                facebook_settings.feedTargeting.model_dump(mode="json")
+            )
+        if facebook_settings.targeting is not None:
+            data["targeting"] = json.dumps(
+                facebook_settings.targeting.model_dump(mode="json")
+            )
 
     try:
         with open(media.local_path, "rb") as handle:
             response = resilient_request(
                 "POST",
                 f"{_GRAPH_BASE}/{page_id}/videos",
-                data={
-                    "access_token": account.tokens.access_token,
-                    "description": publication.caption or "",
-                    "title": title,
-                },
+                data=data,
                 files={"source": (os.path.basename(media.local_path), handle, media.content_type)},
                 timeout=300.0,
                 max_retries=2,
@@ -426,7 +478,10 @@ def _upload_page_video(
     return PublicationResult(
         remote_post_id=video_id,
         remote_post_url=permalink,
-        provider_payload={"upload": payload},
+        provider_payload={
+            "upload": payload,
+            "requested_follow_ups": _facebook_follow_up_requests(publication),
+        },
         result_payload={
             "platform": "facebook_page",
             "video_id": video_id,
@@ -441,6 +496,69 @@ def publish_video(
     publication: PublicationContext,
     media: PublicationMedia,
 ) -> PublicationResult:
+    facebook_settings = _facebook_config(publication)
+    publish_target = (
+        str(facebook_settings.publishTarget)
+        if facebook_settings is not None
+        else "auto"
+    )
+
+    if publish_target == "reel":
+        logger.info(
+            "Starting Facebook Reels publish for publication %s (%d bytes, %.1fs)",
+            publication.id,
+            media.file_size,
+            media.duration_seconds or 0,
+        )
+        _validate_reel_media(media)
+
+        video_id, start_payload, upload_payload = "", {}, {}
+        upload_status_payload, finish_payload, publish_status_payload = {}, {}, {}
+
+        video_id, _upload_url, start_payload = _start_reel_upload(account)
+        logger.info("Facebook Reels upload session started: video_id=%s", video_id)
+        upload_payload = _upload_reel_bytes(_upload_url, media, account.tokens.access_token)
+        upload_status_payload = _wait_for_upload(video_id, account.tokens.access_token)
+        finish_payload = _finish_reel_publish(
+            account=account,
+            publication=publication,
+            video_id=video_id,
+        )
+        publish_status_payload = _wait_for_publish(video_id, account.tokens.access_token)
+        permalink = _fetch_reel_permalink(video_id, account.tokens.access_token)
+        logger.info("Facebook Reels publish complete: video_id=%s, permalink=%s", video_id, permalink)
+
+        return PublicationResult(
+            remote_post_id=video_id,
+            remote_post_url=permalink,
+            provider_payload={
+                "start": start_payload,
+                "upload": upload_payload,
+                "upload_status": upload_status_payload,
+                "finish": finish_payload,
+                "publish_status": publish_status_payload,
+                "requested_follow_ups": _facebook_follow_up_requests(publication),
+            },
+            result_payload={
+                "platform": "facebook_page",
+                "video_id": video_id,
+                "publish_target": "facebook_reels",
+            },
+        )
+
+    if publish_target == "page_video":
+        logger.info(
+            "Starting Facebook Page Video upload for publication %s (%d bytes, %.1fs)",
+            publication.id,
+            media.file_size,
+            media.duration_seconds or 0,
+        )
+        return _upload_page_video(
+            account=account,
+            publication=publication,
+            media=media,
+        )
+
     if _is_reel_eligible(media):
         logger.info(
             "Starting Facebook Reels publish for publication %s (%d bytes, %.1fs)",
@@ -473,6 +591,7 @@ def publish_video(
                 "upload_status": upload_status_payload,
                 "finish": finish_payload,
                 "publish_status": publish_status_payload,
+                "requested_follow_ups": _facebook_follow_up_requests(publication),
             },
             result_payload={
                 "platform": "facebook_page",

@@ -61,6 +61,14 @@ def _env_float(
     return parsed
 
 
+def _env_csv(name: str) -> tuple[str, ...]:
+    return tuple(
+        entry.strip()
+        for entry in (os.getenv(name) or "").split(",")
+        if entry.strip()
+    )
+
+
 # ---------------------------------------------------------------------------
 # Supabase
 # ---------------------------------------------------------------------------
@@ -368,6 +376,11 @@ YOUTUBE_SHORTS_MAX_DURATION_SECONDS = _env_int(
     minimum=1,
 )
 SOCIAL_ACCOUNT_ENCRYPTION_KEY = os.getenv("SOCIAL_ACCOUNT_ENCRYPTION_KEY")
+TIKTOK_PREFER_PULL_FROM_URL = _env_bool("TIKTOK_PREFER_PULL_FROM_URL", False)
+TIKTOK_VERIFIED_SOURCE_URL_PREFIXES = tuple(
+    value.rstrip("/")
+    for value in _env_csv("TIKTOK_VERIFIED_SOURCE_URL_PREFIXES")
+)
 
 
 # ---------------------------------------------------------------------------

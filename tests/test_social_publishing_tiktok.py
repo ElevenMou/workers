@@ -41,6 +41,17 @@ def _account(refresh_token: str | None = "refresh-token") -> SocialAccountContex
     )
 
 
+def _publication() -> PublicationContext:
+    return PublicationContext(
+        id="publication-1",
+        clip_id="clip-1",
+        clip_title="Launch clip",
+        caption="Launch caption",
+        youtube_title=None,
+        scheduled_for=datetime.now(timezone.utc),
+    )
+
+
 def test_tiktok_refresh_token_returns_none_without_refresh_token():
     assert tiktok.refresh_access_token(_account(refresh_token=None)) is None
 
@@ -130,14 +141,7 @@ def test_tiktok_publish_video_init_uses_floor_chunk_count_for_large_files(tmp_pa
         height=1920,
         duration_seconds=66.0,
     )
-    publication = PublicationContext(
-        id="publication-1",
-        clip_id="clip-1",
-        clip_title="Launch clip",
-        caption="Launch caption",
-        youtube_title=None,
-        scheduled_for=datetime.now(timezone.utc),
-    )
+    publication = _publication()
     init_calls: list[dict] = []
 
     monkeypatch.setattr(
@@ -178,3 +182,261 @@ def test_tiktok_publish_video_init_uses_floor_chunk_count_for_large_files(tmp_pa
     assert init_calls
     assert init_calls[0]["chunk_size"] == 10 * 1024 * 1024
     assert init_calls[0]["total_chunk_count"] == 7
+
+
+def test_tiktok_publish_video_prefers_file_upload_by_default_even_with_public_url(
+    tmp_path,
+    monkeypatch,
+):
+    clip_path = tmp_path / "clip.mp4"
+    clip_path.write_bytes(b"clip")
+    media = PublicationMedia(
+        local_path=str(clip_path),
+        file_size=4,
+        content_type="video/mp4",
+        signed_url="https://cdn.clipry.example/clips/clip.mp4",
+        width=1080,
+        height=1920,
+        duration_seconds=30.0,
+    )
+    init_calls: list[dict] = []
+
+    monkeypatch.setattr(tiktok, "TIKTOK_PREFER_PULL_FROM_URL", False)
+    monkeypatch.setattr(tiktok, "TIKTOK_VERIFIED_SOURCE_URL_PREFIXES", ())
+    monkeypatch.setattr(
+        tiktok,
+        "_query_creator_info",
+        lambda _account: {
+            "privacy_level_options": ["SELF_ONLY"],
+            "max_video_post_duration_sec": 600,
+        },
+    )
+    monkeypatch.setattr(
+        tiktok,
+        "_upload_file_chunks",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        tiktok,
+        "_authorized_post",
+        lambda *args, **kwargs: {
+            "error": {"code": "ok"},
+            "data": {
+                "status": "PUBLISH_COMPLETE",
+                "publicly_available_post_id": ["post-123"],
+            },
+        },
+    )
+    monkeypatch.setattr(tiktok.time, "sleep", lambda _seconds: None)
+
+    def _fake_init_video_publish(**kwargs):
+        init_calls.append(kwargs)
+        return {"data": {"publish_id": "publish-123", "upload_url": "https://upload.example.com"}}
+
+    monkeypatch.setattr(tiktok, "_init_video_publish", _fake_init_video_publish)
+
+    result = tiktok.publish_video(
+        account=_account(),
+        publication=_publication(),
+        media=media,
+    )
+
+    assert result.remote_post_id == "post-123"
+    assert init_calls[0]["video_url"] is None
+    assert init_calls[0]["chunk_size"] == 4
+    assert init_calls[0]["total_chunk_count"] == 1
+
+
+def test_tiktok_publish_video_uses_pull_from_url_only_for_verified_prefix(
+    tmp_path,
+    monkeypatch,
+):
+    clip_path = tmp_path / "clip.mp4"
+    clip_path.write_bytes(b"clip")
+    media = PublicationMedia(
+        local_path=str(clip_path),
+        file_size=4,
+        content_type="video/mp4",
+        signed_url="https://cdn.clipry.example/clips/clip.mp4",
+        width=1080,
+        height=1920,
+        duration_seconds=30.0,
+    )
+    init_calls: list[dict] = []
+
+    monkeypatch.setattr(tiktok, "TIKTOK_PREFER_PULL_FROM_URL", True)
+    monkeypatch.setattr(
+        tiktok,
+        "TIKTOK_VERIFIED_SOURCE_URL_PREFIXES",
+        ("https://cdn.clipry.example/clips",),
+    )
+    monkeypatch.setattr(
+        tiktok,
+        "_query_creator_info",
+        lambda _account: {
+            "privacy_level_options": ["SELF_ONLY"],
+            "max_video_post_duration_sec": 600,
+        },
+    )
+    monkeypatch.setattr(
+        tiktok,
+        "_authorized_post",
+        lambda *args, **kwargs: {
+            "error": {"code": "ok"},
+            "data": {
+                "status": "PUBLISH_COMPLETE",
+                "publicly_available_post_id": ["post-123"],
+            },
+        },
+    )
+    monkeypatch.setattr(tiktok.time, "sleep", lambda _seconds: None)
+
+    def _fake_init_video_publish(**kwargs):
+        init_calls.append(kwargs)
+        return {"data": {"publish_id": "publish-123"}}
+
+    monkeypatch.setattr(tiktok, "_init_video_publish", _fake_init_video_publish)
+
+    result = tiktok.publish_video(
+        account=_account(),
+        publication=_publication(),
+        media=media,
+    )
+
+    assert result.remote_post_id == "post-123"
+    assert init_calls[0]["video_url"] == "https://cdn.clipry.example/clips/clip.mp4"
+    assert init_calls[0]["chunk_size"] is None
+    assert init_calls[0]["total_chunk_count"] is None
+
+
+def test_tiktok_publish_video_falls_back_to_file_upload_when_url_ownership_unverified(
+    tmp_path,
+    monkeypatch,
+):
+    clip_path = tmp_path / "clip.mp4"
+    clip_path.write_bytes(b"clip")
+    media = PublicationMedia(
+        local_path=str(clip_path),
+        file_size=4,
+        content_type="video/mp4",
+        signed_url="https://cdn.clipry.example/clips/clip.mp4",
+        width=1080,
+        height=1920,
+        duration_seconds=30.0,
+    )
+    init_calls: list[dict] = []
+    upload_calls: list[dict] = []
+
+    monkeypatch.setattr(tiktok, "TIKTOK_PREFER_PULL_FROM_URL", True)
+    monkeypatch.setattr(
+        tiktok,
+        "TIKTOK_VERIFIED_SOURCE_URL_PREFIXES",
+        ("https://cdn.clipry.example/clips",),
+    )
+    monkeypatch.setattr(
+        tiktok,
+        "_query_creator_info",
+        lambda _account: {
+            "privacy_level_options": ["SELF_ONLY"],
+            "max_video_post_duration_sec": 600,
+        },
+    )
+    monkeypatch.setattr(
+        tiktok,
+        "_authorized_post",
+        lambda *args, **kwargs: {
+            "error": {"code": "ok"},
+            "data": {
+                "status": "PUBLISH_COMPLETE",
+                "publicly_available_post_id": ["post-123"],
+            },
+        },
+    )
+    monkeypatch.setattr(
+        tiktok,
+        "_upload_file_chunks",
+        lambda **kwargs: upload_calls.append(kwargs),
+    )
+    monkeypatch.setattr(tiktok.time, "sleep", lambda _seconds: None)
+
+    def _fake_init_video_publish(**kwargs):
+        init_calls.append(kwargs)
+        if len(init_calls) == 1:
+            raise SocialProviderError(
+                "domain not verified",
+                code="url_ownership_unverified",
+            )
+        return {"data": {"publish_id": "publish-123", "upload_url": "https://upload.example.com"}}
+
+    monkeypatch.setattr(tiktok, "_init_video_publish", _fake_init_video_publish)
+
+    result = tiktok.publish_video(
+        account=_account(),
+        publication=_publication(),
+        media=media,
+    )
+
+    assert result.remote_post_id == "post-123"
+    assert len(init_calls) == 2
+    assert init_calls[0]["video_url"] == "https://cdn.clipry.example/clips/clip.mp4"
+    assert init_calls[1]["video_url"] is None
+    assert init_calls[1]["chunk_size"] == 4
+    assert init_calls[1]["total_chunk_count"] == 1
+    assert upload_calls
+    assert result.provider_payload["initial_source"] == "PULL_FROM_URL"
+    assert result.provider_payload["source"] == "FILE_UPLOAD"
+
+
+def test_tiktok_authorized_post_marks_access_token_invalid_as_refresh_required(monkeypatch):
+    def _fake_request(method: str, url: str, **kwargs):
+        return _FakeResponse(
+            status_code=401,
+            payload={
+                "error": {
+                    "code": "access_token_invalid",
+                    "message": "Token expired",
+                }
+            },
+        )
+
+    monkeypatch.setattr(tiktok, "resilient_request", _fake_request)
+
+    with pytest.raises(SocialProviderError) as exc:
+        tiktok._authorized_post(
+            "/v2/post/publish/creator_info/query/",
+            token="access-token",
+            json_body={},
+        )
+
+    assert exc.value.code == "access_token_invalid"
+    assert exc.value.refresh_required is True
+    assert str(exc.value) == "TikTok access expired or was revoked. Reconnect the account and try again."
+
+
+def test_tiktok_normalize_provider_error_maps_scope_and_quota_messages():
+    scope_error = tiktok._normalize_provider_error(
+        {
+            "error": {
+                "code": "scope_not_authorized",
+                "message": "scope missing",
+            }
+        },
+        "fallback",
+        status_code=403,
+    )
+    quota_error = tiktok._normalize_provider_error(
+        {
+            "error": {
+                "code": "spam_risk_too_many_posts",
+                "message": "Daily quota reached",
+            }
+        },
+        "fallback",
+        status_code=429,
+    )
+
+    assert scope_error.code == "scope_not_authorized"
+    assert "user.info.basic and video.publish" in str(scope_error)
+    assert quota_error.code == "tiktok_publish_rate_limited"
+    assert quota_error.recoverable is True
+    assert "posting limit" in str(quota_error)

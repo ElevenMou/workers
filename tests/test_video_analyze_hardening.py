@@ -1697,7 +1697,7 @@ def test_validate_env_warns_on_local_worker_public_base_url_in_production(monkey
     monkeypatch.setenv("MINIO_SECRET_KEY", "minio-secret")
     monkeypatch.setenv("MINIO_PUBLIC_ENDPOINT", "https://storage.example.com")
     monkeypatch.setenv("WORKER_INTERNAL_API_TOKEN", "internal-token")
-    monkeypatch.setenv("WORKER_PUBLIC_BASE_URL", "http://localhost:8080")
+    monkeypatch.setenv("WORKER_PUBLIC_BASE_URL", "http://localhost:7050")
     monkeypatch.setenv("CADDY_DOMAIN", "api.example.com")
     monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://www.clipscut.pro")
     monkeypatch.delenv("CORS_ALLOWED_ORIGIN_REGEX", raising=False)

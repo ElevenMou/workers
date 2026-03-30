@@ -81,7 +81,7 @@ def test_signed_worker_clip_url_uses_caddy_domain_when_public_base_url_missing(m
 
 def test_signed_worker_clip_url_ignores_local_worker_base_url_in_production(monkeypatch):
     monkeypatch.setattr(media_storage, "IS_PRODUCTION", True)
-    monkeypatch.setattr(media_storage, "WORKER_PUBLIC_BASE_URL", "http://localhost:8080")
+    monkeypatch.setattr(media_storage, "WORKER_PUBLIC_BASE_URL", "http://localhost:7050")
     monkeypatch.setattr(media_storage, "WORKER_MEDIA_SIGNING_SECRET", "test-media-secret")
     monkeypatch.setenv("CADDY_DOMAIN", "api.clipscut.pro")
 

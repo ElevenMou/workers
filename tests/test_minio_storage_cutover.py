@@ -100,7 +100,7 @@ def test_social_media_returns_none_when_no_public_media_url_exists(monkeypatch):
     monkeypatch.setattr(
         social_media,
         "build_worker_clip_url",
-        lambda _clip_id, *, expires_in_seconds=3600: f"http://localhost:8080/media?expires={expires_in_seconds}",
+        lambda _clip_id, *, expires_in_seconds=3600: f"http://localhost:7050/media?expires={expires_in_seconds}",
     )
     monkeypatch.setattr(
         social_media,

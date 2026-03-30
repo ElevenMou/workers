@@ -340,6 +340,18 @@ def _validate_provider_specific_constraints(
                 ),
             )
 
+    facebook_reel_destinations = [
+        destination
+        for destination in destinations
+        if destination.provider == "facebook_page"
+        and destination.facebook.publishTarget == "reel"
+    ]
+    if facebook_reel_destinations and duration_seconds > 90.0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Facebook Reels requires clips that are 90 seconds or shorter when Reel mode is forced.",
+        )
+
 
 def _assert_clip_storage_ready_for_publish(clip: dict) -> None:
     storage_path = str(
