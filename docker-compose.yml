@@ -44,15 +44,20 @@ services:
       - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
     restart: "no"
 
+  # ---------- Cloudflare Tunnel for API (api.clipscut.pro) ----------
+  # Run on the host with the example config in workers/cloudflared/:
+  #   cloudflared tunnel run
+  # The tunnel must route api.clipscut.pro -> http://127.0.0.1:7050
+  #
   # ---------- Cloudflare Tunnel for MinIO (storage.clipscut.pro) ----------
   # Run on the host (not in Docker) to avoid pulling the cloudflared image:
   #   cloudflared tunnel run clipscut-storage
   # The tunnel must route storage.clipscut.pro -> http://localhost:9000
 
-  # ---------- Caddy (TLS termination + load balancer) ----------
-  # Automatically provisions Let's Encrypt certificates for CADDY_DOMAIN.
-  # Local development listens on :7050 without TLS.
-  # For a real domain with automatic TLS, publish 80/443 instead.
+  # ---------- Caddy (reverse proxy + load balancer behind Cloudflare Tunnel) ----------
+  # Tunnel-backed production listens on :7050.
+  # If you move to direct Caddy TLS on 80/443, update docker-compose,
+  # CADDY_DOMAIN, and your edge routing together.
   caddy:
     image: caddy:2-alpine
     ports:

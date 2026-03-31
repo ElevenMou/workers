@@ -39,6 +39,8 @@ echo "Using env file: $ENV_FILE"
 git fetch origin
 git pull --ff-only origin "$BRANCH"
 
+bash ./scripts/validate_tunnel_runtime.sh --env-file "$ENV_FILE" --compose-file docker-compose.yml
+
 docker compose "${COMPOSE_ARGS[@]}" config >/dev/null
 docker compose "${COMPOSE_ARGS[@]}" up -d --build --remove-orphans
 

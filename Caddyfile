@@ -1,7 +1,10 @@
-# Clipry Workers API — Caddy reverse proxy with automatic TLS.
+# Clipry Workers API — Caddy reverse proxy for local development and
+# Cloudflare Tunnel-backed production.
 #
-# CADDY_DOMAIN must be set to your API domain (e.g. api.clipscut.pro).
-# When running locally, use ":7050" as the domain to disable TLS.
+# Tunnel-backed deployments should set CADDY_DOMAIN to ":7050" and route
+# api.clipscut.pro -> http://127.0.0.1:7050 with cloudflared.
+# Direct Caddy TLS requires exposing 80/443 and setting CADDY_DOMAIN to the
+# public API hostname instead.
 
 {$CADDY_DOMAIN:localhost:7050} {
 	reverse_proxy api:8001 {

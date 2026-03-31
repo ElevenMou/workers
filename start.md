@@ -67,7 +67,7 @@ TEMP_DIR=/tmp/video_clipper
 OPENAI_API_KEY=sk-...
 WHISPER_MODEL=base
 MEDIA_STORAGE_PROVIDER=minio
-WORKER_PUBLIC_BASE_URL=http://localhost:8001
+WORKER_PUBLIC_BASE_URL=http://localhost:7050
 WORKER_MEDIA_SIGNING_SECRET=replace-with-worker-media-signing-secret
 WORKER_INTERNAL_API_TOKEN=replace-with-worker-internal-token
 MINIO_ENDPOINT=localhost:9000
@@ -123,3 +123,20 @@ Validate this end-to-end flow:
 5. Delete the clip and the source video.
 
 Only MinIO buckets should change during media operations. Supabase remains the source of truth for auth, tables, and RPCs only.
+
+## Production Behind Cloudflare Tunnel
+
+Use the worker stack behind `cloudflared` when serving `api.clipscut.pro`.
+
+1. Copy `workers/.env.production.example` to `workers/.env.production`.
+2. Keep `CADDY_DOMAIN=:7050` and `WORKER_PUBLIC_BASE_URL=https://api.clipscut.pro`.
+3. Create or inspect the Cloudflare tunnel and note its UUID with `cloudflared tunnel list`.
+4. Copy `workers/cloudflared/api-tunnel.yml.example` to `/etc/cloudflared/api-clipscut.yml` and replace `<TUNNEL_UUID>` with the actual tunnel UUID.
+5. Validate the ingress rules with `cloudflared tunnel ingress validate --config /etc/cloudflared/api-clipscut.yml`.
+6. Copy `workers/cloudflared/cloudflared-api.service.example` to `/etc/systemd/system/cloudflared-api.service`.
+7. Enable the tunnel service with `sudo systemctl enable --now cloudflared-api`.
+8. If the service does not come up, run `sudo bash scripts/diagnose_cloudflared_api.sh`.
+9. Start or update the stack with `cd workers && sudo bash run_server.sh`.
+10. Verify the local origin with `curl http://127.0.0.1:7050/ready`.
+11. Verify the public origin with `curl https://api.clipscut.pro/ready`.
+12. Run `LOCAL_API_ORIGIN=http://127.0.0.1:7050 bash ../scripts/smoke-test.sh --api-only`.

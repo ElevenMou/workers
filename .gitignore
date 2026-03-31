@@ -15,3 +15,4 @@ __pycache__/
 .env.production
 secrets/
 cookies.txt
+cloudflared/*.json

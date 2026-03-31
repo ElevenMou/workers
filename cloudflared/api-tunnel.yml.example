@@ -1,0 +1,12 @@
+# Copy to /etc/cloudflared/api-clipscut.yml before enabling the service.
+# Important: `tunnel:` must be the tunnel UUID, not the friendly display name.
+# Validate the config with:
+#   cloudflared tunnel ingress validate --config /etc/cloudflared/api-clipscut.yml
+
+tunnel: <TUNNEL_UUID>
+credentials-file: /etc/cloudflared/<TUNNEL_UUID>.json
+
+ingress:
+  - hostname: api.clipscut.pro
+    service: http://127.0.0.1:7050
+  - service: http_status:404
