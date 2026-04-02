@@ -413,6 +413,9 @@ def test_custom_flow_reuses_existing_word_timing_for_smart_cleanup(monkeypatch, 
     monkeypatch.setattr(custom_task_module, "has_sufficient_credits", lambda **_k: True)
     monkeypatch.setattr(custom_task_module, "get_credit_balance", lambda *_a, **_k: 999)
     monkeypatch.setattr(custom_task_module, "get_team_wallet_balance", lambda *_a, **_k: 999)
+    monkeypatch.setattr(custom_task_module, "reserve_credits", lambda **_k: "res-1")
+    monkeypatch.setattr(custom_task_module, "capture_credit_reservation", lambda **_k: True)
+    monkeypatch.setattr(custom_task_module, "release_credit_reservation", lambda **_k: True)
     monkeypatch.setattr(
         custom_task_module,
         "resolve_effective_layout_id",
@@ -547,6 +550,9 @@ def test_custom_partial_whisper_fallback_returns_transcript(monkeypatch, tmp_pat
     monkeypatch.setattr(custom_task_module, "has_sufficient_credits", lambda **_k: True)
     monkeypatch.setattr(custom_task_module, "get_credit_balance", lambda *_a, **_k: 999)
     monkeypatch.setattr(custom_task_module, "get_team_wallet_balance", lambda *_a, **_k: 999)
+    monkeypatch.setattr(custom_task_module, "reserve_credits", lambda **_k: "res-1")
+    monkeypatch.setattr(custom_task_module, "capture_credit_reservation", lambda **_k: True)
+    monkeypatch.setattr(custom_task_module, "release_credit_reservation", lambda **_k: True)
     monkeypatch.setattr(
         custom_task_module,
         "resolve_effective_layout_id",

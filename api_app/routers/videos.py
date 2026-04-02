@@ -20,15 +20,23 @@ from api_app.access_rules import (
 )
 from api_app.auth import AuthenticatedUser, get_current_user
 
-from api_app.constants import ANALYZE_TASK_PATH, SPLIT_VIDEO_TASK_PATH
+from api_app.constants import ANALYZE_TASK_PATH, GENERATE_TASK_PATH, SPLIT_VIDEO_TASK_PATH
 from api_app.helpers import enqueue_or_fail, raise_on_error
 from api_app.models import (
     AnalyzeVideoRequest,
     AnalyzeVideoResponse,
+    BatchGeneratePreparedClipsRequest,
+    BatchGeneratePreparedClipsResponse,
     BatchSplitVideoRequest,
     BatchSplitVideoResponse,
     CreditsCostByUrlRequest,
     CreditsCostByUrlResponse,
+)
+from api_app.routers.clips import (
+    _ACTIVE_GENERATE_JOB_STATUSES,
+    _clip_queue_for_context,
+    _enforce_smart_cleanup_access,
+    _raise_if_insufficient_clip_generation_credits,
 )
 from api_app.rate_limit import limiter
 from api_app.state import logger, whisper_ready
@@ -37,8 +45,15 @@ from config import (
     WHISPER_FALLBACK_JOB_TIMEOUT_MAX_SECONDS,
     WHISPER_FALLBACK_JOB_TIMEOUT_MULTIPLIER,
     WHISPER_FALLBACK_JOB_TIMEOUT_PADDING_SECONDS,
+    calculate_clip_generation_cost,
     calculate_custom_clip_generation_cost,
     calculate_video_analysis_cost,
+)
+from services.clips.quality_policy import resolve_clip_quality_policy
+from services.clips.render_profiles import (
+    DEFAULT_DELIVERY_PROFILE,
+    DEFAULT_MASTER_PROFILE,
+    DEFAULT_SOURCE_PROFILE,
 )
 from services.video_downloader import VideoDownloader
 from utils.supabase_client import (
@@ -54,6 +69,7 @@ _PRIORITY_VIDEO_QUEUE = "video-processing-priority"
 _ACTIVE_ANALYZE_JOB_STATUSES = ("queued", "processing", "retrying")
 _ANALYZE_CLIP_MIN_SECONDS = 10
 _DEFAULT_ANALYZE_LEGACY_CLIP_SECONDS = 90
+_URL_PROBE_TIMEOUT_SECONDS = 45.0
 
 
 def _best_effort_delete_video(video_id: str):
@@ -324,6 +340,66 @@ def _load_workspace_video(
     return video
 
 
+def _load_pending_batch_split_clips(
+    *,
+    video_id: str,
+    access_context: UserAccessContext,
+    actor_user_id: str,
+) -> list[dict]:
+    clip_query = (
+        supabase.table("clips")
+        .select(
+            "id,video_id,user_id,team_id,billing_owner_user_id,start_time,end_time,status,"
+            "storage_path,ai_score,transcript_excerpt,layout_id,title"
+        )
+        .eq("video_id", video_id)
+        .eq("origin", "batch_split")
+        .eq("status", "pending")
+        .order("created_at", desc=False)
+    )
+    if access_context.workspace_team_id:
+        clip_query = clip_query.eq("team_id", access_context.workspace_team_id)
+        if access_context.workspace_role != "owner":
+            clip_query = clip_query.eq("user_id", actor_user_id)
+    else:
+        clip_query = clip_query.eq("user_id", actor_user_id).is_("team_id", "null")
+
+    clip_response = clip_query.execute()
+    raise_on_error(clip_response, "Failed to load prepared split clips")
+    return list(clip_response.data or [])
+
+
+def _load_active_generate_jobs_for_clips(
+    *,
+    clip_ids: list[str],
+    access_context: UserAccessContext,
+    actor_user_id: str,
+) -> set[str]:
+    if not clip_ids:
+        return set()
+
+    job_query = (
+        supabase.table("jobs")
+        .select("clip_id")
+        .eq("type", "generate_clip")
+        .in_("status", list(_ACTIVE_GENERATE_JOB_STATUSES))
+        .in_("clip_id", clip_ids)
+        .order("created_at", desc=True)
+    )
+    if access_context.workspace_team_id:
+        job_query = job_query.eq("team_id", access_context.workspace_team_id)
+    else:
+        job_query = job_query.eq("user_id", actor_user_id).is_("team_id", "null")
+
+    job_response = job_query.execute()
+    raise_on_error(job_response, "Failed to load active generation jobs for prepared clips")
+    return {
+        str(row.get("clip_id") or "").strip()
+        for row in list(job_response.data or [])
+        if str(row.get("clip_id") or "").strip()
+    }
+
+
 def _raise_if_insufficient_credits(
     *,
     context: UserAccessContext,
@@ -394,7 +470,7 @@ async def analyze_video(
     try:
         url_probe = await asyncio.wait_for(
             asyncio.to_thread(_probe_credit_cost_for_url, url_str),
-            timeout=15.0,
+            timeout=_URL_PROBE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         raise HTTPException(
@@ -716,7 +792,7 @@ async def batch_split_video(
         try:
             source_probe = await asyncio.wait_for(
                 asyncio.to_thread(_probe_credit_cost_for_url, source_url),
-                timeout=15.0,
+                timeout=_URL_PROBE_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
             raise HTTPException(
@@ -766,7 +842,7 @@ async def batch_split_video(
         try:
             source_probe = await asyncio.wait_for(
                 asyncio.to_thread(_probe_credit_cost_for_url, source_url),
-                timeout=15.0,
+                timeout=_URL_PROBE_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
             raise HTTPException(
@@ -797,11 +873,6 @@ async def batch_split_video(
     expected_generation_credits = int(
         estimated_part_count
         * calculate_custom_clip_generation_cost(False, access_context.tier)
-    )
-    _raise_if_insufficient_credits(
-        context=access_context,
-        actor_user_id=user_id,
-        required_credits=expected_generation_credits,
     )
 
     billing_owner_user_id = access_context.billing_owner_user_id or user_id
@@ -935,6 +1006,179 @@ async def batch_split_video(
     return BatchSplitVideoResponse(jobId=job_id, videoId=video_id, status="queued")
 
 
+@router.post(
+    "/videos/batch-generate-prepared-clips",
+    response_model=BatchGeneratePreparedClipsResponse,
+)
+@limiter.limit("10/minute")
+@limiter.limit("5/minute", key_func=get_user_rate_key)
+def batch_generate_prepared_clips(
+    request: Request,
+    payload: BatchGeneratePreparedClipsRequest = Body(...),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> BatchGeneratePreparedClipsResponse:
+    """Queue generation jobs for eligible prepared split clips on one video."""
+    user_id = current_user.id
+    access_context = enforce_processing_access_rules(user_id, supabase_client=supabase)
+    smart_cleanup_enabled = bool(payload.smartCleanupEnabled)
+    _enforce_smart_cleanup_access(
+        context=access_context,
+        smart_cleanup_enabled=smart_cleanup_enabled,
+    )
+
+    video_id = str(payload.videoId or "").strip()
+    if not video_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="videoId is required.",
+        )
+
+    video_row = _load_workspace_video(
+        video_id=video_id,
+        access_context=access_context,
+        actor_user_id=user_id,
+    )
+    if video_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Video not found in the active workspace.",
+        )
+
+    pending_clips = _load_pending_batch_split_clips(
+        video_id=video_id,
+        access_context=access_context,
+        actor_user_id=user_id,
+    )
+    if not pending_clips:
+        return BatchGeneratePreparedClipsResponse(
+            videoId=video_id,
+            queuedCount=0,
+            skippedCount=0,
+            jobIds=[],
+        )
+
+    active_clip_ids = _load_active_generate_jobs_for_clips(
+        clip_ids=[
+            str(clip.get("id") or "").strip()
+            for clip in pending_clips
+            if str(clip.get("id") or "").strip()
+        ],
+        access_context=access_context,
+        actor_user_id=user_id,
+    )
+
+    eligible_clips: list[dict] = []
+    skipped_count = 0
+    max_clip_duration_seconds = int(access_context.max_clip_duration_seconds)
+    for clip in pending_clips:
+        clip_id = str(clip.get("id") or "").strip()
+        if not clip_id:
+            skipped_count += 1
+            continue
+
+        if clip_id in active_clip_ids:
+            skipped_count += 1
+            continue
+
+        clip_duration = float(clip.get("end_time") or 0) - float(clip.get("start_time") or 0)
+        if clip_duration > float(max_clip_duration_seconds):
+            skipped_count += 1
+            continue
+
+        eligible_clips.append(clip)
+
+    if not eligible_clips:
+        return BatchGeneratePreparedClipsResponse(
+            videoId=video_id,
+            queuedCount=0,
+            skippedCount=skipped_count,
+            jobIds=[],
+        )
+
+    generation_credits_per_clip = calculate_clip_generation_cost(
+        smart_cleanup_enabled,
+        access_context.tier,
+    )
+    total_required_credits = len(eligible_clips) * int(generation_credits_per_clip)
+    _raise_if_insufficient_clip_generation_credits(
+        context=access_context,
+        actor_user_id=user_id,
+        required_credits=total_required_credits,
+    )
+
+    queued_job_ids: list[str] = []
+    billing_owner_user_id = access_context.billing_owner_user_id or user_id
+    for clip in eligible_clips:
+        clip_id = str(clip["id"])
+        clip_duration = float(clip["end_time"]) - float(clip["start_time"])
+        quality_policy = resolve_clip_quality_policy(
+            tier=access_context.tier,
+            clip_duration_seconds=clip_duration,
+            requested_output_quality=None,
+        )
+        output_quality_override = None
+        job_id = str(uuid4())
+        job_data = {
+            "jobId": job_id,
+            "clipId": clip_id,
+            "userId": user_id,
+            "layoutId": clip.get("layout_id"),
+            "smartCleanupEnabled": smart_cleanup_enabled,
+            "generationCredits": int(generation_credits_per_clip),
+            "clipRetentionDays": access_context.clip_retention_days,
+            "workspaceTeamId": access_context.workspace_team_id,
+            "billingOwnerUserId": billing_owner_user_id,
+            "chargeSource": access_context.charge_source,
+            "workspaceRole": access_context.workspace_role,
+            "subscriptionTier": access_context.tier,
+            "sourceMaxHeight": quality_policy.get("source_max_height"),
+            "sourceProfile": DEFAULT_SOURCE_PROFILE,
+            "masterProfile": DEFAULT_MASTER_PROFILE,
+            "deliveryProfile": DEFAULT_DELIVERY_PROFILE,
+            "outputQualityOverride": output_quality_override,
+            "qualityPolicyProfile": quality_policy.get("profile"),
+        }
+
+        job_response = (
+            supabase.table("jobs")
+            .upsert(
+                {
+                    "id": job_id,
+                    "user_id": user_id,
+                    "team_id": access_context.workspace_team_id,
+                    "billing_owner_user_id": billing_owner_user_id,
+                    "video_id": video_id,
+                    "clip_id": clip_id,
+                    "type": "generate_clip",
+                    "status": "queued",
+                    "input_data": job_data,
+                },
+                on_conflict="id",
+            )
+            .execute()
+        )
+        raise_on_error(job_response, f"Failed to queue prepared clip job for {clip_id}")
+
+        enqueue_or_fail(
+            queue_name=_clip_queue_for_context(access_context),
+            task_path=GENERATE_TASK_PATH,
+            job_data=job_data,
+            job_id=job_id,
+            user_id=user_id,
+            job_type="generate_clip",
+            video_id=video_id,
+            clip_id=clip_id,
+        )
+        queued_job_ids.append(job_id)
+
+    return BatchGeneratePreparedClipsResponse(
+        videoId=video_id,
+        queuedCount=len(queued_job_ids),
+        skippedCount=skipped_count,
+        jobIds=queued_job_ids,
+    )
+
+
 @router.post("/credits/cost", response_model=CreditsCostByUrlResponse)
 @limiter.limit("15/minute")
 @limiter.limit("10/minute", key_func=get_user_rate_key)
@@ -954,7 +1198,7 @@ async def get_credit_cost_from_url(
     try:
         probe = await asyncio.wait_for(
             asyncio.to_thread(_probe_credit_cost_for_url, url_str),
-            timeout=15.0,
+            timeout=_URL_PROBE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         raise HTTPException(

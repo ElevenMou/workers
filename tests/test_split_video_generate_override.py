@@ -77,6 +77,8 @@ def test_generate_clip_uses_split_source_override_for_resolution(monkeypatch, tm
     monkeypatch.setattr(generate_task_module, "assert_response_ok", lambda *_a, **_k: None)
     monkeypatch.setattr(generate_task_module, "has_sufficient_credits", lambda **_k: True)
     monkeypatch.setattr(generate_task_module, "get_credit_balance", lambda _user_id: 999)
+    monkeypatch.setattr(generate_task_module, "reserve_credits", lambda **_k: "reservation-1")
+    monkeypatch.setattr(generate_task_module, "release_credit_reservation", lambda **_k: True)
     monkeypatch.setattr(generate_task_module, "_is_latest_generate_job_for_clip", lambda **_k: True)
     monkeypatch.setattr(generate_task_module, "_best_effort_mark_failed", lambda **_k: None)
     monkeypatch.setattr(generate_task_module, "best_effort_cleanup_uploaded_artifacts", lambda **_k: None)

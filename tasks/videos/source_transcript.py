@@ -118,10 +118,20 @@ def resolve_source_transcript(
         on_attempt("provider_captions")
     get_provider_transcript = getattr(downloader, "get_provider_transcript", None)
     if callable(get_provider_transcript):
-        provider_result = get_provider_transcript(
-            source_url,
-            preferred_languages=preferred_languages,
-        )
+        try:
+            provider_result = get_provider_transcript(
+                source_url,
+                preferred_languages=preferred_languages,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Provider transcript fetch failed: %s", job_id, exc)
+            provider_result = {
+                "transcript": None,
+                "fallback_reason": f"provider_caption_probe_failed:{type(exc).__name__}",
+                "track_source": None,
+                "track_ext": None,
+                "track_language": None,
+            }
     else:
         provider_result = {
             "transcript": None,

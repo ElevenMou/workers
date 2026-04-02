@@ -95,6 +95,28 @@ class BatchSplitVideoResponse(BaseModel):
     status: str
 
 
+class BatchGeneratePreparedClipsRequest(BaseModel):
+    videoId: str = Field(..., description="Video id whose prepared split clips should be queued.")
+    smartCleanupEnabled: bool = Field(
+        default=False,
+        description=(
+            "Whether to apply Smart Cleanup to every queued prepared clip. "
+            "Available for basic/pro/enterprise tiers only."
+        ),
+    )
+    workspaceTeamId: Optional[str] = Field(
+        default=None,
+        description="Optional workspace team id hint (server resolves active workspace).",
+    )
+
+
+class BatchGeneratePreparedClipsResponse(BaseModel):
+    videoId: str
+    queuedCount: int
+    skippedCount: int
+    jobIds: list[str]
+
+
 class GenerateClipRequest(BaseModel):
     clipId: str = Field(..., description="Clip id to generate")
     layoutId: Optional[str] = Field(

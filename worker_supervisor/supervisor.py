@@ -27,6 +27,7 @@ from worker_supervisor.runtime import (
 )
 from worker_supervisor.startup import env_bool, recover_stale_processing_rows
 from worker_supervisor.state import logger
+from utils.subscription_state import derive_effective_subscription_state
 
 VIDEO_PRIORITY_QUEUE = "video-processing-priority"
 VIDEO_QUEUE = "video-processing"
@@ -213,7 +214,7 @@ def _run_maintenance_loop(
     def _resolve_dispatch_priority_and_access(batch: dict) -> tuple[str, bool, str | None]:
         sub_resp = (
             supabase.table("subscriptions")
-            .select("tier, status, interval")
+            .select("tier, status, interval, canceled_at, current_period_end")
             .eq("user_id", batch["billing_owner_user_id"])
             .limit(1)
             .execute()
@@ -223,10 +224,12 @@ def _run_maintenance_loop(
             f"Failed to load subscription for {batch['billing_owner_user_id']}",
         )
         subscription_rows = sub_resp.data or []
-        sub_row = subscription_rows[0] if subscription_rows else {}
-        interval = str(sub_row.get("interval") or "month")
-        tier = str(sub_row.get("tier") or "free")
-        subscription_status = str(sub_row.get("status") or "active")
+        subscription_state = derive_effective_subscription_state(
+            subscription_rows[0] if subscription_rows else None
+        )
+        interval = subscription_state.interval or "month"
+        tier = subscription_state.tier
+        subscription_status = subscription_state.status
 
         plan_resp = (
             supabase.table("pricing_tiers")

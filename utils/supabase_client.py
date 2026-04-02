@@ -269,6 +269,36 @@ def _refresh_free_monthly_credits_if_needed(user_id: str):
     raise RuntimeError(f"Failed to refresh free monthly credits for {user_id}: {detail}")
 
 
+def _owner_processing_charge_exists(*, user_id: str, tx_type: str, processing_ref: str) -> bool:
+    existing_resp = (
+        supabase.table("credit_transactions")
+        .select("id")
+        .eq("user_id", user_id)
+        .eq("type", tx_type)
+        .eq("processing_ref", processing_ref)
+        .lt("amount", 0)
+        .limit(1)
+        .execute()
+    )
+    assert_response_ok(existing_resp, f"Failed to check existing owner charge for {processing_ref}")
+    return bool(existing_resp.data)
+
+
+def _team_processing_charge_exists(*, team_id: str, processing_ref: str) -> bool:
+    existing_resp = (
+        supabase.table("team_wallet_transactions")
+        .select("id")
+        .eq("team_id", team_id)
+        .eq("type", "processing_charge")
+        .eq("processing_ref", processing_ref)
+        .lt("amount", 0)
+        .limit(1)
+        .execute()
+    )
+    assert_response_ok(existing_resp, f"Failed to check existing team charge for {processing_ref}")
+    return bool(existing_resp.data)
+
+
 def _charge_credits_or_raise(
     *,
     user_id: str,
@@ -282,18 +312,11 @@ def _charge_credits_or_raise(
 ):
     """Atomically charge credits in DB and fail when balance is insufficient."""
     if processing_ref:
-        existing_resp = (
-            supabase.table("credit_transactions")
-            .select("id")
-            .eq("user_id", user_id)
-            .eq("type", tx_type)
-            .eq("processing_ref", processing_ref)
-            .lt("amount", 0)
-            .limit(1)
-            .execute()
-        )
-        assert_response_ok(existing_resp, f"{context}: dedupe precheck failed")
-        if existing_resp.data:
+        if _owner_processing_charge_exists(
+            user_id=user_id,
+            tx_type=tx_type,
+            processing_ref=processing_ref,
+        ):
             try:
                 from utils.redis_client import get_redis_connection
 
@@ -302,7 +325,7 @@ def _charge_credits_or_raise(
                 conn.incr("clipry:metrics:billing_dedupe:owner_wallet")
             except Exception:
                 pass
-            return
+            return False
 
     _refresh_free_monthly_credits_if_needed(user_id)
 
@@ -321,6 +344,7 @@ def _charge_credits_or_raise(
     assert_response_ok(resp, context)
     if not resp.data:
         raise RuntimeError(f"{context}: insufficient credits")
+    return True
 
 
 def _charge_team_credits_or_raise(
@@ -339,18 +363,10 @@ def _charge_team_credits_or_raise(
 ):
     """Atomically charge a team wallet and write owner/team audit transactions."""
     if processing_ref:
-        existing_resp = (
-            supabase.table("team_wallet_transactions")
-            .select("id")
-            .eq("team_id", team_id)
-            .eq("type", "processing_charge")
-            .eq("processing_ref", processing_ref)
-            .lt("amount", 0)
-            .limit(1)
-            .execute()
-        )
-        assert_response_ok(existing_resp, f"{context}: dedupe precheck failed")
-        if existing_resp.data:
+        if _team_processing_charge_exists(
+            team_id=team_id,
+            processing_ref=processing_ref,
+        ):
             try:
                 from utils.redis_client import get_redis_connection
 
@@ -359,7 +375,7 @@ def _charge_team_credits_or_raise(
                 conn.incr("clipry:metrics:billing_dedupe:team_wallet")
             except Exception:
                 pass
-            return
+            return False
 
     resp = supabase.rpc(
         "charge_team_credits",
@@ -379,6 +395,7 @@ def _charge_team_credits_or_raise(
     assert_response_ok(resp, context)
     if not resp.data:
         raise RuntimeError(f"{context}: insufficient team wallet credits")
+    return True
 
 
 def get_credit_balance(user_id: str) -> int:
@@ -500,8 +517,17 @@ def capture_credit_reservation(
     tx_type: str,
     description: str | None = None,
     processing_ref: str | None = None,
+    user_id: str | None = None,
 ) -> bool:
     """Capture a previously reserved owner-wallet charge."""
+    already_applied = (
+        bool(processing_ref and user_id)
+        and _owner_processing_charge_exists(
+            user_id=str(user_id),
+            tx_type=tx_type,
+            processing_ref=str(processing_ref),
+        )
+    )
     response = supabase.rpc(
         "capture_credit_reservation",
         {
@@ -515,7 +541,7 @@ def capture_credit_reservation(
         response,
         f"Failed to capture credit reservation {reservation_id}",
     )
-    return bool(response.data)
+    return bool(response.data) and not already_applied
 
 
 def release_credit_reservation(*, reservation_id: str) -> bool:
@@ -527,6 +553,89 @@ def release_credit_reservation(*, reservation_id: str) -> bool:
     assert_response_ok(
         response,
         f"Failed to release credit reservation {reservation_id}",
+    )
+    return bool(response.data)
+
+
+def reserve_team_credits(
+    *,
+    owner_user_id: str,
+    team_id: str,
+    amount: int,
+    reason: str,
+    actor_user_id: str | None = None,
+    reservation_key: str | None = None,
+    video_id: str | None = None,
+    clip_id: str | None = None,
+    job_id: str | None = None,
+) -> str | None:
+    """Reserve team-wallet credits using an idempotency key."""
+    parsed_amount = int(amount)
+    if parsed_amount <= 0:
+        return None
+
+    response = supabase.rpc(
+        "reserve_team_credits",
+        {
+            "p_owner_user_id": owner_user_id,
+            "p_team_id": team_id,
+            "p_amount": parsed_amount,
+            "p_reason": reason,
+            "p_actor_user_id": actor_user_id or owner_user_id,
+            "p_reservation_key": reservation_key,
+            "p_video_id": video_id,
+            "p_clip_id": clip_id,
+            "p_job_id": job_id,
+        },
+    ).execute()
+    assert_response_ok(response, f"Failed to reserve team credits for {team_id}")
+    reservation_id = response.data
+    if reservation_id is None:
+        return None
+    return str(reservation_id)
+
+
+def capture_team_credit_reservation(
+    *,
+    reservation_id: str,
+    owner_tx_type: str,
+    description: str | None = None,
+    processing_ref: str | None = None,
+    team_id: str | None = None,
+) -> bool:
+    """Capture a previously reserved team-wallet charge."""
+    already_applied = (
+        bool(processing_ref and team_id)
+        and _team_processing_charge_exists(
+            team_id=str(team_id),
+            processing_ref=str(processing_ref),
+        )
+    )
+    response = supabase.rpc(
+        "capture_team_credit_reservation",
+        {
+            "p_reservation_id": reservation_id,
+            "p_owner_transaction_type": owner_tx_type,
+            "p_description": description,
+            "p_processing_ref": processing_ref,
+        },
+    ).execute()
+    assert_response_ok(
+        response,
+        f"Failed to capture team credit reservation {reservation_id}",
+    )
+    return bool(response.data) and not already_applied
+
+
+def release_team_credit_reservation(*, reservation_id: str) -> bool:
+    """Release a previously reserved team-wallet charge."""
+    response = supabase.rpc(
+        "release_team_credit_reservation",
+        {"p_reservation_id": reservation_id},
+    ).execute()
+    assert_response_ok(
+        response,
+        f"Failed to release team credit reservation {reservation_id}",
     )
     return bool(response.data)
 
@@ -615,6 +724,41 @@ def _emit_usage_event_after_charge(
     )
 
 
+def emit_clip_generation_usage_event(
+    *,
+    user_id: str,
+    amount: int,
+    video_id: str,
+    clip_id: str,
+    charge_source: str = "owner_wallet",
+    team_id: str | None = None,
+    billing_owner_user_id: str | None = None,
+    actor_user_id: str | None = None,
+    job_id: str | None = None,
+    usage_metadata: dict[str, Any] | None = None,
+) -> None:
+    """Emit clip-generation usage telemetry without charging credits."""
+    parsed_amount = int(amount)
+    if parsed_amount <= 0:
+        return
+
+    owner_user_id = billing_owner_user_id or user_id
+    actor_id = actor_user_id or user_id
+    _emit_usage_event_after_charge(
+        event_name=POLAR_USAGE_EVENT_GENERATION_NAME,
+        category="clip_generation",
+        owner_user_id=owner_user_id,
+        actor_user_id=actor_id,
+        amount=parsed_amount,
+        charge_source=charge_source,
+        team_id=team_id,
+        job_id=job_id,
+        video_id=video_id,
+        clip_id=clip_id,
+        usage_metadata=usage_metadata,
+    )
+
+
 def charge_clip_generation_credits(
     *,
     user_id: str,
@@ -643,14 +787,14 @@ def charge_clip_generation_credits(
             clip_id,
             charge_source,
         )
-        return
+        return False
 
     owner_user_id = billing_owner_user_id or user_id
     actor_id = actor_user_id or user_id
     if charge_source == "team_wallet":
         if not team_id:
             raise RuntimeError("Failed to charge clip-generation credits: missing team_id")
-        _charge_team_credits_or_raise(
+        applied = _charge_team_credits_or_raise(
             owner_user_id=owner_user_id,
             team_id=team_id,
             amount=amount,
@@ -663,22 +807,22 @@ def charge_clip_generation_credits(
             processing_ref=processing_ref,
             context="Failed to charge clip-generation credits",
         )
-        _emit_usage_event_after_charge(
-            event_name=POLAR_USAGE_EVENT_GENERATION_NAME,
-            category="clip_generation",
-            owner_user_id=owner_user_id,
-            actor_user_id=actor_id,
-            amount=amount,
-            charge_source=charge_source,
-            team_id=team_id,
-            job_id=job_id,
-            video_id=video_id,
-            clip_id=clip_id,
-            usage_metadata=usage_metadata,
-        )
-        return
+        if applied:
+            emit_clip_generation_usage_event(
+                user_id=user_id,
+                amount=amount,
+                video_id=video_id,
+                clip_id=clip_id,
+                charge_source=charge_source,
+                team_id=team_id,
+                billing_owner_user_id=owner_user_id,
+                actor_user_id=actor_id,
+                job_id=job_id,
+                usage_metadata=usage_metadata,
+            )
+        return applied
 
-    _charge_credits_or_raise(
+    applied = _charge_credits_or_raise(
         user_id=owner_user_id,
         amount=amount,
         tx_type="clip_generation",
@@ -688,19 +832,20 @@ def charge_clip_generation_credits(
         processing_ref=processing_ref,
         context="Failed to charge clip-generation credits",
     )
-    _emit_usage_event_after_charge(
-        event_name=POLAR_USAGE_EVENT_GENERATION_NAME,
-        category="clip_generation",
-        owner_user_id=owner_user_id,
-        actor_user_id=actor_id,
-        amount=amount,
-        charge_source=charge_source,
-        team_id=team_id,
-        job_id=job_id,
-        video_id=video_id,
-        clip_id=clip_id,
-        usage_metadata=usage_metadata,
-    )
+    if applied:
+        emit_clip_generation_usage_event(
+            user_id=user_id,
+            amount=amount,
+            video_id=video_id,
+            clip_id=clip_id,
+            charge_source=charge_source,
+            team_id=team_id,
+            billing_owner_user_id=owner_user_id,
+            actor_user_id=actor_id,
+            job_id=job_id,
+            usage_metadata=usage_metadata,
+        )
+    return applied
 
 
 def charge_video_analysis_credits(
@@ -730,14 +875,14 @@ def charge_video_analysis_credits(
             video_id,
             charge_source,
         )
-        return
+        return False
 
     owner_user_id = billing_owner_user_id or user_id
     actor_id = actor_user_id or user_id
     if charge_source == "team_wallet":
         if not team_id:
             raise RuntimeError("Failed to charge video-analysis credits: missing team_id")
-        _charge_team_credits_or_raise(
+        applied = _charge_team_credits_or_raise(
             owner_user_id=owner_user_id,
             team_id=team_id,
             amount=amount,
@@ -750,22 +895,21 @@ def charge_video_analysis_credits(
             processing_ref=processing_ref,
             context="Failed to charge video-analysis credits",
         )
-        _emit_usage_event_after_charge(
-            event_name=POLAR_USAGE_EVENT_ANALYSIS_NAME,
-            category="video_analysis",
-            owner_user_id=owner_user_id,
-            actor_user_id=actor_id,
-            amount=amount,
-            charge_source=charge_source,
-            team_id=team_id,
-            job_id=job_id,
-            video_id=video_id,
-            clip_id=None,
-            usage_metadata=usage_metadata,
-        )
-        return
+        if applied:
+            emit_video_analysis_usage_event(
+                user_id=user_id,
+                amount=amount,
+                video_id=video_id,
+                charge_source=charge_source,
+                team_id=team_id,
+                billing_owner_user_id=owner_user_id,
+                actor_user_id=actor_id,
+                job_id=job_id,
+                usage_metadata=usage_metadata,
+            )
+        return applied
 
-    _charge_credits_or_raise(
+    applied = _charge_credits_or_raise(
         user_id=owner_user_id,
         amount=amount,
         tx_type="video_analysis",
@@ -775,19 +919,19 @@ def charge_video_analysis_credits(
         processing_ref=processing_ref,
         context="Failed to charge video-analysis credits",
     )
-    _emit_usage_event_after_charge(
-        event_name=POLAR_USAGE_EVENT_ANALYSIS_NAME,
-        category="video_analysis",
-        owner_user_id=owner_user_id,
-        actor_user_id=actor_id,
-        amount=amount,
-        charge_source=charge_source,
-        team_id=team_id,
-        job_id=job_id,
-        video_id=video_id,
-        clip_id=None,
-        usage_metadata=usage_metadata,
-    )
+    if applied:
+        emit_video_analysis_usage_event(
+            user_id=user_id,
+            amount=amount,
+            video_id=video_id,
+            charge_source=charge_source,
+            team_id=team_id,
+            billing_owner_user_id=owner_user_id,
+            actor_user_id=actor_id,
+            job_id=job_id,
+            usage_metadata=usage_metadata,
+        )
+    return applied
 
 
 def emit_video_analysis_usage_event(

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
 
+from utils.subscription_state import derive_effective_subscription_state
 from utils.supabase_client import assert_response_ok, supabase
 
 FREE_MAX_CONCURRENT_JOBS = 1
@@ -194,7 +195,7 @@ def _read_user_subscription(
     try:
         response = (
             supabase_client.table("subscriptions")
-            .select("tier, status, interval")
+            .select("tier, status, interval, canceled_at, current_period_end")
             .eq("user_id", user_id)
             .limit(1)
             .execute()
@@ -208,12 +209,11 @@ def _read_user_subscription(
     if not rows:
         return "free", "active", "month"
 
-    row = rows[0]
-    interval = row.get("interval")
+    state = derive_effective_subscription_state(rows[0])
     return (
-        str(row.get("tier") or "free"),
-        str(row.get("status") or "active"),
-        str(interval) if interval else "month",
+        state.tier,
+        state.status,
+        state.interval or "month",
     )
 
 

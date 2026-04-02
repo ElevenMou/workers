@@ -32,6 +32,14 @@ def test_charge_credits_sql_uses_atomic_balance_update():
     assert "RETURNING balance INTO v_balance_after" in sql
 
 
+def test_team_wallet_reservation_sql_exists():
+    sql = _combined_migration_sql()
+    assert "CREATE TABLE IF NOT EXISTS public.team_wallet_reservations" in sql
+    assert "CREATE OR REPLACE FUNCTION public.reserve_team_credits(" in sql
+    assert "CREATE OR REPLACE FUNCTION public.capture_team_credit_reservation(" in sql
+    assert "CREATE OR REPLACE FUNCTION public.release_team_credit_reservation(" in sql
+
+
 def test_clip_tasks_finalize_before_charging_credits():
     generate_code = (
         _repo_root() / "workers" / "tasks" / "clips" / "generate.py"
@@ -40,12 +48,32 @@ def test_clip_tasks_finalize_before_charging_credits():
         _repo_root() / "workers" / "tasks" / "clips" / "custom.py"
     ).read_text(encoding="utf-8")
 
-    assert generate_code.index("clip_update = {") < generate_code.index(
-        "charge_clip_generation_credits("
+    assert generate_code.index("clip_update = {") < min(
+        generate_code.index("capture_credit_reservation("),
+        generate_code.index("capture_team_credit_reservation("),
     )
-    assert custom_code.index("clip_update = {") < custom_code.index(
-        "charge_clip_generation_credits("
+    assert custom_code.index("clip_update = {") < min(
+        custom_code.index("capture_credit_reservation("),
+        custom_code.index("capture_team_credit_reservation("),
     )
+
+
+def test_clip_tasks_reserve_before_rendering():
+    generate_code = (
+        _repo_root() / "workers" / "tasks" / "clips" / "generate.py"
+    ).read_text(encoding="utf-8")
+    custom_code = (
+        _repo_root() / "workers" / "tasks" / "clips" / "custom.py"
+    ).read_text(encoding="utf-8")
+
+    assert min(
+        generate_code.index("reserve_credits("),
+        generate_code.index("reserve_team_credits("),
+    ) < generate_code.index("generator.generate(")
+    assert min(
+        custom_code.index("reserve_credits("),
+        custom_code.index("reserve_team_credits("),
+    ) < custom_code.index("generator.generate(")
 
 
 def test_clip_tasks_emit_stage_progress_updates():

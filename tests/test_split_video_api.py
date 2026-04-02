@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import api_app.access_rules as access_rules
 import api_app.routers.videos as videos_router
 from api_app.auth import AuthenticatedUser, get_current_user
+from fastapi import HTTPException
 
 
 @dataclass
@@ -96,9 +97,16 @@ class _FakeBatchSplitQuery:
 
 
 class _FakeBatchSplitSupabase:
-    def __init__(self, *, videos: list[dict] | None = None, jobs: list[dict] | None = None):
+    def __init__(
+        self,
+        *,
+        videos: list[dict] | None = None,
+        clips: list[dict] | None = None,
+        jobs: list[dict] | None = None,
+    ):
         self.tables = {
             "videos": list(videos or []),
+            "clips": list(clips or []),
             "jobs": list(jobs or []),
         }
         self.video_upserts: list[dict] = []
@@ -122,6 +130,25 @@ def _basic_access_context(max_clip_duration_seconds: int = 120):
         max_active_jobs=2,
         priority_processing=False,
         clip_retention_days=30,
+    )
+
+
+def _team_access_context(*, role: str = "owner"):
+    return access_rules.UserAccessContext(
+        tier="basic",
+        status="active",
+        interval="month",
+        max_videos_per_month=60,
+        max_clip_duration_seconds=120,
+        max_analysis_duration_seconds=60 * 60,
+        allow_custom_clips=True,
+        max_active_jobs=5,
+        priority_processing=False,
+        clip_retention_days=30,
+        workspace_team_id="team-1",
+        workspace_role=role,
+        billing_owner_user_id="owner-user",
+        charge_source="team_wallet",
     )
 
 
@@ -283,6 +310,56 @@ def test_batch_split_video_queues_new_job_from_url(client, monkeypatch):
     assert fake_supabase.job_upserts[0]["type"] == "split_video"
 
 
+def test_batch_split_video_does_not_require_generation_credits_up_front(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    fake_supabase = _FakeBatchSplitSupabase()
+
+    def _fake_enqueue_or_fail(**_kwargs):
+        return None
+
+    monkeypatch.setattr(videos_router, "supabase", fake_supabase)
+    monkeypatch.setattr(videos_router, "enforce_processing_access_rules", lambda *_a, **_k: _basic_access_context())
+    monkeypatch.setattr(videos_router, "enforce_monthly_video_limit", lambda *_a, **_k: None)
+    monkeypatch.setattr(videos_router, "enqueue_or_fail", _fake_enqueue_or_fail)
+    monkeypatch.setattr(
+        videos_router,
+        "_raise_if_insufficient_credits",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected upfront credit gate")),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_probe_credit_cost_for_url",
+        lambda _url: {
+            "valid_url": True,
+            "duration_seconds": 210,
+            "video_title": "Long source",
+            "thumbnail_url": "https://image.test/thumb.jpg",
+            "platform": "youtube",
+            "external_id": "abc123",
+            "has_captions": True,
+            "has_audio": True,
+            "detected_language": "es",
+        },
+    )
+
+    response = client.post(
+        "/videos/batch-split",
+        json={
+            "url": "https://www.youtube.com/watch?v=abc123",
+            "segmentLengthSeconds": 60,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "queued"
+
+
 def test_batch_split_video_extends_timeout_for_likely_whisper_fallback(client, monkeypatch):
     from api_app.app import app
 
@@ -331,3 +408,400 @@ def test_batch_split_video_extends_timeout_for_likely_whisper_fallback(client, m
     assert response.status_code == 200
     assert enqueued_timeout_seconds is not None
     assert enqueued_timeout_seconds > videos_router.VIDEO_JOB_TIMEOUT
+
+
+def test_batch_generate_prepared_clips_returns_zero_when_no_eligible_clips(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    fake_supabase = _FakeBatchSplitSupabase(
+        videos=[
+            {
+                "id": "video-1",
+                "user_id": "user-id",
+                "team_id": None,
+                "url": "https://www.youtube.com/watch?v=abc123",
+                "duration_seconds": 180,
+                "status": "completed",
+            }
+        ],
+    )
+
+    monkeypatch.setattr(videos_router, "supabase", fake_supabase)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_a, **_k: _basic_access_context(),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "enqueue_or_fail",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected enqueue")),
+    )
+
+    response = client.post(
+        "/videos/batch-generate-prepared-clips",
+        json={"videoId": "video-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "videoId": "video-1",
+        "queuedCount": 0,
+        "skippedCount": 0,
+        "jobIds": [],
+    }
+
+
+def test_batch_generate_prepared_clips_queues_all_eligible_and_preflights_credits(
+    client,
+    monkeypatch,
+):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    fake_supabase = _FakeBatchSplitSupabase(
+        videos=[
+            {
+                "id": "video-1",
+                "user_id": "user-id",
+                "team_id": None,
+                "url": "https://www.youtube.com/watch?v=abc123",
+                "duration_seconds": 180,
+                "status": "completed",
+            }
+        ],
+        clips=[
+            {
+                "id": "clip-1",
+                "video_id": "video-1",
+                "user_id": "user-id",
+                "team_id": None,
+                "start_time": 0.0,
+                "end_time": 60.0,
+                "origin": "batch_split",
+                "status": "pending",
+                "layout_id": "layout-1",
+                "title": "Part 1",
+            },
+            {
+                "id": "clip-2",
+                "video_id": "video-1",
+                "user_id": "user-id",
+                "team_id": None,
+                "start_time": 60.0,
+                "end_time": 120.0,
+                "origin": "batch_split",
+                "status": "pending",
+                "layout_id": "layout-2",
+                "title": "Part 2",
+            },
+        ],
+    )
+    enqueued_payloads: list[dict] = []
+    required_credits: list[int] = []
+
+    monkeypatch.setattr(videos_router, "supabase", fake_supabase)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_a, **_k: _basic_access_context(),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_raise_if_insufficient_clip_generation_credits",
+        lambda **kwargs: required_credits.append(int(kwargs["required_credits"])),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "enqueue_or_fail",
+        lambda *, job_data, **_kwargs: enqueued_payloads.append(dict(job_data)),
+    )
+
+    response = client.post(
+        "/videos/batch-generate-prepared-clips",
+        json={"videoId": "video-1", "smartCleanupEnabled": True},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["queuedCount"] == 2
+    assert payload["skippedCount"] == 0
+    assert len(payload["jobIds"]) == 2
+    assert required_credits == [6]
+    assert [item["clipId"] for item in enqueued_payloads] == ["clip-1", "clip-2"]
+    assert all(item["smartCleanupEnabled"] is True for item in enqueued_payloads)
+    assert [item["layoutId"] for item in enqueued_payloads] == ["layout-1", "layout-2"]
+    assert [item["generationCredits"] for item in enqueued_payloads] == [3, 3]
+
+
+def test_batch_generate_prepared_clips_skips_active_generate_jobs(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    fake_supabase = _FakeBatchSplitSupabase(
+        videos=[
+            {
+                "id": "video-1",
+                "user_id": "user-id",
+                "team_id": None,
+                "url": "https://www.youtube.com/watch?v=abc123",
+                "duration_seconds": 180,
+                "status": "completed",
+            }
+        ],
+        clips=[
+            {
+                "id": "clip-1",
+                "video_id": "video-1",
+                "user_id": "user-id",
+                "team_id": None,
+                "start_time": 0.0,
+                "end_time": 60.0,
+                "origin": "batch_split",
+                "status": "pending",
+                "layout_id": "layout-1",
+                "title": "Part 1",
+            },
+            {
+                "id": "clip-2",
+                "video_id": "video-1",
+                "user_id": "user-id",
+                "team_id": None,
+                "start_time": 60.0,
+                "end_time": 120.0,
+                "origin": "batch_split",
+                "status": "pending",
+                "layout_id": "layout-2",
+                "title": "Part 2",
+            },
+        ],
+        jobs=[
+            {
+                "id": "job-live",
+                "video_id": "video-1",
+                "clip_id": "clip-1",
+                "user_id": "user-id",
+                "team_id": None,
+                "type": "generate_clip",
+                "status": "processing",
+            }
+        ],
+    )
+    enqueued_payloads: list[dict] = []
+
+    monkeypatch.setattr(videos_router, "supabase", fake_supabase)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_a, **_k: _basic_access_context(),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_raise_if_insufficient_clip_generation_credits",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "enqueue_or_fail",
+        lambda *, job_data, **_kwargs: enqueued_payloads.append(dict(job_data)),
+    )
+
+    response = client.post(
+        "/videos/batch-generate-prepared-clips",
+        json={"videoId": "video-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["queuedCount"] == 1
+    assert response.json()["skippedCount"] == 1
+    assert [item["clipId"] for item in enqueued_payloads] == ["clip-2"]
+
+
+def test_batch_generate_prepared_clips_rejects_credit_shortfall(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    fake_supabase = _FakeBatchSplitSupabase(
+        videos=[
+            {
+                "id": "video-1",
+                "user_id": "user-id",
+                "team_id": None,
+                "url": "https://www.youtube.com/watch?v=abc123",
+                "duration_seconds": 180,
+                "status": "completed",
+            }
+        ],
+        clips=[
+            {
+                "id": "clip-1",
+                "video_id": "video-1",
+                "user_id": "user-id",
+                "team_id": None,
+                "start_time": 0.0,
+                "end_time": 60.0,
+                "origin": "batch_split",
+                "status": "pending",
+                "layout_id": "layout-1",
+                "title": "Part 1",
+            }
+        ],
+    )
+
+    monkeypatch.setattr(videos_router, "supabase", fake_supabase)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_a, **_k: _basic_access_context(),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_raise_if_insufficient_clip_generation_credits",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            HTTPException(status_code=402, detail="Insufficient credits for clip generation.")
+        ),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "enqueue_or_fail",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected enqueue")),
+    )
+
+    response = client.post(
+        "/videos/batch-generate-prepared-clips",
+        json={"videoId": "video-1"},
+    )
+
+    assert response.status_code == 402
+    assert response.json()["detail"] == "Insufficient credits for clip generation."
+    assert fake_supabase.job_upserts == []
+
+
+def test_batch_generate_prepared_clips_scopes_to_active_workspace(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="user-id",
+        email=None,
+        claims={},
+    )
+    fake_supabase = _FakeBatchSplitSupabase(
+        videos=[
+            {
+                "id": "video-1",
+                "user_id": "other-user",
+                "team_id": None,
+                "url": "https://www.youtube.com/watch?v=abc123",
+                "duration_seconds": 180,
+                "status": "completed",
+            }
+        ],
+    )
+
+    monkeypatch.setattr(videos_router, "supabase", fake_supabase)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_a, **_k: _basic_access_context(),
+    )
+
+    response = client.post(
+        "/videos/batch-generate-prepared-clips",
+        json={"videoId": "video-1"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Video not found in the active workspace."
+
+
+def test_batch_generate_prepared_clips_limits_team_member_to_own_clips(client, monkeypatch):
+    from api_app.app import app
+
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        id="member-user",
+        email=None,
+        claims={},
+    )
+    fake_supabase = _FakeBatchSplitSupabase(
+        videos=[
+            {
+                "id": "video-1",
+                "user_id": "owner-user",
+                "team_id": "team-1",
+                "url": "https://www.youtube.com/watch?v=abc123",
+                "duration_seconds": 180,
+                "status": "completed",
+            }
+        ],
+        clips=[
+            {
+                "id": "clip-own",
+                "video_id": "video-1",
+                "user_id": "member-user",
+                "team_id": "team-1",
+                "start_time": 0.0,
+                "end_time": 60.0,
+                "origin": "batch_split",
+                "status": "pending",
+                "layout_id": "layout-own",
+                "title": "Part 1",
+            },
+            {
+                "id": "clip-other",
+                "video_id": "video-1",
+                "user_id": "other-user",
+                "team_id": "team-1",
+                "start_time": 60.0,
+                "end_time": 120.0,
+                "origin": "batch_split",
+                "status": "pending",
+                "layout_id": "layout-other",
+                "title": "Part 2",
+            },
+        ],
+    )
+    enqueued_payloads: list[dict] = []
+
+    monkeypatch.setattr(videos_router, "supabase", fake_supabase)
+    monkeypatch.setattr(
+        videos_router,
+        "enforce_processing_access_rules",
+        lambda *_a, **_k: _team_access_context(role="member"),
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "_raise_if_insufficient_clip_generation_credits",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        videos_router,
+        "enqueue_or_fail",
+        lambda *, job_data, **_kwargs: enqueued_payloads.append(dict(job_data)),
+    )
+
+    response = client.post(
+        "/videos/batch-generate-prepared-clips",
+        json={"videoId": "video-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["queuedCount"] == 1
+    assert response.json()["skippedCount"] == 0
+    assert [item["clipId"] for item in enqueued_payloads] == ["clip-own"]

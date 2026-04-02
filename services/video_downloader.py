@@ -14,7 +14,19 @@ from urllib.parse import urlparse
 import ffmpeg as ffmpeg_lib
 import httpx
 import yt_dlp
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import (
+    AgeRestricted,
+    CouldNotRetrieveTranscript,
+    InvalidVideoId,
+    IpBlocked,
+    NoTranscriptFound,
+    RequestBlocked,
+    TranscriptsDisabled,
+    VideoUnavailable,
+    VideoUnplayable,
+    YouTubeRequestFailed,
+    YouTubeTranscriptApi,
+)
 from youtube_transcript_api.proxies import GenericProxyConfig
 
 from config import (
@@ -33,12 +45,9 @@ from config import (
 _MIN_FREE_DISK_MB = int(os.getenv("MIN_FREE_DISK_MB", str(MAX_VIDEO_SIZE_MB * 2 + 500)))
 
 
-def _build_yt_transcript_api() -> YouTubeTranscriptApi:
-    """Build YouTubeTranscriptApi with proxy if configured."""
-    proxy_url = YTDLP_PROXY
-    if not proxy_url:
-        proxies = YTDLP_PROXY_LIST
-        proxy_url = proxies[0] if proxies else None
+def _build_yt_transcript_api(proxy_url: str | None = None) -> YouTubeTranscriptApi:
+    """Build YouTubeTranscriptApi with an optional proxy."""
+    proxy_url = str(proxy_url or "").strip() or None
     if proxy_url:
         return YouTubeTranscriptApi(
             proxy_config=GenericProxyConfig(
@@ -49,7 +58,51 @@ def _build_yt_transcript_api() -> YouTubeTranscriptApi:
     return YouTubeTranscriptApi()
 
 
-_yt_transcript_api = _build_yt_transcript_api()
+def _build_yt_transcript_api_candidates() -> list[tuple[str | None, YouTubeTranscriptApi]]:
+    proxy_urls: list[str | None] = []
+    if YTDLP_PROXY:
+        proxy_urls.append(YTDLP_PROXY)
+    for proxy_url in YTDLP_PROXY_LIST:
+        if proxy_url not in proxy_urls:
+            proxy_urls.append(proxy_url)
+    if not proxy_urls:
+        proxy_urls.append(None)
+    return [(proxy_url, _build_yt_transcript_api(proxy_url)) for proxy_url in proxy_urls]
+
+
+def _is_retryable_youtube_transcript_error(exc: Exception) -> bool:
+    if isinstance(
+        exc,
+        (
+            NoTranscriptFound,
+            TranscriptsDisabled,
+            VideoUnavailable,
+            VideoUnplayable,
+            AgeRestricted,
+            InvalidVideoId,
+        ),
+    ):
+        return False
+    return isinstance(
+        exc,
+        (
+            RequestBlocked,
+            IpBlocked,
+            YouTubeRequestFailed,
+            CouldNotRetrieveTranscript,
+        ),
+    )
+
+
+def _fetch_youtube_transcript_for_client(
+    transcript_api: YouTubeTranscriptApi,
+    video_id: str,
+    preferred_languages: list[str],
+):
+    try:
+        return transcript_api.fetch(video_id, languages=preferred_languages)
+    except NoTranscriptFound:
+        return transcript_api.fetch(video_id)
 
 logger = logging.getLogger(__name__)
 
@@ -687,6 +740,18 @@ class VideoDownloader:
         }
 
     @staticmethod
+    def _youtube_cookie_first_overrides() -> dict[str, object]:
+        return {
+            "proxy": None,
+        }
+
+    @staticmethod
+    def _youtube_proxy_fallback_overrides() -> dict[str, object]:
+        return {
+            "cookiefile": None,
+        }
+
+    @staticmethod
     def _merge_ydl_overrides(*overrides: dict[str, object] | None) -> dict[str, object] | None:
         merged: dict[str, object] = {}
         for override in overrides:
@@ -714,6 +779,22 @@ class VideoDownloader:
                 else:
                     merged[key] = value
         return merged or None
+
+    def _probe_ydl_opts(self, *, include_cookies: bool, include_proxy: bool) -> dict:
+        opts = self._base_ydl_opts(max_height=2160)
+        if not include_cookies:
+            opts.pop("cookiefile", None)
+        if not include_proxy:
+            opts.pop("proxy", None)
+        opts.update(
+            {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "noplaylist": True,
+            }
+        )
+        return opts
 
     def _download_with_opts(
         self,
@@ -834,6 +915,7 @@ class VideoDownloader:
         *,
         format_selector: str,
         attempt_label: str,
+        proxy_fallback_label: str,
         direct_public_label: str,
         legacy_label: str,
         video_id: str,
@@ -847,6 +929,15 @@ class VideoDownloader:
                 }
             }
         }
+        cookie_first_allowed = self._has_cookie_configuration()
+        proxy_allowed = self._has_proxy_configuration()
+        initial_overrides = ydl_overrides
+        if cookie_first_allowed:
+            initial_overrides = self._merge_ydl_overrides(
+                ydl_overrides,
+                self._youtube_cookie_first_overrides(),
+            )
+
         try:
             return self._download_with_opts(
                 url,
@@ -854,18 +945,42 @@ class VideoDownloader:
                 format_selector=format_selector,
                 attempt_label=attempt_label,
                 max_height=max_height,
-                ydl_overrides=ydl_overrides,
+                ydl_overrides=initial_overrides,
             )
         except yt_dlp.utils.DownloadError as exc:
-            direct_public_allowed = (
-                self._has_cookie_configuration() or self._has_proxy_configuration()
-            )
-            if direct_public_allowed:
+            last_attempt_label = attempt_label
+            last_exc: yt_dlp.utils.DownloadError = exc
+
+            if cookie_first_allowed and proxy_allowed:
                 logger.warning(
-                    "yt-dlp download failed (%s) for %s; retrying with direct public YouTube access: %s",
+                    "yt-dlp download failed (%s) for %s; retrying with configured proxies: %s",
                     attempt_label,
                     video_id,
                     exc,
+                )
+                try:
+                    return self._download_with_opts(
+                        url,
+                        output_path,
+                        format_selector=format_selector,
+                        attempt_label=proxy_fallback_label,
+                        max_height=max_height,
+                        ydl_overrides=self._merge_ydl_overrides(
+                            ydl_overrides,
+                            self._youtube_proxy_fallback_overrides(),
+                        ),
+                    )
+                except yt_dlp.utils.DownloadError as proxy_exc:
+                    last_attempt_label = proxy_fallback_label
+                    last_exc = proxy_exc
+
+            direct_public_allowed = cookie_first_allowed or proxy_allowed
+            if direct_public_allowed:
+                logger.warning(
+                    "yt-dlp download failed (%s) for %s; retrying with direct public YouTube access: %s",
+                    last_attempt_label,
+                    video_id,
+                    last_exc,
                 )
                 try:
                     return self._download_with_opts(
@@ -888,9 +1003,9 @@ class VideoDownloader:
             else:
                 logger.warning(
                     "yt-dlp download failed (%s) for %s; retrying with legacy YouTube clients: %s",
-                    attempt_label,
+                    last_attempt_label,
                     video_id,
-                    exc,
+                    last_exc,
                 )
             try:
                 return self._download_with_opts(
@@ -923,6 +1038,7 @@ class VideoDownloader:
                 output_path,
                 format_selector=primary_selector,
                 attempt_label="best_source_default",
+                proxy_fallback_label="best_source_proxy_fallback",
                 direct_public_label="best_source_direct_public",
                 legacy_label="best_source_legacy_clients",
                 video_id=video_id,
@@ -955,6 +1071,7 @@ class VideoDownloader:
                         output_path,
                         format_selector=compatibility_selector,
                         attempt_label="compatibility_fallback",
+                        proxy_fallback_label="compatibility_proxy_fallback",
                         direct_public_label="compatibility_direct_public",
                         legacy_label="compatibility_legacy_clients",
                         video_id=video_id,
@@ -1002,6 +1119,7 @@ class VideoDownloader:
                 output_template,
                 format_selector=audio_selector,
                 attempt_label="audio_only_default",
+                proxy_fallback_label="audio_only_proxy_fallback",
                 direct_public_label="audio_only_direct_public",
                 legacy_label="audio_only_legacy_clients",
                 video_id=video_id,
@@ -1032,7 +1150,13 @@ class VideoDownloader:
             "external_id": info.get("id"),
         }
 
-    def _extract_with_proxy_rotation(self, url: str, ydl_opts: dict) -> dict:
+    def _extract_with_proxy_rotation(
+        self,
+        url: str,
+        ydl_opts: dict,
+        *,
+        rotate_on_bot_check: bool = True,
+    ) -> dict:
         """Try extract_info, rotating through proxies on bot-check failures."""
         proxies = _build_proxy_list()
         last_exc: Exception | None = None
@@ -1043,7 +1167,7 @@ class VideoDownloader:
                 return ydl.extract_info(url, download=False)
         except Exception as exc:
             reason = classify_yt_dlp_error(exc)
-            if reason != "youtube_bot_check" or not proxies:
+            if reason != "youtube_bot_check" or not proxies or not rotate_on_bot_check:
                 logger.warning("yt-dlp probe failed (%s) for %s: %s", reason, url, exc)
                 raise VideoProbeError(reason, str(exc)) from exc
             logger.warning(
@@ -1054,7 +1178,12 @@ class VideoDownloader:
             last_exc = exc
 
         # Rotate through remaining proxies (skip index 0 — already tried).
-        for i, proxy in enumerate(proxies[1:], start=2):
+        initial_proxy = ydl_opts.get("proxy")
+        start_index = 0
+        if isinstance(initial_proxy, str) and initial_proxy in proxies:
+            start_index = proxies.index(initial_proxy) + 1
+
+        for i, proxy in enumerate(proxies[start_index:], start=start_index + 1):
             ydl_opts["proxy"] = proxy
             try:
                 logger.info("yt-dlp retry with proxy %d/%d", i, len(proxies))
@@ -1078,19 +1207,26 @@ class VideoDownloader:
     def _probe_info(self, url: str) -> dict:
         """Fetch source metadata from yt-dlp without downloading media."""
         _validate_url(url)
-        ydl_opts = self._base_ydl_opts(max_height=2160)
+        cookie_probe_opts = self._probe_ydl_opts(include_cookies=True, include_proxy=False)
+        cookiefile = cookie_probe_opts.get("cookiefile")
         # Probing doesn't need cookies — stale/IP-mismatched cookies can
         # trigger YouTube bot checks *before* PO tokens come into play.
-        ydl_opts.pop("cookiefile", None)
-        ydl_opts.update(
-            {
-                "quiet": True,
-                "no_warnings": True,
-                "skip_download": True,
-                "noplaylist": True,
-            }
-        )
-        return self._extract_with_proxy_rotation(url, ydl_opts)
+        if cookiefile:
+            try:
+                return self._extract_with_proxy_rotation(
+                    url,
+                    cookie_probe_opts,
+                    rotate_on_bot_check=False,
+                )
+            except VideoProbeError as exc:
+                logger.warning(
+                    "yt-dlp probe failed with cookies (%s) for %s; retrying with configured proxies",
+                    exc.failure_reason,
+                    url,
+                )
+
+        proxy_probe_opts = self._probe_ydl_opts(include_cookies=False, include_proxy=True)
+        return self._extract_with_proxy_rotation(url, proxy_probe_opts)
 
     def _preferred_languages(self, language_hint: str | None = None) -> list[str]:
         preferred: list[str] = []
@@ -1316,31 +1452,38 @@ class VideoDownloader:
         """
         fetched = None
         preferred = preferred_languages or self._preferred_languages()
+        transcript_clients = _build_yt_transcript_api_candidates()
 
-        # 1. Try preferred transcript languages (manual or auto-generated)
-        try:
-            fetched = _yt_transcript_api.fetch(video_id, languages=preferred)
-            logger.info(
-                "Found %s transcript (%s) for %s",
-                fetched.language,
-                fetched.language_code,
-                video_id,
-            )
-        except Exception:
-            pass
-
-        # 2. Fall back to any available language
-        if fetched is None:
+        for attempt_index, (_proxy_url, transcript_api) in enumerate(
+            transcript_clients,
+            start=1,
+        ):
             try:
-                fetched = _yt_transcript_api.fetch(video_id)
+                fetched = _fetch_youtube_transcript_for_client(
+                    transcript_api,
+                    video_id,
+                    preferred,
+                )
                 logger.info(
                     "Found %s transcript (%s) for %s",
                     fetched.language,
                     fetched.language_code,
                     video_id,
                 )
-            except Exception as e:
-                logger.warning("Could not get YouTube transcript for %s: %s", video_id, e)
+                break
+            except Exception as exc:
+                if (
+                    attempt_index < len(transcript_clients)
+                    and _is_retryable_youtube_transcript_error(exc)
+                ):
+                    logger.warning(
+                        "YouTube transcript fetch blocked on proxy %d/%d for %s; rotating",
+                        attempt_index,
+                        len(transcript_clients),
+                        video_id,
+                    )
+                    continue
+                logger.warning("Could not get YouTube transcript for %s: %s", video_id, exc)
                 return None
 
         segments = [

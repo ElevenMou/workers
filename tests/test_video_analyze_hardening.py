@@ -349,6 +349,7 @@ def _install_common_patches(
 
     reservations_by_key: dict[str, str] = {}
     captured: set[str] = set()
+    team_capture_calls: list[str] = []
 
     def _reserve_credits(**kwargs):
         key = str(kwargs.get("reservation_key") or f"default:{kwargs['user_id']}")
@@ -368,23 +369,47 @@ def _install_common_patches(
         release_calls.append(reservation_id)
         return True
 
+    def _reserve_team_credits(**kwargs):
+        key = str(kwargs.get("reservation_key") or f"team:{kwargs['team_id']}")
+        reservation_id = reservations_by_key.get(key)
+        if reservation_id:
+            return reservation_id
+        reservation_id = f"team-res-{len(reservations_by_key) + 1}"
+        reservations_by_key[key] = reservation_id
+        return reservation_id
+
+    def _capture_team_credit_reservation(*, reservation_id: str, **_kwargs):
+        team_capture_calls.append(reservation_id)
+        captured.add(reservation_id)
+        return True
+
+    def _release_team_credit_reservation(*, reservation_id: str):
+        release_calls.append(reservation_id)
+        return True
+
     monkeypatch.setattr(analyze_task_module, "reserve_credits", _reserve_credits)
     monkeypatch.setattr(analyze_task_module, "capture_credit_reservation", _capture_credit_reservation)
     monkeypatch.setattr(analyze_task_module, "release_credit_reservation", _release_credit_reservation)
-    monkeypatch.setattr(analyze_task_module, "emit_video_analysis_usage_event", lambda **_k: None)
-    monkeypatch.setattr(analyze_task_module, "has_team_wallet_charge_for_job", lambda **_k: False)
+    monkeypatch.setattr(analyze_task_module, "reserve_team_credits", _reserve_team_credits)
     monkeypatch.setattr(
         analyze_task_module,
-        "charge_video_analysis_credits",
-        lambda **kwargs: team_charge_calls.append(kwargs),
+        "capture_team_credit_reservation",
+        _capture_team_credit_reservation,
     )
+    monkeypatch.setattr(
+        analyze_task_module,
+        "release_team_credit_reservation",
+        _release_team_credit_reservation,
+    )
+    monkeypatch.setattr(analyze_task_module, "emit_video_analysis_usage_event", lambda **_k: None)
+    monkeypatch.setattr(analyze_task_module, "has_team_wallet_charge_for_job", lambda **_k: False)
 
     return {
         "job_updates": job_updates,
         "video_status_updates": video_status_updates,
         "capture_calls": capture_calls,
         "release_calls": release_calls,
-        "team_charge_calls": team_charge_calls,
+        "team_charge_calls": team_capture_calls,
     }
 
 

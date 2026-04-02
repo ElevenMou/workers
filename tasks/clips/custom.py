@@ -55,10 +55,17 @@ from utils.sentry_context import configure_job_scope
 from utils.workdirs import create_work_dir
 from utils.supabase_client import (
     assert_response_ok,
-    charge_clip_generation_credits,
+    capture_credit_reservation,
+    capture_team_credit_reservation,
+    emit_clip_generation_usage_event,
     get_credit_balance,
     get_team_wallet_balance,
     has_sufficient_credits,
+    has_team_wallet_charge_for_job,
+    release_credit_reservation,
+    release_team_credit_reservation,
+    reserve_credits,
+    reserve_team_credits,
     supabase,
     update_job_status,
     update_video_status,
@@ -173,6 +180,31 @@ def _best_effort_mark_failed(
         update_video_status(video_id, "failed", error_message=error_msg)
     except Exception as exc:
         logger.warning("[%s] Failed to mark video %s failed: %s", job_id, video_id, exc)
+
+
+def _release_pending_clip_reservation(
+    *,
+    job_id: str,
+    charge_source: str,
+    reservation_id: str | None,
+    reservation_captured: bool,
+):
+    if not reservation_id or reservation_captured:
+        return
+
+    try:
+        if charge_source == "team_wallet":
+            release_team_credit_reservation(reservation_id=reservation_id)
+        else:
+            release_credit_reservation(reservation_id=reservation_id)
+    except Exception as exc:
+        logger.warning(
+            "[%s] Failed to release %s custom-clip reservation %s: %s",
+            job_id,
+            charge_source,
+            reservation_id,
+            exc,
+        )
 
 
 def _has_retries_remaining() -> bool:
@@ -298,6 +330,10 @@ def custom_clip_task(job_data: CustomClipJob):
     source_video_strategy = "reused_existing"
     source_video_wait_seconds = 0.0
     source_video_download_seconds = 0.0
+    reservation_key = f"clip_generation:{job_id}"
+    reservation_id: str | None = None
+    reservation_captured = False
+    team_wallet_already_charged = False
 
     try:
         update_clip_job_progress(
@@ -322,6 +358,41 @@ def custom_clip_task(job_data: CustomClipJob):
                 "Insufficient credits for custom clip generation before processing starts: "
                 f"required={generation_credits}, available={available}"
             )
+
+        if generation_credits > 0:
+            if charge_source == "team_wallet" and workspace_team_id:
+                team_wallet_already_charged = has_team_wallet_charge_for_job(
+                    team_id=workspace_team_id,
+                    job_id=job_id,
+                    owner_user_id=billing_owner_user_id,
+                )
+                if not team_wallet_already_charged:
+                    reservation_id = reserve_team_credits(
+                        owner_user_id=billing_owner_user_id,
+                        team_id=workspace_team_id,
+                        amount=generation_credits,
+                        reason=f"Custom clip reservation ({job_id})",
+                        actor_user_id=user_id,
+                        reservation_key=reservation_key,
+                        video_id=video_id,
+                        clip_id=clip_id,
+                        job_id=job_id,
+                    )
+            else:
+                reservation_id = reserve_credits(
+                    user_id=billing_owner_user_id,
+                    amount=generation_credits,
+                    reason=f"Custom clip reservation ({job_id})",
+                    reservation_key=reservation_key,
+                    video_id=video_id,
+                    clip_id=clip_id,
+                )
+
+            if generation_credits > 0 and not team_wallet_already_charged and not reservation_id:
+                raise RuntimeError(
+                    "Insufficient credits for custom clip generation before processing starts: "
+                    f"required={generation_credits}"
+                )
 
         update_video_status(video_id, "downloading")
         clip_status_resp = supabase.table("clips").update({"status": "generating"}).eq(
@@ -916,26 +987,46 @@ def custom_clip_task(job_data: CustomClipJob):
             stage="charging_credits",
             detail_key="updating_usage_records",
         )
-        charge_clip_generation_credits(
-            user_id=user_id,
-            amount=generation_credits,
-            description=f"Custom clip: {title[:50]}",
-            video_id=video_id,
-            clip_id=clip_id,
-            charge_source=charge_source,
-            team_id=workspace_team_id,
-            billing_owner_user_id=billing_owner_user_id,
-            actor_user_id=user_id,
-            job_id=job_id,
-            processing_ref=f"clip_generation:{job_id}",
-            usage_metadata={
-                "units_generated": 1,
-                "smart_cleanup_enabled": smart_cleanup_enabled,
-                "clip_duration_seconds": max(0.0, end_time - start_time),
-                "workspace_role": workspace_role,
-                "generation_flow": "custom",
-            },
-        )
+        usage_metadata = {
+            "units_generated": 1,
+            "smart_cleanup_enabled": smart_cleanup_enabled,
+            "clip_duration_seconds": max(0.0, end_time - start_time),
+            "workspace_role": workspace_role,
+            "generation_flow": "custom",
+        }
+        if generation_credits > 0 and not team_wallet_already_charged:
+            if not reservation_id:
+                raise RuntimeError("Missing custom clip reservation before capture")
+            if charge_source == "team_wallet" and workspace_team_id:
+                newly_applied = capture_team_credit_reservation(
+                    reservation_id=reservation_id,
+                    owner_tx_type="clip_generation",
+                    description=f"Custom clip: {title[:50]}",
+                    processing_ref=f"clip_generation:{job_id}",
+                    team_id=workspace_team_id,
+                )
+            else:
+                newly_applied = capture_credit_reservation(
+                    reservation_id=reservation_id,
+                    tx_type="clip_generation",
+                    description=f"Custom clip: {title[:50]}",
+                    processing_ref=f"clip_generation:{job_id}",
+                    user_id=billing_owner_user_id,
+                )
+            reservation_captured = True
+            if newly_applied:
+                emit_clip_generation_usage_event(
+                    user_id=user_id,
+                    amount=generation_credits,
+                    video_id=video_id,
+                    clip_id=clip_id,
+                    charge_source=charge_source,
+                    team_id=workspace_team_id,
+                    billing_owner_user_id=billing_owner_user_id,
+                    actor_user_id=user_id,
+                    job_id=job_id,
+                    usage_metadata=usage_metadata,
+                )
 
         update_job_status(
             job_id,
@@ -978,6 +1069,12 @@ def custom_clip_task(job_data: CustomClipJob):
             delivery_storage_path=uploaded_delivery_storage_path,
             master_storage_path=uploaded_master_storage_path,
             logger=logger,
+        )
+        _release_pending_clip_reservation(
+            job_id=job_id,
+            charge_source=charge_source,
+            reservation_id=reservation_id,
+            reservation_captured=reservation_captured,
         )
         if _has_retries_remaining():
             logger.warning(

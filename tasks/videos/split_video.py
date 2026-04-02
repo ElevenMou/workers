@@ -15,10 +15,7 @@ from config import (
     calculate_custom_clip_generation_cost,
 )
 from services.ai_analyzer import AIAnalyzer
-from services.clips.quality_policy import resolve_clip_quality_policy
 from services.clips.render_profiles import (
-    DEFAULT_DELIVERY_PROFILE,
-    DEFAULT_MASTER_PROFILE,
     DEFAULT_SOURCE_PROFILE,
 )
 from services.transcriber import Transcriber
@@ -34,17 +31,13 @@ from tasks.clips.helpers.source_video import (
     build_raw_video_metadata_update,
     resolve_source_video,
 )
-from tasks.models.jobs import GenerateClipJob, SplitVideoJob
+from tasks.models.jobs import SplitVideoJob
 from tasks.videos.source_transcript import resolve_source_transcript
 from tasks.videos.transcript import normalize_transcript_for_analysis_window
 from utils.media_storage import upload_raw_video
-from utils.redis_client import enqueue_job
 from utils.sentry_context import configure_job_scope
 from utils.supabase_client import (
     assert_response_ok,
-    get_credit_balance,
-    get_team_wallet_balance,
-    has_sufficient_credits,
     supabase,
     update_job_status,
     update_video_status,
@@ -52,10 +45,6 @@ from utils.supabase_client import (
 from utils.workdirs import create_work_dir
 
 logger = logging.getLogger(__name__)
-
-_GENERATE_TASK_PATH = "tasks.generate_clip.generate_clip_task"
-_STANDARD_CLIP_QUEUE = "clip-generation"
-_PRIORITY_CLIP_QUEUE = "clip-generation-priority"
 _MAX_PARTS = 20
 _MIN_INTERVAL_SECONDS = 0.01
 _PART_TITLE_PREFIX_RE = re.compile(r"^\s*part\s+\d+\s*[-:]\s*", re.IGNORECASE)
@@ -101,10 +90,6 @@ def _as_optional_bool(value: Any) -> bool | None:
     if text in {"0", "false", "no", "off"}:
         return False
     return None
-
-
-def _clip_queue_name(priority_processing: bool) -> str:
-    return _PRIORITY_CLIP_QUEUE if priority_processing else _STANDARD_CLIP_QUEUE
 
 
 def _load_video_context_row(video_id: str) -> dict[str, Any]:
@@ -566,81 +551,17 @@ def _format_part_title(index: int, title_suffix: str | None, source_title: str |
     return f"Part {index} - {cleaned_suffix}"
 
 
-def _enqueue_generate_child_job(
-    *,
-    job_data: GenerateClipJob,
-    queue_name: str,
-    clip_id: str,
-    video_id: str,
-    user_id: str,
-    team_id: str | None,
-    billing_owner_user_id: str,
-) -> tuple[str, bool]:
-    job_id = str(job_data["jobId"])
-    response = (
-        supabase.table("jobs")
-        .insert(
-            {
-                "id": job_id,
-                "user_id": user_id,
-                "team_id": team_id,
-                "billing_owner_user_id": billing_owner_user_id,
-                "video_id": video_id,
-                "clip_id": clip_id,
-                "type": "generate_clip",
-                "status": "queued",
-                "input_data": job_data,
-            }
-        )
-        .execute()
-    )
-    assert_response_ok(response, f"Failed to insert child generation job {job_id}")
-
-    try:
-        enqueue_job(queue_name, _GENERATE_TASK_PATH, job_data, job_id=job_id)
-    except Exception as exc:
-        logger.error("[%s] Failed to enqueue child generation job for clip %s: %s", job_id, clip_id, exc)
-        try:
-            update_job_status(job_id, "failed", 0, f"Queue enqueue failed: {exc}")
-        except Exception:
-            logger.warning("[%s] Failed to mark child generation job failed", job_id)
-        try:
-            supabase.table("clips").update(
-                {
-                    "status": "failed",
-                    "error_message": f"Clip queue enqueue failed: {exc}",
-                }
-            ).eq("id", clip_id).execute()
-        except Exception:
-            logger.warning("[%s] Failed to mark clip %s failed after enqueue error", job_id, clip_id)
-        return job_id, False
-
-    logger.info(
-        "Child generate job %s enqueued on %s queue (clip=%s video=%s user=%s)",
-        job_id,
-        queue_name,
-        clip_id,
-        video_id,
-        user_id,
-    )
-    return job_id, True
-
-
 def split_video_task(job_data: SplitVideoJob) -> None:
     job_id = str(job_data["jobId"])
     video_id = str(job_data["videoId"])
     user_id = str(job_data["userId"])
     workspace_team_id = job_data.get("workspaceTeamId")
     billing_owner_user_id = str(job_data.get("billingOwnerUserId") or user_id)
-    charge_source = str(job_data.get("chargeSource") or "owner_wallet")
-    workspace_role = str(job_data.get("workspaceRole") or "owner")
     subscription_tier = str(job_data.get("subscriptionTier") or "basic")
     segment_length_seconds = int(job_data.get("segmentLengthSeconds") or 60)
     layout_id = str(job_data.get("layoutId") or "").strip() or None
     expected_part_count = max(1, int(job_data.get("expectedPartCount") or 1))
     expected_generation_credits = max(0, int(job_data.get("expectedGenerationCredits") or 0))
-    clip_retention_days = job_data.get("clipRetentionDays")
-    priority_processing = bool(job_data.get("priorityProcessing"))
     source_title = str(job_data.get("sourceTitle") or "").strip() or None
     source_thumbnail_url = str(job_data.get("sourceThumbnailUrl") or "").strip() or None
     source_platform = str(job_data.get("sourcePlatform") or "").strip().lower() or None
@@ -675,22 +596,6 @@ def split_video_task(job_data: SplitVideoJob) -> None:
                 result_data={"stage": "superseded", "video_id": video_id},
             )
             return
-
-        if expected_generation_credits > 0 and not has_sufficient_credits(
-            user_id=billing_owner_user_id,
-            amount=expected_generation_credits,
-            charge_source=charge_source,
-            team_id=workspace_team_id,
-        ):
-            available = (
-                get_team_wallet_balance(workspace_team_id)
-                if charge_source == "team_wallet" and workspace_team_id
-                else get_credit_balance(billing_owner_user_id)
-            )
-            raise RuntimeError(
-                "Insufficient credits for split-video generation before processing starts: "
-                f"required={expected_generation_credits}, available={available}"
-            )
 
         work_dir = create_work_dir(f"split_{job_id}")
         downloader = VideoDownloader(work_dir=work_dir)
@@ -785,6 +690,15 @@ def split_video_task(job_data: SplitVideoJob) -> None:
             job_id=job_id,
         )
         transcript = transcript_resolution.transcript
+        transcript_segments = transcript.get("segments") if isinstance(transcript, dict) else []
+        logger.info(
+            "[%s] Transcript resolved for video %s: source=%s segments=%d duration=%ss",
+            job_id,
+            video_id,
+            str(transcript.get("source") or transcript_resolution.fallback_reason or "unknown"),
+            len(transcript_segments) if isinstance(transcript_segments, list) else 0,
+            duration_seconds,
+        )
 
         video_update_payload = {
             "title": source_info.get("title"),
@@ -805,6 +719,12 @@ def split_video_task(job_data: SplitVideoJob) -> None:
         assert_response_ok(video_metadata_response, f"Failed to update video metadata for {video_id}")
 
         _update_split_job_progress(job_id, 32, "planning_cleanup", detail_key="analyzing_intro_outro_ad_ranges")
+        logger.info(
+            "[%s] Starting cleanup analysis for video %s (duration=%ss)",
+            job_id,
+            video_id,
+            duration_seconds,
+        )
 
         heuristic_ranges = _find_heuristic_removal_ranges(
             transcript,
@@ -812,6 +732,7 @@ def split_video_task(job_data: SplitVideoJob) -> None:
         )
         ai_ranges: list[dict[str, Any]] = []
         try:
+            logger.info("[%s] Requesting AI cleanup ranges for video %s", job_id, video_id)
             ai_ranges = analyzer.find_removable_ranges(
                 transcript,
                 video_title=source_info.get("title"),
@@ -828,6 +749,17 @@ def split_video_task(job_data: SplitVideoJob) -> None:
             ai_ranges=ai_ranges,
             duration_seconds=float(duration_seconds),
         )
+        removed_seconds = float(trim_diagnostics.get("total_removed_seconds") or 0.0)
+        logger.info(
+            "[%s] Cleanup analysis complete for video %s: heuristic=%d ai=%d accepted=%d intervals=%d removed=%.2fs",
+            job_id,
+            video_id,
+            len(heuristic_ranges),
+            len(ai_ranges),
+            len(trim_diagnostics.get("accepted_ranges") or []),
+            len(removal_intervals),
+            removed_seconds,
+        )
 
         cleaned_video_path = source_video_path
         cleaned_storage_path = source_storage_path
@@ -835,7 +767,16 @@ def split_video_task(job_data: SplitVideoJob) -> None:
         cleaned_duration_seconds = float(duration_seconds)
 
         if removal_intervals:
-            _update_split_job_progress(job_id, 45, "rendering_clean_source", detail_key="removing_intro_outro_ad")
+            _update_split_job_progress(
+                job_id,
+                45,
+                "rendering_clean_source",
+                detail_key="removing_intro_outro_ad",
+                detail_params={
+                    "removed_seconds": round(removed_seconds, 2),
+                    "interval_count": len(removal_intervals),
+                },
+            )
             keep_intervals = build_keep_intervals(
                 window_start=0.0,
                 window_end=float(duration_seconds),
@@ -844,6 +785,13 @@ def split_video_task(job_data: SplitVideoJob) -> None:
             if keep_intervals:
                 timeline_map = build_timeline_map(keep_intervals)
                 if timeline_map:
+                    logger.info(
+                        "[%s] Rendering cleaned source for video %s: keep_segments=%d removed=%.2fs",
+                        job_id,
+                        video_id,
+                        len(keep_intervals),
+                        removed_seconds,
+                    )
                     cleaned_output_path = os.path.join(work_dir, f"{video_id}_split_cleaned.mov")
                     render_condensed_video_from_keep_intervals(
                         input_video_path=source_video_path,
@@ -868,6 +816,15 @@ def split_video_task(job_data: SplitVideoJob) -> None:
                         [round(start, 3), round(end, 3)] for start, end in keep_intervals
                     ]
                     trim_diagnostics["timeline_map"] = timeline_map
+                    logger.info(
+                        "[%s] Cleaned source ready for video %s: duration=%.2fs storage=%s",
+                        job_id,
+                        video_id,
+                        cleaned_duration_seconds,
+                        cleaned_storage_path,
+                    )
+        else:
+            logger.info("[%s] Cleanup render skipped for video %s: no confident removal ranges", job_id, video_id)
 
         part_windows = _build_part_windows(
             duration_seconds=cleaned_duration_seconds,
@@ -879,25 +836,9 @@ def split_video_task(job_data: SplitVideoJob) -> None:
 
         _update_split_job_progress(job_id, 62, "creating_parts", detail_key="creating_split_parts")
 
-        per_part_credits = int(
+        actual_required_credits = len(part_windows) * int(
             calculate_custom_clip_generation_cost(False, subscription_tier)
         )
-        actual_required_credits = len(part_windows) * per_part_credits
-        if actual_required_credits > 0 and not has_sufficient_credits(
-            user_id=billing_owner_user_id,
-            amount=actual_required_credits,
-            charge_source=charge_source,
-            team_id=workspace_team_id,
-        ):
-            available = (
-                get_team_wallet_balance(workspace_team_id)
-                if charge_source == "team_wallet" and workspace_team_id
-                else get_credit_balance(billing_owner_user_id)
-            )
-            raise RuntimeError(
-                "Insufficient credits for split-video generation before fan-out: "
-                f"required={actual_required_credits}, available={available}"
-            )
 
         part_records: list[dict[str, Any]] = []
         title_prompt_segments: list[dict[str, Any]] = []
@@ -926,6 +867,12 @@ def split_video_task(job_data: SplitVideoJob) -> None:
 
         generated_titles: list[str] = []
         try:
+            logger.info(
+                "[%s] Generating titles for %d split parts of video %s",
+                job_id,
+                len(title_prompt_segments),
+                video_id,
+            )
             generated_titles = analyzer.generate_segment_titles(
                 title_prompt_segments,
                 language_hint=(
@@ -933,6 +880,13 @@ def split_video_task(job_data: SplitVideoJob) -> None:
                     or source_detected_language
                 ),
                 video_title=str(source_info.get("title") or "").strip() or None,
+            )
+            logger.info(
+                "[%s] Title generation finished for video %s: returned=%d/%d",
+                job_id,
+                video_id,
+                len([title for title in generated_titles if str(title).strip()]),
+                len(title_prompt_segments),
             )
         except Exception as exc:
             logger.warning("[%s] AI title generation failed; using deterministic titles: %s", job_id, exc)
@@ -946,25 +900,16 @@ def split_video_task(job_data: SplitVideoJob) -> None:
             )
 
         clip_rows: list[dict[str, Any]] = []
-        clip_generation_payloads: list[tuple[str, GenerateClipJob]] = []
         for record in part_records:
             clip_id = str(uuid4())
-            clip_start = float(record["start"])
-            clip_end = float(record["end"])
-            clip_duration = max(1.0, clip_end - clip_start)
-            quality_policy = resolve_clip_quality_policy(
-                tier=subscription_tier,
-                clip_duration_seconds=clip_duration,
-                requested_output_quality=None,
-            )
             clip_row = {
                 "id": clip_id,
                 "video_id": video_id,
                 "user_id": user_id,
                 "team_id": workspace_team_id,
                 "billing_owner_user_id": billing_owner_user_id,
-                "start_time": clip_start,
-                "end_time": clip_end,
+                "start_time": float(record["start"]),
+                "end_time": float(record["end"]),
                 "title": record["title"],
                 "origin": "batch_split",
                 "transcript": record["transcript"],
@@ -975,56 +920,16 @@ def split_video_task(job_data: SplitVideoJob) -> None:
                 clip_row["layout_id"] = layout_id
             clip_rows.append(clip_row)
 
-            child_job_id = str(uuid4())
-            child_job_data: GenerateClipJob = {
-                "jobId": child_job_id,
-                "clipId": clip_id,
-                "userId": user_id,
-                "layoutId": layout_id,
-                "smartCleanupEnabled": False,
-                "generationCredits": per_part_credits,
-                "clipRetentionDays": clip_retention_days,
-                "workspaceTeamId": workspace_team_id,
-                "billingOwnerUserId": billing_owner_user_id,
-                "chargeSource": charge_source,
-                "workspaceRole": workspace_role,
-                "subscriptionTier": subscription_tier,
-                "sourceMaxHeight": quality_policy.get("source_max_height"),
-                "sourceProfile": DEFAULT_SOURCE_PROFILE,
-                "masterProfile": DEFAULT_MASTER_PROFILE,
-                "deliveryProfile": DEFAULT_DELIVERY_PROFILE,
-                "outputQualityOverride": None,
-                "qualityPolicyProfile": quality_policy.get("profile"),
-            }
-            clip_generation_payloads.append((clip_id, child_job_data))
-
         clip_insert_response = supabase.table("clips").insert(clip_rows).execute()
         assert_response_ok(clip_insert_response, f"Failed to insert split clips for video {video_id}")
 
         _update_split_job_progress(
             job_id,
             80,
-            "queueing_clip_generation",
-            detail_key="queueing_generated_parts",
-            detail_params={"count": len(clip_generation_payloads)},
+            "saving_clip_definitions",
+            detail_key="saving_split_clip_definitions",
+            detail_params={"count": len(clip_rows)},
         )
-
-        child_job_ids: list[str] = []
-        failed_child_job_ids: list[str] = []
-        queue_name = _clip_queue_name(priority_processing)
-        for clip_id, child_job_data in clip_generation_payloads:
-            child_job_id, queued = _enqueue_generate_child_job(
-                job_data=child_job_data,
-                queue_name=queue_name,
-                clip_id=clip_id,
-                video_id=video_id,
-                user_id=user_id,
-                team_id=workspace_team_id,
-                billing_owner_user_id=billing_owner_user_id,
-            )
-            child_job_ids.append(child_job_id)
-            if not queued:
-                failed_child_job_ids.append(child_job_id)
 
         result_data = {
             "stage": "completed",
@@ -1033,8 +938,7 @@ def split_video_task(job_data: SplitVideoJob) -> None:
             "expected_generation_credits": expected_generation_credits,
             "actual_generation_credits_upper_bound": actual_required_credits,
             "created_clip_ids": [str(row["id"]) for row in clip_rows],
-            "child_job_ids": child_job_ids,
-            "failed_child_job_ids": failed_child_job_ids,
+            "generation_mode": "deferred",
             "cleaned_source_storage_path": cleaned_storage_path,
             "trim_diagnostics": trim_diagnostics,
         }

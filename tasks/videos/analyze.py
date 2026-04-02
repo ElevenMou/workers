@@ -26,14 +26,16 @@ from utils.workdirs import create_work_dir
 from utils.supabase_client import (
     assert_response_ok,
     capture_credit_reservation,
-    charge_video_analysis_credits,
+    capture_team_credit_reservation,
     emit_video_analysis_usage_event,
     get_credit_balance,
     get_team_wallet_balance,
     has_sufficient_credits,
     has_team_wallet_charge_for_job,
     release_credit_reservation,
+    release_team_credit_reservation,
     reserve_credits,
+    reserve_team_credits,
     supabase,
     update_job_status,
     update_video_status,
@@ -311,20 +313,25 @@ def _release_pending_analysis_reservation(
     *,
     job_id: str,
     charge_source: str,
+    workspace_team_id: str | None,
     reservation_id: str | None,
     reservation_captured: bool,
     billing_state: dict[str, Any],
 ):
-    if charge_source != "owner_wallet" or not reservation_id or reservation_captured:
+    if not reservation_id or reservation_captured:
         return
 
     try:
-        release_credit_reservation(reservation_id=reservation_id)
+        if charge_source == "team_wallet":
+            release_team_credit_reservation(reservation_id=reservation_id)
+        else:
+            release_credit_reservation(reservation_id=reservation_id)
         billing_state["status"] = "released"
     except Exception as exc:
         logger.warning(
-            "[%s] Failed to release superseded analysis credit reservation %s: %s",
+            "[%s] Failed to release superseded %s analysis reservation %s: %s",
             job_id,
+            charge_source,
             reservation_id,
             exc,
         )
@@ -335,6 +342,7 @@ def _should_exit_for_newer_analyze_job(
     job_id: str,
     video_id: str,
     charge_source: str,
+    workspace_team_id: str | None,
     reservation_id: str | None,
     reservation_captured: bool,
     billing_state: dict[str, Any],
@@ -350,6 +358,7 @@ def _should_exit_for_newer_analyze_job(
     _release_pending_analysis_reservation(
         job_id=job_id,
         charge_source=charge_source,
+        workspace_team_id=workspace_team_id,
         reservation_id=reservation_id,
         reservation_captured=reservation_captured,
         billing_state=billing_state,
@@ -489,9 +498,11 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
     }
 
     billing_state: dict[str, Any] = {
-        "mode": "owner_wallet_reservation"
-        if charge_source == "owner_wallet"
-        else "team_wallet",
+        "mode": (
+            "owner_wallet_reservation"
+            if charge_source == "owner_wallet"
+            else "team_wallet_reservation"
+        ),
         "status": "pending",
     }
     reservation_key = f"video_analysis:{job_id}"
@@ -507,6 +518,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             job_id=job_id,
             video_id=video_id,
             charge_source=charge_source,
+            workspace_team_id=workspace_team_id,
             reservation_id=reservation_id,
             reservation_captured=reservation_captured,
             billing_state=billing_state,
@@ -534,32 +546,59 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
         downloader = VideoDownloader(work_dir=work_dir)
         analyzer = AIAnalyzer()
 
-        if charge_source == "owner_wallet" and expected_credits > 0:
-            reservation_id = reserve_credits(
-                user_id=billing_owner_user_id,
-                amount=expected_credits,
-                reason=f"Video analysis reservation ({job_id})",
-                reservation_key=reservation_key,
-                video_id=video_id,
-            )
-            if not reservation_id:
-                raise RuntimeError(
-                    "Insufficient credits for analysis before processing starts: "
-                    f"required={expected_credits}"
+        if expected_credits > 0:
+            if charge_source == "team_wallet" and workspace_team_id:
+                team_wallet_already_charged = has_team_wallet_charge_for_job(
+                    team_id=workspace_team_id,
+                    job_id=job_id,
+                    owner_user_id=billing_owner_user_id,
                 )
-            billing_state.update(
-                {
-                    "reservation_key": reservation_key,
-                    "reservation_id": reservation_id,
-                    "status": "reserved",
-                }
-            )
-            _update_analysis_job_progress(
-                job_id,
-                1,
-                "reserving_credits",
-                billing_state=billing_state,
-            )
+                if not team_wallet_already_charged:
+                    reservation_id = reserve_team_credits(
+                        owner_user_id=billing_owner_user_id,
+                        team_id=workspace_team_id,
+                        amount=expected_credits,
+                        reason=f"Video analysis reservation ({job_id})",
+                        actor_user_id=user_id,
+                        reservation_key=reservation_key,
+                        video_id=video_id,
+                        job_id=job_id,
+                    )
+                    if not reservation_id:
+                        raise RuntimeError(
+                            "Insufficient credits for analysis before processing starts: "
+                            f"required={expected_credits}"
+                        )
+                else:
+                    billing_state["status"] = "already_charged"
+            else:
+                reservation_id = reserve_credits(
+                    user_id=billing_owner_user_id,
+                    amount=expected_credits,
+                    reason=f"Video analysis reservation ({job_id})",
+                    reservation_key=reservation_key,
+                    video_id=video_id,
+                )
+                if not reservation_id:
+                    raise RuntimeError(
+                        "Insufficient credits for analysis before processing starts: "
+                        f"required={expected_credits}"
+                    )
+
+            if reservation_id:
+                billing_state.update(
+                    {
+                        "reservation_key": reservation_key,
+                        "reservation_id": reservation_id,
+                        "status": "reserved",
+                    }
+                )
+                _update_analysis_job_progress(
+                    job_id,
+                    1,
+                    "reserving_credits",
+                    billing_state=billing_state,
+                )
 
         # 1. Resolve source metadata (no full media download by default) -----
         _update_analysis_job_progress(
@@ -665,20 +704,38 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             credits_required,
         )
 
-        if charge_source == "owner_wallet" and not reservation_id and credits_required > 0:
-            reservation_id = reserve_credits(
-                user_id=billing_owner_user_id,
-                amount=credits_required,
-                reason=f"Video analysis reservation ({job_id})",
-                reservation_key=reservation_key,
-                video_id=video_id,
-            )
-            if not reservation_id:
-                available = get_credit_balance(billing_owner_user_id)
-                raise RuntimeError(
-                    "Insufficient credits for analysis before processing starts: "
-                    f"required={credits_required}, available={available}"
+        if not reservation_id and credits_required > 0 and not team_wallet_already_charged:
+            if charge_source == "team_wallet" and workspace_team_id:
+                reservation_id = reserve_team_credits(
+                    owner_user_id=billing_owner_user_id,
+                    team_id=workspace_team_id,
+                    amount=credits_required,
+                    reason=f"Video analysis reservation ({job_id})",
+                    actor_user_id=user_id,
+                    reservation_key=reservation_key,
+                    video_id=video_id,
+                    job_id=job_id,
                 )
+                if not reservation_id:
+                    available = get_team_wallet_balance(workspace_team_id)
+                    raise RuntimeError(
+                        "Insufficient credits for analysis before processing starts: "
+                        f"required={credits_required}, available={available}"
+                    )
+            else:
+                reservation_id = reserve_credits(
+                    user_id=billing_owner_user_id,
+                    amount=credits_required,
+                    reason=f"Video analysis reservation ({job_id})",
+                    reservation_key=reservation_key,
+                    video_id=video_id,
+                )
+                if not reservation_id:
+                    available = get_credit_balance(billing_owner_user_id)
+                    raise RuntimeError(
+                        "Insufficient credits for analysis before processing starts: "
+                        f"required={credits_required}, available={available}"
+                    )
             billing_state.update(
                 {
                     "reservation_key": reservation_key,
@@ -896,6 +953,7 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             job_id=job_id,
             video_id=video_id,
             charge_source=charge_source,
+            workspace_team_id=workspace_team_id,
             reservation_id=reservation_id,
             reservation_captured=reservation_captured,
             billing_state=billing_state,
@@ -1124,56 +1182,60 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
             else:
                 if not reservation_id:
                     raise RuntimeError("Missing credit reservation before capture")
-                capture_ok = capture_credit_reservation(
+                newly_applied = capture_credit_reservation(
                     reservation_id=reservation_id,
                     tx_type="video_analysis",
                     description=charge_description,
                     processing_ref=f"video_analysis:{job_id}",
+                    user_id=billing_owner_user_id,
                 )
-                if not capture_ok:
-                    raise RuntimeError("Failed to capture video-analysis credit reservation")
                 reservation_captured = True
-                billing_state["status"] = "captured"
-                emit_video_analysis_usage_event(
-                    user_id=user_id,
-                    amount=credits_required,
-                    video_id=video_id,
-                    charge_source=charge_source,
-                    team_id=workspace_team_id,
-                    billing_owner_user_id=billing_owner_user_id,
-                    actor_user_id=user_id,
-                    job_id=job_id,
-                    usage_metadata=usage_metadata,
-                )
+                billing_state["status"] = "captured" if newly_applied else "already_charged"
+                if newly_applied:
+                    emit_video_analysis_usage_event(
+                        user_id=user_id,
+                        amount=credits_required,
+                        video_id=video_id,
+                        charge_source=charge_source,
+                        team_id=workspace_team_id,
+                        billing_owner_user_id=billing_owner_user_id,
+                        actor_user_id=user_id,
+                        job_id=job_id,
+                        usage_metadata=usage_metadata,
+                    )
         else:
-            if charge_source == "team_wallet" and workspace_team_id and credits_required > 0:
-                team_wallet_already_charged = has_team_wallet_charge_for_job(
-                    team_id=workspace_team_id,
-                    job_id=job_id,
-                    owner_user_id=billing_owner_user_id,
-                )
-
-            if team_wallet_already_charged:
+            if credits_required <= 0:
+                billing_state["status"] = "not_required"
+            elif team_wallet_already_charged:
                 billing_state["status"] = "already_charged"
                 logger.info(
                     "[%s] Skipping duplicate team-wallet charge for already-charged job",
                     job_id,
                 )
             else:
-                charge_video_analysis_credits(
-                    user_id=user_id,
-                    amount=credits_required,
+                if not reservation_id:
+                    raise RuntimeError("Missing team credit reservation before capture")
+                newly_applied = capture_team_credit_reservation(
+                    reservation_id=reservation_id,
+                    owner_tx_type="video_analysis",
                     description=charge_description,
-                    video_id=video_id,
-                    charge_source=charge_source,
-                    team_id=workspace_team_id,
-                    billing_owner_user_id=billing_owner_user_id,
-                    actor_user_id=user_id,
-                    job_id=job_id,
                     processing_ref=f"video_analysis:{job_id}",
-                    usage_metadata=usage_metadata,
+                    team_id=workspace_team_id,
                 )
-                billing_state["status"] = "charged"
+                reservation_captured = True
+                billing_state["status"] = "captured" if newly_applied else "already_charged"
+                if newly_applied:
+                    emit_video_analysis_usage_event(
+                        user_id=user_id,
+                        amount=credits_required,
+                        video_id=video_id,
+                        charge_source=charge_source,
+                        team_id=workspace_team_id,
+                        billing_owner_user_id=billing_owner_user_id,
+                        actor_user_id=user_id,
+                        job_id=job_id,
+                        usage_metadata=usage_metadata,
+                    )
 
         finalize_video_resp = supabase.table("videos").update(
             {
@@ -1250,9 +1312,12 @@ def analyze_video_task(job_data: AnalyzeVideoJob):
                 logger.warning("[%s] Failed to update retrying status: %s", job_id, exc)
             raise
 
-        if charge_source == "owner_wallet" and reservation_id and not reservation_captured:
+        if reservation_id and not reservation_captured:
             try:
-                release_credit_reservation(reservation_id=reservation_id)
+                if charge_source == "team_wallet":
+                    release_team_credit_reservation(reservation_id=reservation_id)
+                else:
+                    release_credit_reservation(reservation_id=reservation_id)
                 billing_state["status"] = "released"
                 _update_analysis_job_progress(
                     job_id,
