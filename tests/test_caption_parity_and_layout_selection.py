@@ -141,6 +141,32 @@ def test_caption_override_fallbacks_for_legacy_and_words_mapping():
     assert abs(from_words_only["line_delay"] - 0.04) < 1e-6
 
 
+def test_rtl_caption_override_forces_grouped_style_and_arabic_font(monkeypatch):
+    monkeypatch.setenv("RTL_CAPTION_FONT_FAMILY", "RTL Test Font")
+
+    overrides = _overrides_from_layout(
+        {
+            "style": "highlight_box",
+            "wordHighlight": True,
+            "fontCase": "uppercase",
+            "fontFamily": "Montserrat",
+        },
+        canvas_w=1080,
+        canvas_h=1920,
+        preset_name="clean",
+        transcript={
+            "languageCode": "ar",
+            "segments": [{"start": 0.0, "end": 1.0, "text": "مرحبا بالعالم"}],
+        },
+    )
+
+    assert overrides["style"] == "grouped"
+    assert overrides["word_highlight"] is False
+    assert overrides["font_case"] == "as_typed"
+    assert overrides["uppercase"] is False
+    assert overrides["font_name"] == "RTL Test Font"
+
+
 def test_mode_selection_grouped_highlight_and_karaoke():
     transcript = _sample_transcript()
 
@@ -301,6 +327,57 @@ def test_highlight_styles_use_dedicated_style_switches():
     assert r"{\rHighlightBox" in highlight_box_rows[0][2]
     assert r"{\rDefault" in highlight_box_rows[0][2]
     assert r"\t(0," in highlight_box_rows[0][2]
+
+
+def test_build_caption_ass_for_rtl_transcript_avoids_word_level_markup(monkeypatch):
+    transcript = {
+        "languageCode": "ar",
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 2.4,
+                "text": "مرحبا بكم",
+                "words": [
+                    {"word": "مرحبا", "start": 0.0, "end": 1.0},
+                    {"word": "بكم", "start": 1.0, "end": 2.4},
+                ],
+            }
+        ],
+    }
+
+    monkeypatch.setenv("RTL_CAPTION_FONT_FAMILY", "RTL Test Font")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        ass_path = build_caption_ass(
+            job_id="job-rtl",
+            clip_id="clip-rtl",
+            transcript=transcript,
+            cap_cfg={
+                "show": True,
+                "presetName": "clean",
+                "style": "highlight_box",
+                "fontFamily": "Montserrat",
+            },
+            start_time=0.0,
+            end_time=2.4,
+            canvas_w=1080,
+            canvas_h=1920,
+            vid_y=420,
+            vid_h=1080,
+            video_aspect_ratio="9:16",
+            work_dir=tmp_dir,
+            logger=LOGGER,
+        )
+        assert ass_path is not None
+        with open(ass_path, "r", encoding="utf-8") as handle:
+            ass_text = handle.read()
+
+    style = _style_row(ass_text)
+    dialogue_rows = _dialogue_rows(ass_text)
+    assert style[1] == "RTL Test Font"
+    assert len(dialogue_rows) == 1
+    assert r"{\kf" not in dialogue_rows[0][2]
+    assert r"{\rHighlightBox" not in dialogue_rows[0][2]
 
 
 def test_top_position_anchor_uses_video_bounds_margin():

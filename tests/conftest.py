@@ -1,4 +1,6 @@
 import os
+import sys
+import types
 
 import pytest
 from fastapi.testclient import TestClient
@@ -22,6 +24,21 @@ os.environ.setdefault("MINIO_PUBLIC_ENDPOINT", "http://localhost:9000")
 os.environ.setdefault("MINIO_ACCESS_KEY", "minioadmin")
 os.environ.setdefault("MINIO_SECRET_KEY", "minioadmin")
 os.environ.setdefault("MINIO_SKIP_STARTUP_READINESS", "true")
+
+try:
+    import openai  # noqa: F401
+except ModuleNotFoundError:
+    openai_stub = types.ModuleType("openai")
+    openai_stub.NotFoundError = type("NotFoundError", (Exception,), {})
+    openai_stub.LengthFinishReasonError = type("LengthFinishReasonError", (Exception,), {})
+
+    class _OpenAI:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+    openai_stub.OpenAI = _OpenAI
+    sys.modules.setdefault("openai", openai_stub)
 
 from api_app.app import app  # noqa: E402
 

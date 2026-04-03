@@ -116,7 +116,16 @@ def test_split_video_task_creates_pending_clip_definitions_without_enqueuing_gen
         split_video_module,
         "AIAnalyzer",
         lambda: SimpleNamespace(
-            find_removable_ranges=lambda *_a, **_k: [],
+            find_removable_ranges=lambda *_a, **_k: [
+                {
+                    "kind": "intro",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "confidence": 0.99,
+                    "reason": "Trim intro beat",
+                    "source": "ai",
+                }
+            ],
             generate_segment_titles=lambda segments, **_kwargs: [
                 f"Generated title {index + 1}" for index, _segment in enumerate(segments)
             ],
@@ -189,6 +198,14 @@ def test_split_video_task_creates_pending_clip_definitions_without_enqueuing_gen
     assert len(inserted_rows) == 3
     assert all(row["origin"] == "batch_split" for row in inserted_rows)
     assert all(row["status"] == "pending" for row in inserted_rows)
+    assert all(isinstance(row["transcript_excerpt"], str) and row["transcript_excerpt"] for row in inserted_rows)
+    assert all(row.get("source_video_storage_path_override") in (None, "") for row in inserted_rows)
+    first_transcript_metadata = inserted_rows[0]["transcript"]["metadata"]
+    deferred_plan = first_transcript_metadata["batch_split_deferred_render"]
+    assert deferred_plan["strategy"] == "source_keep_intervals"
+    assert deferred_plan["keep_intervals"] == [[1.0, 61.0]]
+    assert deferred_plan["output_duration_seconds"] == 60.0
+    assert deferred_plan["transcript_offset_seconds"] == 0.0
 
     final_update = next(
         update
@@ -202,3 +219,118 @@ def test_split_video_task_creates_pending_clip_definitions_without_enqueuing_gen
 
     assert video_status_updates[0][0] == "downloading"
     assert video_status_updates[-1][0] == "completed"
+
+
+def test_split_video_task_falls_back_when_ai_analyzer_is_unavailable(
+    monkeypatch,
+    tmp_path,
+):
+    fake_supabase = _FakeSupabase()
+    job_status_updates: list[dict] = []
+
+    monkeypatch.setattr(split_video_module, "supabase", fake_supabase)
+    monkeypatch.setattr(split_video_module, "assert_response_ok", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        split_video_module,
+        "_load_video_context_row",
+        lambda _video_id: {
+            "id": "video-2",
+            "status": "pending",
+            "url": "https://www.youtube.com/watch?v=fallback123",
+            "title": "Fallback source",
+            "duration_seconds": 121,
+            "thumbnail_url": "https://image.test/fallback.jpg",
+            "platform": "youtube",
+            "external_id": "fallback123",
+            "raw_video_path": None,
+            "raw_video_storage_path": None,
+            "transcript": None,
+        },
+    )
+    monkeypatch.setattr(split_video_module, "_is_latest_split_job_for_video", lambda **_kwargs: True)
+    monkeypatch.setattr(split_video_module, "create_work_dir", lambda _name: str(tmp_path))
+    monkeypatch.setattr(
+        split_video_module,
+        "VideoDownloader",
+        lambda work_dir: SimpleNamespace(work_dir=work_dir),
+    )
+    monkeypatch.setattr(
+        split_video_module,
+        "AIAnalyzer",
+        lambda: (_ for _ in ()).throw(RuntimeError("missing openai config")),
+    )
+    monkeypatch.setattr(
+        split_video_module,
+        "resolve_source_video",
+        lambda **_kwargs: SimpleNamespace(
+            video_path=str(tmp_path / "fallback-source.mkv"),
+            storage_path="raw-videos/raw/video-2__source_best_2160.mkv",
+            download_metadata={
+                "duration": 121,
+                "title": "Fallback source",
+                "thumbnail": "https://image.test/fallback.jpg",
+                "platform": "youtube",
+                "external_id": "fallback123",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        split_video_module,
+        "resolve_source_transcript",
+        lambda **_kwargs: SimpleNamespace(
+            transcript={
+                "source": "youtube",
+                "segments": [
+                    {"start": 0.0, "end": 58.0, "text": "Opening section"},
+                    {"start": 58.0, "end": 118.0, "text": "Main section"},
+                    {"start": 118.0, "end": 121.0, "text": "Closing tag"},
+                ],
+            },
+            fallback_reason=None,
+        ),
+    )
+    monkeypatch.setattr(
+        split_video_module,
+        "update_job_status",
+        lambda job_id, status, progress, error_message=None, result_data=None, **_kwargs: job_status_updates.append(
+            {
+                "job_id": job_id,
+                "status": status,
+                "progress": progress,
+                "error_message": error_message,
+                "result_data": result_data,
+            }
+        ),
+    )
+    monkeypatch.setattr(split_video_module, "update_video_status", lambda *_a, **_k: None)
+
+    split_video_module.split_video_task(
+        {
+            "jobId": "job-2",
+            "videoId": "video-2",
+            "userId": "user-2",
+            "segmentLengthSeconds": 60,
+            "expectedPartCount": 3,
+            "expectedGenerationCredits": 9,
+            "subscriptionTier": "basic",
+            "sourceDetectedLanguage": "en",
+        }
+    )
+
+    assert len(fake_supabase.clip_inserts) == 1
+    inserted_rows = fake_supabase.clip_inserts[0]
+    assert [row["title"] for row in inserted_rows] == [
+        "Part 1 - Fallback source",
+        "Part 2 - Fallback source",
+        "Part 3 - Fallback source",
+    ]
+    assert [row["end_time"] for row in inserted_rows] == [58.0, 118.0, 121.0]
+    assert all(isinstance(row["transcript_excerpt"], str) and row["transcript_excerpt"] for row in inserted_rows)
+
+    final_update = next(
+        update
+        for update in reversed(job_status_updates)
+        if update["status"] == "completed"
+    )
+    assert final_update["result_data"]["actual_part_count"] == 3
+    assert final_update["result_data"]["trim_diagnostics"]["total_removed_seconds"] == 0.0

@@ -1066,10 +1066,9 @@ class _FakeOpenAIFallbackClient:
         model = str(kwargs.get("model") or "")
         self.calls.append(model)
         if model == self.failing_model:
-            raise ai_analyzer_module.NotFoundError(
-                "The model `invalid-model` does not exist.",
-                status_code=404,
-            )
+            error = RuntimeError("The model `invalid-model` does not exist.")
+            error.status_code = 404  # type: ignore[attr-defined]
+            raise error
         if model != self.fallback_model:
             raise RuntimeError(f"Unexpected model used: {model}")
         return SimpleNamespace(

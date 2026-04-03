@@ -14,6 +14,7 @@ from services.caption_renderer import (
     to_ass_color,
 )
 from services.captions.positioning import compute_video_anchored_margin_v
+from tasks.videos.transcript import transcript_is_rtl
 
 _STYLE_MODES = {"grouped", "karaoke", "highlight", "highlight_box"}
 
@@ -74,6 +75,16 @@ def _normalize_style_mode(style_value: Any, fallback: Any) -> str:
     if fallback_mode in _STYLE_MODES:
         return fallback_mode
     return "grouped"
+
+
+def resolve_rtl_safe_caption_style(
+    style_mode: str,
+    transcript: dict[str, Any] | None,
+) -> str:
+    normalized = _normalize_style_mode(style_mode, "grouped")
+    if transcript_is_rtl(transcript):
+        return "grouped"
+    return normalized
 
 
 def _normalize_font_weight_token(value: Any) -> str:
@@ -167,18 +178,30 @@ def _normalize_word_highlight(
     return bool(preset_defaults.get("word_highlight", False))
 
 
+def _default_rtl_caption_font_name() -> str:
+    configured = str(os.getenv("RTL_CAPTION_FONT_FAMILY", "")).strip()
+    if configured:
+        return configured
+    return "Segoe UI" if os.name == "nt" else "Noto Sans Arabic"
+
+
 def _overrides_from_layout(
     cap_cfg: dict[str, Any],
     *,
     canvas_w: int,
     canvas_h: int,
     preset_name: str = "clean",
+    transcript: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Translate layout caption fields into normalized preset override keys."""
     overrides: dict[str, Any] = {}
     preset_defaults = resolve_preset(preset_name)
+    rtl_transcript = transcript_is_rtl(transcript)
 
-    style_mode = _normalize_style_mode(cap_cfg.get("style"), preset_defaults.get("style"))
+    style_mode = resolve_rtl_safe_caption_style(
+        _normalize_style_mode(cap_cfg.get("style"), preset_defaults.get("style")),
+        transcript,
+    )
     overrides["style"] = style_mode
     overrides["word_highlight"] = _normalize_word_highlight(
         cap_cfg,
@@ -191,6 +214,10 @@ def _overrides_from_layout(
     )
     overrides["font_case"] = case_mode
     overrides["uppercase"] = case_mode == "uppercase"
+    if rtl_transcript:
+        overrides["font_case"] = "as_typed"
+        overrides["uppercase"] = False
+        overrides["word_highlight"] = False
 
     max_chars = _pick_numeric(cap_cfg, "maxCharsPerCaption", "maxCharsPerLine")
     if max_chars is None:
@@ -238,6 +265,8 @@ def _overrides_from_layout(
             font_weight=font_weight,
             bold_hint=bold_hint,
         )
+    if rtl_transcript:
+        overrides["font_name"] = _default_rtl_caption_font_name()
 
     font_color = cap_cfg.get("fontColor")
     if isinstance(font_color, str) and font_color.strip():
@@ -327,11 +356,22 @@ def build_caption_ass(
     preset_name = normalize_caption_style(str(requested_preset))
     logger.info("[%s] Building caption preset '%s' ...", job_id, preset_name)
 
+    requested_style = resolve_caption_style_mode(cap_cfg)
+    effective_style = resolve_rtl_safe_caption_style(requested_style, transcript)
+    if effective_style != requested_style:
+        logger.info(
+            "[%s] Forcing grouped captions for RTL transcript (requested=%s effective=%s)",
+            job_id,
+            requested_style,
+            effective_style,
+        )
+
     overrides = _overrides_from_layout(
         cap_cfg,
         canvas_w=canvas_w,
         canvas_h=canvas_h,
         preset_name=preset_name,
+        transcript=transcript,
     )
     resolved_preset = resolve_preset(preset_name, overrides=overrides)
     requested_position = str(

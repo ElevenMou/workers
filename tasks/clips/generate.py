@@ -2,6 +2,7 @@ import logging
 import os
 import shutil
 import traceback
+from typing import Any
 
 from config import normalize_clip_generation_credits
 from services.clip_generator import ClipGenerator, compute_video_position
@@ -13,7 +14,11 @@ from services.clips.render_profiles import (
     DEFAULT_SOURCE_PROFILE,
 )
 from services.video_downloader import VideoDownloader
-from tasks.clips.helpers.captions import build_caption_ass, resolve_caption_style_mode
+from tasks.clips.helpers.captions import (
+    build_caption_ass,
+    resolve_caption_style_mode,
+    resolve_rtl_safe_caption_style,
+)
 from tasks.clips.helpers.lifecycle import (
     asset_expires_at_iso,
     best_effort_cleanup_uploaded_artifacts,
@@ -22,16 +27,21 @@ from tasks.clips.helpers.lifecycle import (
     update_clip_job_progress,
     upload_clip_with_replace,
 )
-from tasks.clips.helpers.smart_cleanup import apply_balanced_smart_cleanup
+from tasks.clips.helpers.smart_cleanup import (
+    apply_balanced_smart_cleanup,
+    render_condensed_video_from_keep_intervals,
+)
 from tasks.clips.helpers.source_video import (
     build_raw_video_metadata_update,
     resolve_source_video,
 )
 from tasks.videos.transcript import (
     needs_whisper_retranscription,
+    shift_transcript_timestamps,
     transcript_has_word_timing,
     transcript_has_word_timing_in_window,
     transcribe_clip_window_with_whisper,
+    whisper_retranscription_skip_reason,
 )
 from tasks.clips.helpers.layout import (
     load_layout_overrides,
@@ -64,6 +74,84 @@ from utils.supabase_client import (
 logger = logging.getLogger(__name__)
 # Keep explicit media type in this module so durability tests can verify upload intent.
 _UPLOAD_CONTENT_TYPE = {"content-type": "video/mp4"}
+_BATCH_SPLIT_RENDER_PLAN_KEY = "batch_split_deferred_render"
+
+
+def _read_batch_split_render_plan(transcript: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(transcript, dict):
+        return None
+
+    metadata = transcript.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+
+    candidate = metadata.get(_BATCH_SPLIT_RENDER_PLAN_KEY)
+    if not isinstance(candidate, dict):
+        return None
+
+    keep_intervals = candidate.get("keep_intervals")
+    if not isinstance(keep_intervals, list):
+        return None
+
+    normalized_intervals: list[tuple[float, float]] = []
+    for item in keep_intervals:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        try:
+            start = float(item[0])
+            end = float(item[1])
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        normalized_intervals.append((start, end))
+
+    if not normalized_intervals:
+        return None
+
+    output_duration_seconds = candidate.get("output_duration_seconds")
+    try:
+        output_duration = float(output_duration_seconds)
+    except (TypeError, ValueError):
+        output_duration = sum(end - start for start, end in normalized_intervals)
+
+    transcript_offset_seconds = candidate.get(
+        "transcript_offset_seconds",
+        candidate.get("cleaned_window_start"),
+    )
+    try:
+        transcript_offset = float(transcript_offset_seconds)
+    except (TypeError, ValueError):
+        transcript_offset = 0.0
+
+    return {
+        "keep_intervals": normalized_intervals,
+        "output_duration_seconds": max(0.0, output_duration),
+        "transcript_offset_seconds": transcript_offset,
+    }
+
+
+def _copy_transcript_metadata(
+    transcript: dict[str, Any] | None,
+    *,
+    metadata_source: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(transcript, dict):
+        return transcript
+
+    if not isinstance(metadata_source, dict):
+        return transcript
+
+    source_metadata = metadata_source.get("metadata")
+    if not isinstance(source_metadata, dict) or not source_metadata:
+        return transcript
+
+    merged = dict(transcript)
+    existing_metadata = merged.get("metadata")
+    metadata = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+    metadata.update(source_metadata)
+    merged["metadata"] = metadata
+    return merged
 
 
 def _warn_low_source_resolution_for_high_output(
@@ -320,6 +408,7 @@ def generate_clip_task(job_data: GenerateClipJob):
     smart_cleanup_summary = {
         "enabled": smart_cleanup_enabled,
         "profile": "balanced",
+        "disabled_reason": None,
         "stopwords_removed": 0,
         "silence_seconds_removed": 0.0,
         "original_duration_seconds": 0.0,
@@ -427,6 +516,7 @@ def generate_clip_task(job_data: GenerateClipJob):
         clip = clip_resp.data
         if not clip:
             raise Exception(f"Clip {clip_id} not found")
+        transcript = clip.get("transcript") or clip["videos"].get("transcript")
 
         if not _is_latest_generate_job_for_clip(job_id=job_id, clip_id=clip_id):
             logger.info(
@@ -630,6 +720,42 @@ def generate_clip_task(job_data: GenerateClipJob):
             source_strategy=source_video_strategy,
         )
 
+        deferred_split_render_plan = (
+            None if source_video_storage_override else _read_batch_split_render_plan(transcript)
+        )
+        if deferred_split_render_plan:
+            update_clip_job_progress(
+                job_id=job_id,
+                progress=34,
+                stage="preparing_source_video",
+                detail_key="trimming_source_video",
+            )
+            deferred_output_path = os.path.join(work_dir, f"{clip_id}_prepared_split.mov")
+            logger.info(
+                "[%s] Rendering deferred split source for clip %s (%d source segments)",
+                job_id,
+                clip_id,
+                len(deferred_split_render_plan["keep_intervals"]),
+            )
+            rendered_duration = render_condensed_video_from_keep_intervals(
+                input_video_path=video_file,
+                keep_intervals=deferred_split_render_plan["keep_intervals"],
+                output_path=deferred_output_path,
+                work_dir=work_dir,
+            )
+            video_file = deferred_output_path
+            source_video_strategy = f"{source_video_strategy}+batch_split_deferred"
+            transcript_offset_seconds = float(
+                deferred_split_render_plan["transcript_offset_seconds"]
+            )
+            transcript = (
+                shift_transcript_timestamps(transcript, -transcript_offset_seconds)
+                if isinstance(transcript, dict) and abs(transcript_offset_seconds) > 1e-6
+                else transcript
+            )
+            start_time = 0.0
+            end_time = float(rendered_duration or deferred_split_render_plan["output_duration_seconds"])
+
         _, vid_h, _, vid_y = compute_video_position(
             src_w,
             src_h,
@@ -653,8 +779,16 @@ def generate_clip_task(job_data: GenerateClipJob):
         # -- Whisper re-transcription for word-level caption styles -----------
         # Prefer clip-level Whisper transcript (from a previous generation),
         # fall back to the video-level transcript (YouTube or Whisper).
-        transcript = clip.get("transcript") or clip["videos"].get("transcript")
-        caption_style = resolve_caption_style_mode(cap_cfg)
+        requested_caption_style = resolve_caption_style_mode(cap_cfg)
+        caption_style = resolve_rtl_safe_caption_style(requested_caption_style, transcript)
+        if caption_style != requested_caption_style:
+            logger.info(
+                "[%s] Forcing grouped captions for transcript language policy (requested=%s effective=%s)",
+                job_id,
+                requested_caption_style,
+                caption_style,
+            )
+        whisper_skip_reason = whisper_retranscription_skip_reason(transcript)
         should_retranscribe_for_captions = needs_whisper_retranscription(
             transcript, caption_style
         )
@@ -675,6 +809,25 @@ def generate_clip_task(job_data: GenerateClipJob):
                 end_time,
             )
 
+        if whisper_skip_reason and should_retranscribe_for_captions:
+            logger.info(
+                "[%s] Skipping Whisper caption re-transcription because %s",
+                job_id,
+                whisper_skip_reason,
+            )
+            should_retranscribe_for_captions = False
+        if whisper_skip_reason and should_retranscribe_for_smart_cleanup:
+            logger.info(
+                "[%s] Disabling Smart Cleanup because Whisper re-transcription is skipped (%s)",
+                job_id,
+                whisper_skip_reason,
+            )
+            should_retranscribe_for_smart_cleanup = False
+            smart_cleanup_enabled = False
+            smart_cleanup_summary["enabled"] = False
+            smart_cleanup_summary["profile"] = "disabled_due_to_language"
+            smart_cleanup_summary["disabled_reason"] = whisper_skip_reason
+
         if should_retranscribe_for_captions or should_retranscribe_for_smart_cleanup:
             retranscribe_reason = (
                 "Smart Cleanup needs word timing in selected window"
@@ -693,6 +846,7 @@ def generate_clip_task(job_data: GenerateClipJob):
                 detail_key="improving_caption_timing",
             )
             video_duration = clip["videos"].get("duration_seconds") or (end_time + 10)
+            transcript_metadata_source = transcript if isinstance(transcript, dict) else None
             transcript = transcribe_clip_window_with_whisper(
                 media_path=video_file,
                 work_dir=work_dir,
@@ -701,6 +855,17 @@ def generate_clip_task(job_data: GenerateClipJob):
                 end_time=end_time,
                 video_duration_seconds=float(video_duration),
             )
+            transcript = _copy_transcript_metadata(
+                transcript,
+                metadata_source=transcript_metadata_source,
+            )
+            deferred_metadata = (
+                transcript.get("metadata", {}).get(_BATCH_SPLIT_RENDER_PLAN_KEY)
+                if isinstance(transcript, dict)
+                else None
+            )
+            if isinstance(deferred_metadata, dict):
+                deferred_metadata["transcript_offset_seconds"] = 0.0
             # Store the Whisper transcript on the clip row for reuse
             try:
                 supabase.table("clips").update(

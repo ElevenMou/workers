@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import traceback
+from copy import deepcopy
 from typing import Any
 from uuid import uuid4
 
@@ -25,7 +26,6 @@ from tasks.clips.helpers.smart_cleanup import (
     build_keep_intervals,
     build_timeline_map,
     merge_intervals,
-    render_condensed_video_from_keep_intervals,
 )
 from tasks.clips.helpers.source_video import (
     build_raw_video_metadata_update,
@@ -34,7 +34,6 @@ from tasks.clips.helpers.source_video import (
 from tasks.models.jobs import SplitVideoJob
 from tasks.videos.source_transcript import resolve_source_transcript
 from tasks.videos.transcript import normalize_transcript_for_analysis_window
-from utils.media_storage import upload_raw_video
 from utils.sentry_context import configure_job_scope
 from utils.supabase_client import (
     assert_response_ok,
@@ -47,6 +46,8 @@ from utils.workdirs import create_work_dir
 logger = logging.getLogger(__name__)
 _MAX_PARTS = 20
 _MIN_INTERVAL_SECONDS = 0.01
+_SPLIT_BOUNDARY_SNAP_TOLERANCE_SECONDS = 5.0
+_TRANSCRIPT_EXCERPT_MAX_CHARS = 500
 _PART_TITLE_PREFIX_RE = re.compile(r"^\s*part\s+\d+\s*[-:]\s*", re.IGNORECASE)
 
 _INTRO_PATTERNS = (
@@ -68,6 +69,7 @@ _AD_PATTERNS = (
     re.compile(r"\b(try\s+it\s+free|free\s+trial|discount|coupon)\b", re.IGNORECASE),
     re.compile(r"\b(link\s+in\s+(bio|description)|check\s+the\s+description)\b", re.IGNORECASE),
 )
+_BATCH_SPLIT_RENDER_PLAN_KEY = "batch_split_deferred_render"
 
 
 def _as_float(value: Any, default: float | None = None) -> float | None:
@@ -269,8 +271,15 @@ def _combine_removal_ranges(
 ) -> tuple[list[tuple[float, float]], dict[str, Any]]:
     normalized_candidates: list[dict[str, Any]] = []
     for candidate in [*heuristic_ranges, *ai_ranges]:
-        start = max(0.0, float(candidate.get("start") or 0.0))
-        end = min(float(duration_seconds), float(candidate.get("end") or 0.0))
+        if not isinstance(candidate, dict):
+            continue
+        start_value = _as_float(candidate.get("start"))
+        end_value = _as_float(candidate.get("end"))
+        confidence_value = _as_float(candidate.get("confidence"), 0.0)
+        if start_value is None or end_value is None:
+            continue
+        start = max(0.0, float(start_value))
+        end = min(float(duration_seconds), float(end_value))
         if end - start < _MIN_INTERVAL_SECONDS:
             continue
         normalized_candidates.append(
@@ -278,7 +287,7 @@ def _combine_removal_ranges(
                 "kind": str(candidate.get("kind") or "").strip().lower() or "ad",
                 "start": start,
                 "end": end,
-                "confidence": max(0.0, min(1.0, float(candidate.get("confidence") or 0.0))),
+                "confidence": max(0.0, min(1.0, float(confidence_value or 0.0))),
                 "reason": candidate.get("reason"),
                 "source": str(candidate.get("source") or "heuristic").strip().lower() or "heuristic",
             }
@@ -290,6 +299,7 @@ def _combine_removal_ranges(
             "ai_ranges": ai_ranges,
             "accepted_ranges": [],
             "final_removal_intervals": [],
+            "total_removed_seconds": 0.0,
         }
 
     normalized_candidates.sort(key=lambda item: (float(item["start"]), float(item["end"])))
@@ -499,10 +509,128 @@ def _slice_transcript_for_window(
     return clipped
 
 
+def _map_output_window_to_source_keep_intervals(
+    *,
+    output_start: float,
+    output_end: float,
+    timeline_map: list[dict[str, float]],
+) -> list[tuple[float, float]]:
+    source_keep_intervals: list[tuple[float, float]] = []
+    requested_start = float(output_start)
+    requested_end = float(output_end)
+    if requested_end <= requested_start:
+        return source_keep_intervals
+
+    for segment in timeline_map:
+        segment_output_start = float(segment["output_start"])
+        segment_output_end = float(segment["output_end"])
+        overlap_start = max(requested_start, segment_output_start)
+        overlap_end = min(requested_end, segment_output_end)
+        if overlap_end - overlap_start < _MIN_INTERVAL_SECONDS:
+            continue
+
+        source_start = float(segment["source_start"]) + (overlap_start - segment_output_start)
+        source_end = float(segment["source_start"]) + (overlap_end - segment_output_start)
+        if source_end - source_start < _MIN_INTERVAL_SECONDS:
+            continue
+
+        source_keep_intervals.append((round(source_start, 6), round(source_end, 6)))
+
+    return source_keep_intervals
+
+
+def _attach_batch_split_render_plan(
+    *,
+    transcript: dict[str, Any] | None,
+    keep_intervals: list[tuple[float, float]],
+    output_start: float,
+    output_end: float,
+) -> dict[str, Any]:
+    base = deepcopy(transcript) if isinstance(transcript, dict) else {"segments": [], "text": ""}
+    existing_metadata = base.get("metadata")
+    metadata = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+    metadata[_BATCH_SPLIT_RENDER_PLAN_KEY] = {
+        "strategy": "source_keep_intervals",
+        "keep_intervals": [[float(start), float(end)] for start, end in keep_intervals],
+        "output_duration_seconds": round(max(0.0, float(output_end) - float(output_start)), 6),
+        "cleaned_window_start": round(float(output_start), 6),
+        "cleaned_window_end": round(float(output_end), 6),
+        "transcript_offset_seconds": round(float(output_start), 6),
+    }
+    base["metadata"] = metadata
+    return base
+
+
+def _collect_transcript_boundary_times(
+    *,
+    transcript: dict[str, Any] | None,
+    duration_seconds: float,
+) -> list[float]:
+    if not isinstance(transcript, dict):
+        return []
+
+    safe_duration = max(0.0, float(duration_seconds))
+    boundaries: set[float] = set()
+    for segment in transcript.get("segments", []) or []:
+        if not isinstance(segment, dict):
+            continue
+        start = _as_float(segment.get("start"))
+        end = _as_float(segment.get("end"))
+        text = _normalize_text(segment.get("text"))
+        if start is None or end is None or end <= start or not text:
+            continue
+
+        normalized_end = round(min(max(float(end), 0.0), safe_duration), 6)
+        if normalized_end <= _MIN_INTERVAL_SECONDS or normalized_end >= safe_duration:
+            continue
+        boundaries.add(normalized_end)
+
+    return sorted(boundaries)
+
+
+def _select_boundary_aware_window_end(
+    *,
+    cursor: float,
+    exact_end: float,
+    duration_seconds: float,
+    boundary_times: list[float],
+    snap_tolerance_seconds: float,
+) -> float:
+    safe_duration = max(0.0, float(duration_seconds))
+    safe_cursor = max(0.0, float(cursor))
+    target_end = min(safe_duration, max(safe_cursor, float(exact_end)))
+    tolerance = max(0.0, float(snap_tolerance_seconds))
+    remaining_after_target = max(0.0, safe_duration - target_end)
+    max_boundary_end = (
+        target_end
+        if remaining_after_target <= tolerance
+        else min(safe_duration, target_end + tolerance)
+    )
+    min_boundary_end = max(safe_cursor + _MIN_INTERVAL_SECONDS, target_end - tolerance)
+    candidates = [
+        boundary
+        for boundary in boundary_times
+        if min_boundary_end <= boundary <= max_boundary_end
+    ]
+    if not candidates:
+        return target_end
+
+    return min(
+        candidates,
+        key=lambda boundary: (
+            abs(boundary - target_end),
+            0 if boundary >= target_end else 1,
+            -boundary,
+        ),
+    )
+
+
 def _build_part_windows(
     *,
     duration_seconds: float,
     segment_length_seconds: int,
+    transcript: dict[str, Any] | None = None,
+    snap_tolerance_seconds: float = _SPLIT_BOUNDARY_SNAP_TOLERANCE_SECONDS,
     max_parts: int = _MAX_PARTS,
 ) -> list[dict[str, Any]]:
     windows: list[dict[str, Any]] = []
@@ -510,9 +638,24 @@ def _build_part_windows(
     index = 1
     safe_duration = max(0.0, float(duration_seconds))
     segment_length = max(1, int(segment_length_seconds))
+    boundary_times = _collect_transcript_boundary_times(
+        transcript=transcript,
+        duration_seconds=safe_duration,
+    )
 
     while cursor < safe_duration - _MIN_INTERVAL_SECONDS and index <= max_parts:
-        end = min(safe_duration, cursor + float(segment_length))
+        exact_end = min(safe_duration, cursor + float(segment_length))
+        end = exact_end
+        if exact_end < safe_duration - _MIN_INTERVAL_SECONDS and boundary_times:
+            end = _select_boundary_aware_window_end(
+                cursor=cursor,
+                exact_end=exact_end,
+                duration_seconds=safe_duration,
+                boundary_times=boundary_times,
+                snap_tolerance_seconds=snap_tolerance_seconds,
+            )
+        if safe_duration - end < _MIN_INTERVAL_SECONDS:
+            end = safe_duration
         if end - cursor < _MIN_INTERVAL_SECONDS:
             break
         windows.append(
@@ -535,6 +678,63 @@ def _title_prompt_text(transcript: dict[str, Any] | None, *, max_chars: int = 32
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 1].rstrip() + "..."
+
+
+def _transcript_excerpt(
+    transcript: dict[str, Any] | None,
+    *,
+    max_chars: int = _TRANSCRIPT_EXCERPT_MAX_CHARS,
+) -> str | None:
+    if not isinstance(transcript, dict):
+        return None
+    text = _normalize_text(transcript.get("text"))
+    if not text:
+        return None
+    return text[:max_chars]
+
+
+def _transcript_excerpt_for_window(
+    *,
+    transcript: dict[str, Any] | None,
+    start_time: float,
+    end_time: float,
+    max_chars: int = _TRANSCRIPT_EXCERPT_MAX_CHARS,
+) -> str | None:
+    if not isinstance(transcript, dict):
+        return None
+
+    window_start = float(start_time)
+    window_end = float(end_time)
+    if window_end <= window_start:
+        return None
+
+    tokens: list[str] = []
+    for segment in transcript.get("segments", []) or []:
+        if not isinstance(segment, dict):
+            continue
+        seg_start = _as_float(segment.get("start"))
+        seg_end = _as_float(segment.get("end"))
+        text = _normalize_text(segment.get("text"))
+        if seg_start is None or seg_end is None or seg_end <= seg_start or not text:
+            continue
+        if seg_end <= window_start or seg_start >= window_end:
+            continue
+        tokens.append(text)
+
+    combined = _normalize_text(" ".join(tokens))
+    if not combined:
+        return None
+    return combined[:max_chars]
+
+
+def _normalize_generated_titles(raw_titles: Any) -> list[str]:
+    if not isinstance(raw_titles, list):
+        return []
+
+    normalized: list[str] = []
+    for value in raw_titles:
+        normalized.append(value if isinstance(value, str) else "")
+    return normalized
 
 
 def _fallback_part_title(index: int, source_title: str | None) -> str:
@@ -580,6 +780,7 @@ def split_video_task(job_data: SplitVideoJob) -> None:
     work_dir: str | None = None
     downloader: VideoDownloader | None = None
     analyzer: AIAnalyzer | None = None
+    analyzer_init_attempted = False
     manage_video_status = False
 
     try:
@@ -599,11 +800,30 @@ def split_video_task(job_data: SplitVideoJob) -> None:
 
         work_dir = create_work_dir(f"split_{job_id}")
         downloader = VideoDownloader(work_dir=work_dir)
-        analyzer = AIAnalyzer()
 
         source_url = source_url or str(existing_video.get("url") or "").strip() or None
         if not source_url:
             raise RuntimeError("Split-video job is missing a usable source URL")
+
+        def _get_analyzer() -> AIAnalyzer | None:
+            nonlocal analyzer, analyzer_init_attempted
+            if analyzer is not None:
+                return analyzer
+            if analyzer_init_attempted:
+                return None
+
+            analyzer_init_attempted = True
+            try:
+                analyzer = AIAnalyzer()
+            except Exception as exc:
+                logger.warning(
+                    "[%s] AI analyzer unavailable for batch split; using fallback cleanup and titles: %s",
+                    job_id,
+                    exc,
+                )
+                return None
+
+            return analyzer
 
         if manage_video_status:
             update_video_status(video_id, "downloading")
@@ -731,18 +951,30 @@ def split_video_task(job_data: SplitVideoJob) -> None:
             duration_seconds=float(duration_seconds),
         )
         ai_ranges: list[dict[str, Any]] = []
-        try:
-            logger.info("[%s] Requesting AI cleanup ranges for video %s", job_id, video_id)
-            ai_ranges = analyzer.find_removable_ranges(
-                transcript,
-                video_title=source_info.get("title"),
-                video_platform=source_info.get("platform"),
-                video_duration=float(duration_seconds),
-            )
-            for candidate in ai_ranges:
-                candidate["source"] = "ai"
-        except Exception as exc:
-            logger.warning("[%s] AI cleanup detection failed; using heuristic cleanup only: %s", job_id, exc)
+        split_analyzer = _get_analyzer()
+        if split_analyzer is not None:
+            try:
+                logger.info("[%s] Requesting AI cleanup ranges for video %s", job_id, video_id)
+                raw_ai_ranges = split_analyzer.find_removable_ranges(
+                    transcript,
+                    video_title=source_info.get("title"),
+                    video_platform=source_info.get("platform"),
+                    video_duration=float(duration_seconds),
+                )
+                if isinstance(raw_ai_ranges, list):
+                    ai_ranges = [
+                        {**candidate, "source": "ai"}
+                        for candidate in raw_ai_ranges
+                        if isinstance(candidate, dict)
+                    ]
+                else:
+                    logger.warning(
+                        "[%s] AI cleanup detection returned unexpected payload %s; using heuristic cleanup only",
+                        job_id,
+                        type(raw_ai_ranges).__name__,
+                    )
+            except Exception as exc:
+                logger.warning("[%s] AI cleanup detection failed; using heuristic cleanup only: %s", job_id, exc)
 
         removal_intervals, trim_diagnostics = _combine_removal_ranges(
             heuristic_ranges=heuristic_ranges,
@@ -761,16 +993,15 @@ def split_video_task(job_data: SplitVideoJob) -> None:
             removed_seconds,
         )
 
-        cleaned_video_path = source_video_path
-        cleaned_storage_path = source_storage_path
         cleaned_transcript = dict(transcript)
         cleaned_duration_seconds = float(duration_seconds)
+        cleanup_timeline_map: list[dict[str, float]] = []
 
         if removal_intervals:
             _update_split_job_progress(
                 job_id,
                 45,
-                "rendering_clean_source",
+                "planning_cleanup",
                 detail_key="removing_intro_outro_ad",
                 detail_params={
                     "removed_seconds": round(removed_seconds, 2),
@@ -785,50 +1016,36 @@ def split_video_task(job_data: SplitVideoJob) -> None:
             if keep_intervals:
                 timeline_map = build_timeline_map(keep_intervals)
                 if timeline_map:
+                    cleanup_timeline_map = timeline_map
                     logger.info(
-                        "[%s] Rendering cleaned source for video %s: keep_segments=%d removed=%.2fs",
+                        "[%s] Prepared deferred cleanup plan for video %s: keep_segments=%d removed=%.2fs",
                         job_id,
                         video_id,
                         len(keep_intervals),
                         removed_seconds,
                     )
-                    cleaned_output_path = os.path.join(work_dir, f"{video_id}_split_cleaned.mov")
-                    render_condensed_video_from_keep_intervals(
-                        input_video_path=source_video_path,
-                        keep_intervals=keep_intervals,
-                        output_path=cleaned_output_path,
-                        work_dir=work_dir,
-                    )
-                    cleaned_video_path = cleaned_output_path
                     cleaned_duration_seconds = float(timeline_map[-1]["output_end"])
                     cleaned_transcript = _remap_transcript_to_clean_timeline(
                         transcript=transcript,
                         timeline_map=timeline_map,
-                    )
-                    cleaned_storage_path, _storage_etag = upload_raw_video(
-                        video_id=video_id,
-                        local_video_path=cleaned_video_path,
-                        source_profile="source_split_cleaned",
-                        logger=logger,
-                        job_id=job_id,
                     )
                     trim_diagnostics["keep_intervals"] = [
                         [round(start, 3), round(end, 3)] for start, end in keep_intervals
                     ]
                     trim_diagnostics["timeline_map"] = timeline_map
                     logger.info(
-                        "[%s] Cleaned source ready for video %s: duration=%.2fs storage=%s",
+                        "[%s] Deferred cleanup plan ready for video %s: duration=%.2fs",
                         job_id,
                         video_id,
                         cleaned_duration_seconds,
-                        cleaned_storage_path,
                     )
         else:
-            logger.info("[%s] Cleanup render skipped for video %s: no confident removal ranges", job_id, video_id)
+            logger.info("[%s] Cleanup render not required for video %s: no confident removal ranges", job_id, video_id)
 
         part_windows = _build_part_windows(
             duration_seconds=cleaned_duration_seconds,
             segment_length_seconds=segment_length_seconds,
+            transcript=cleaned_transcript,
             max_parts=_MAX_PARTS,
         )
         if not part_windows:
@@ -848,12 +1065,31 @@ def split_video_task(job_data: SplitVideoJob) -> None:
                 start_time=float(window["start"]),
                 end_time=float(window["end"]),
             )
+            if cleanup_timeline_map:
+                deferred_keep_intervals = _map_output_window_to_source_keep_intervals(
+                    output_start=float(window["start"]),
+                    output_end=float(window["end"]),
+                    timeline_map=cleanup_timeline_map,
+                )
+                if deferred_keep_intervals:
+                    part_transcript = _attach_batch_split_render_plan(
+                        transcript=part_transcript,
+                        keep_intervals=deferred_keep_intervals,
+                        output_start=float(window["start"]),
+                        output_end=float(window["end"]),
+                    )
             part_records.append(
                 {
                     "index": int(window["index"]),
                     "start": float(window["start"]),
                     "end": float(window["end"]),
                     "transcript": part_transcript,
+                    "transcript_excerpt": _transcript_excerpt(part_transcript)
+                    or _transcript_excerpt_for_window(
+                        transcript=cleaned_transcript,
+                        start_time=float(window["start"]),
+                        end_time=float(window["end"]),
+                    ),
                 }
             )
             title_prompt_segments.append(
@@ -866,30 +1102,34 @@ def split_video_task(job_data: SplitVideoJob) -> None:
             )
 
         generated_titles: list[str] = []
-        try:
-            logger.info(
-                "[%s] Generating titles for %d split parts of video %s",
-                job_id,
-                len(title_prompt_segments),
-                video_id,
-            )
-            generated_titles = analyzer.generate_segment_titles(
-                title_prompt_segments,
-                language_hint=(
-                    str(cleaned_transcript.get("languageCode") or cleaned_transcript.get("language") or "").strip()
-                    or source_detected_language
-                ),
-                video_title=str(source_info.get("title") or "").strip() or None,
-            )
-            logger.info(
-                "[%s] Title generation finished for video %s: returned=%d/%d",
-                job_id,
-                video_id,
-                len([title for title in generated_titles if str(title).strip()]),
-                len(title_prompt_segments),
-            )
-        except Exception as exc:
-            logger.warning("[%s] AI title generation failed; using deterministic titles: %s", job_id, exc)
+        split_analyzer = _get_analyzer()
+        if split_analyzer is not None:
+            try:
+                logger.info(
+                    "[%s] Generating titles for %d split parts of video %s",
+                    job_id,
+                    len(title_prompt_segments),
+                    video_id,
+                )
+                generated_titles = _normalize_generated_titles(
+                    split_analyzer.generate_segment_titles(
+                        title_prompt_segments,
+                        language_hint=(
+                            str(cleaned_transcript.get("languageCode") or cleaned_transcript.get("language") or "").strip()
+                            or source_detected_language
+                        ),
+                        video_title=str(source_info.get("title") or "").strip() or None,
+                    )
+                )
+                logger.info(
+                    "[%s] Title generation finished for video %s: returned=%d/%d",
+                    job_id,
+                    video_id,
+                    len([title for title in generated_titles if str(title).strip()]),
+                    len(title_prompt_segments),
+                )
+            except Exception as exc:
+                logger.warning("[%s] AI title generation failed; using deterministic titles: %s", job_id, exc)
 
         for index, record in enumerate(part_records):
             ai_title = generated_titles[index] if index < len(generated_titles) else None
@@ -913,8 +1153,8 @@ def split_video_task(job_data: SplitVideoJob) -> None:
                 "title": record["title"],
                 "origin": "batch_split",
                 "transcript": record["transcript"],
+                "transcript_excerpt": record["transcript_excerpt"],
                 "status": "pending",
-                "source_video_storage_path_override": cleaned_storage_path,
             }
             if layout_id:
                 clip_row["layout_id"] = layout_id
@@ -939,7 +1179,6 @@ def split_video_task(job_data: SplitVideoJob) -> None:
             "actual_generation_credits_upper_bound": actual_required_credits,
             "created_clip_ids": [str(row["id"]) for row in clip_rows],
             "generation_mode": "deferred",
-            "cleaned_source_storage_path": cleaned_storage_path,
             "trim_diagnostics": trim_diagnostics,
         }
 

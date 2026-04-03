@@ -20,7 +20,11 @@ from services.clips.render_profiles import (
     DEFAULT_SOURCE_PROFILE,
 )
 from services.video_downloader import VideoDownloader
-from tasks.clips.helpers.captions import build_caption_ass, resolve_caption_style_mode
+from tasks.clips.helpers.captions import (
+    build_caption_ass,
+    resolve_caption_style_mode,
+    resolve_rtl_safe_caption_style,
+)
 from tasks.clips.helpers.lifecycle import (
     asset_expires_at_iso,
     best_effort_cleanup_uploaded_artifacts,
@@ -50,6 +54,7 @@ from tasks.videos.transcript import (
     transcript_has_word_timing,
     transcript_has_word_timing_in_window,
     transcribe_clip_window_with_whisper,
+    whisper_retranscription_skip_reason,
 )
 from utils.sentry_context import configure_job_scope
 from utils.workdirs import create_work_dir
@@ -307,6 +312,7 @@ def custom_clip_task(job_data: CustomClipJob):
     smart_cleanup_summary = {
         "enabled": smart_cleanup_enabled,
         "profile": "balanced",
+        "disabled_reason": None,
         "stopwords_removed": 0,
         "silence_seconds_removed": 0.0,
         "original_duration_seconds": 0.0,
@@ -675,7 +681,16 @@ def custom_clip_task(job_data: CustomClipJob):
         if transcript_resolution.is_full_transcript:
             resolved_full_video_transcript = transcript_resolution.transcript
 
-        caption_style = resolve_caption_style_mode(cap_cfg)
+        requested_caption_style = resolve_caption_style_mode(cap_cfg)
+        caption_style = resolve_rtl_safe_caption_style(requested_caption_style, transcript)
+        if caption_style != requested_caption_style:
+            logger.info(
+                "[%s] Forcing grouped captions for transcript language policy (requested=%s effective=%s)",
+                job_id,
+                requested_caption_style,
+                caption_style,
+            )
+        whisper_skip_reason = whisper_retranscription_skip_reason(transcript)
         has_word_timing_for_window = transcript_has_word_timing_in_window(
             transcript,
             start_time=start_time,
@@ -696,6 +711,25 @@ def custom_clip_task(job_data: CustomClipJob):
                 start_time,
                 end_time,
             )
+
+        if whisper_skip_reason and should_retranscribe_for_captions:
+            logger.info(
+                "[%s] Skipping Whisper caption re-transcription because %s",
+                job_id,
+                whisper_skip_reason,
+            )
+            should_retranscribe_for_captions = False
+        if whisper_skip_reason and should_retranscribe_for_smart_cleanup:
+            logger.info(
+                "[%s] Disabling Smart Cleanup because Whisper re-transcription is skipped (%s)",
+                job_id,
+                whisper_skip_reason,
+            )
+            should_retranscribe_for_smart_cleanup = False
+            smart_cleanup_enabled = False
+            smart_cleanup_summary["enabled"] = False
+            smart_cleanup_summary["profile"] = "disabled_due_to_language"
+            smart_cleanup_summary["disabled_reason"] = whisper_skip_reason
 
         if should_retranscribe_for_captions or should_retranscribe_for_smart_cleanup:
             retranscribe_reason = (

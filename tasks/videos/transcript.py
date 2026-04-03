@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from copy import deepcopy
 from typing import Any
 
@@ -13,6 +14,8 @@ from services.transcriber import Transcriber
 from tasks.clips.helpers.media import probe_has_audio_stream
 
 _ANALYSIS_SEGMENT_WORD_CHUNK_SIZE = 8
+_RTL_LANGUAGE_PREFIXES = ("ar", "fa", "he", "iw", "ps", "sd", "ug", "ur", "yi")
+_RTL_SCRIPT_RE = re.compile(r"[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]")
 
 
 def _as_float(value: Any) -> float | None:
@@ -20,6 +23,101 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_language_code(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    return text.replace("_", "-")
+
+
+def transcript_language_code(transcript: dict[str, Any] | None) -> str | None:
+    if not isinstance(transcript, dict):
+        return None
+
+    metadata = transcript.get("metadata")
+    metadata_dict = metadata if isinstance(metadata, dict) else {}
+    for candidate in (
+        transcript.get("languageCode"),
+        transcript.get("language"),
+        transcript.get("language_code"),
+        metadata_dict.get("languageCode"),
+        metadata_dict.get("language"),
+        metadata_dict.get("language_code"),
+    ):
+        normalized = _normalize_language_code(candidate)
+        if normalized:
+            return normalized
+    return None
+
+
+def transcript_source_name(transcript: dict[str, Any] | None) -> str | None:
+    if not isinstance(transcript, dict):
+        return None
+
+    metadata = transcript.get("metadata")
+    metadata_dict = metadata if isinstance(metadata, dict) else {}
+    for candidate in (
+        transcript.get("source"),
+        transcript.get("transcript_source"),
+        metadata_dict.get("source"),
+        metadata_dict.get("transcript_source"),
+    ):
+        text = str(candidate or "").strip().lower()
+        if text:
+            return text
+    return None
+
+
+def _iter_transcript_text_tokens(transcript: dict[str, Any] | None) -> list[str]:
+    if not isinstance(transcript, dict):
+        return []
+
+    tokens: list[str] = []
+    for segment in transcript.get("segments") or []:
+        text = str(segment.get("text") or "").strip()
+        if text:
+            tokens.append(text)
+        words = segment.get("words")
+        if isinstance(words, list):
+            for word in words:
+                token = str(word.get("word", word.get("text", "")) or "").strip()
+                if token:
+                    tokens.append(token)
+        if len(tokens) >= 12:
+            break
+    return tokens
+
+
+def transcript_is_rtl(transcript: dict[str, Any] | None) -> bool:
+    language = transcript_language_code(transcript)
+    if language:
+        base = language.split("-", 1)[0]
+        if base in _RTL_LANGUAGE_PREFIXES:
+            return True
+
+    return any(_RTL_SCRIPT_RE.search(token) for token in _iter_transcript_text_tokens(transcript))
+
+
+def transcript_uses_non_english_source_captions(transcript: dict[str, Any] | None) -> bool:
+    source = transcript_source_name(transcript)
+    if not source or source == "whisper":
+        return False
+
+    language = transcript_language_code(transcript)
+    if not language:
+        return False
+
+    return language.split("-", 1)[0] != "en"
+
+
+def whisper_retranscription_skip_reason(transcript: dict[str, Any] | None) -> str | None:
+    if transcript_is_rtl(transcript):
+        return "rtl_transcript"
+    if transcript_uses_non_english_source_captions(transcript):
+        return "non_english_source_captions"
+    return None
 
 
 def shift_transcript_timestamps(

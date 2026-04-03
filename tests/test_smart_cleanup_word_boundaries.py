@@ -202,6 +202,28 @@ def test_word_level_caption_styles_retranscribe_when_transcript_is_missing():
     assert generate_task_module.needs_whisper_retranscription(None, "grouped") is False
 
 
+def test_whisper_retranscription_skip_reason_prefers_source_captions_for_non_english():
+    transcript = {
+        "source": "youtube",
+        "languageCode": "es",
+        "segments": [{"start": 0.0, "end": 2.0, "text": "hola mundo"}],
+    }
+
+    assert (
+        generate_task_module.whisper_retranscription_skip_reason(transcript)
+        == "non_english_source_captions"
+    )
+
+
+def test_whisper_retranscription_skip_reason_disables_rtl_retranscription():
+    transcript = {
+        "source": "whisper",
+        "segments": [{"start": 0.0, "end": 2.0, "text": "مرحبا بكم"}],
+    }
+
+    assert generate_task_module.whisper_retranscription_skip_reason(transcript) == "rtl_transcript"
+
+
 class _StopAfterCleanup(RuntimeError):
     pass
 
@@ -382,6 +404,156 @@ def test_generate_flow_reuses_existing_word_timing_for_smart_cleanup(monkeypatch
                 "clipId": "clip-1",
                 "userId": "user-1",
                 "smartCleanupEnabled": True,
+            }
+        )
+
+    assert transcript_calls["count"] == 0
+
+
+def test_generate_flow_skips_whisper_retranscription_for_non_english_source_captions(
+    monkeypatch,
+    tmp_path: Path,
+):
+    transcript_calls = {"count": 0}
+
+    clip_payload = {
+        "id": "clip-es",
+        "video_id": "video-es",
+        "layout_id": None,
+        "start_time": 10.0,
+        "end_time": 12.0,
+        "title": "Clip title",
+        "transcript": {
+            "source": "youtube",
+            "languageCode": "es",
+            "segments": [{"start": 10.0, "end": 12.0, "text": "hola mundo"}],
+        },
+        "videos": {
+            "raw_video_path": "C:/tmp/video.mp4",
+            "duration_seconds": 120,
+            "url": "https://example.com/video",
+            "transcript": None,
+        },
+    }
+
+    monkeypatch.setattr(
+        generate_task_module,
+        "supabase",
+        _FakeSupabase(clip_payload=clip_payload, video_payload={}),
+    )
+    monkeypatch.setattr(generate_task_module, "assert_response_ok", lambda *_a, **_k: None)
+    monkeypatch.setattr(generate_task_module, "_is_latest_generate_job_for_clip", lambda **_k: True)
+    monkeypatch.setattr(
+        generate_task_module,
+        "best_effort_cleanup_uploaded_artifacts",
+        lambda **_k: None,
+    )
+    monkeypatch.setattr(generate_task_module, "_best_effort_mark_failed", lambda **_k: None)
+    monkeypatch.setattr(generate_task_module, "update_job_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(lifecycle_helper, "update_job_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(generate_task_module, "has_sufficient_credits", lambda **_k: True)
+    monkeypatch.setattr(generate_task_module, "get_credit_balance", lambda *_a, **_k: 999)
+    monkeypatch.setattr(generate_task_module, "get_team_wallet_balance", lambda *_a, **_k: 999)
+    monkeypatch.setattr(source_video_helper, "probe_video_size", lambda *_a, **_k: (1080, 1920))
+    monkeypatch.setattr(
+        generate_task_module,
+        "compute_video_position",
+        lambda *_a, **_k: (1080, 1440, 0, 240),
+    )
+    monkeypatch.setattr(generate_task_module.os.path, "isfile", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        generate_task_module,
+        "resolve_effective_layout_id",
+        lambda **_k: SimpleNamespace(layout_id=None, should_persist_to_clip=False),
+    )
+    monkeypatch.setattr(
+        generate_task_module,
+        "load_layout_overrides",
+        lambda **_k: SimpleNamespace(
+            bg_style="blur",
+            bg_color="#000000",
+            blur_strength=20,
+            output_quality="medium",
+            layout_video={},
+            layout_title={},
+            layout_captions={},
+            layout_intro={},
+            layout_outro={},
+            layout_overlay={},
+            bg_image_storage_path=None,
+        ),
+    )
+    monkeypatch.setattr(
+        generate_task_module,
+        "merge_layout_configs",
+        lambda *_a, **_k: (
+            {"widthPct": 100, "positionY": "middle", "canvasAspectRatio": "9:16", "videoScaleMode": "fit"},
+            {
+                "show": False,
+                "fontSize": 42,
+                "fontColor": "#FFFFFF",
+                "fontFamily": "Montserrat",
+                "align": "center",
+                "strokeWidth": 0,
+                "strokeColor": "#000000",
+                "barEnabled": False,
+                "barColor": "#000000",
+                "paddingX": 16,
+                "positionY": "top",
+            },
+            {"show": True, "style": "highlight"},
+            {"enabled": False, "type": "image", "storagePath": "", "durationSeconds": 3.0},
+            {"enabled": False, "type": "image", "storagePath": "", "durationSeconds": 3.0},
+            {"enabled": False, "storagePath": "", "widthPx": 200, "x": 0, "y": 0},
+        ),
+    )
+    monkeypatch.setattr(
+        generate_task_module,
+        "maybe_download_layout_background_image",
+        lambda **_k: ("blur", None),
+    )
+    monkeypatch.setattr(
+        generate_task_module,
+        "create_work_dir",
+        lambda name: str((tmp_path / name).mkdir(parents=True, exist_ok=True) or (tmp_path / name)),
+    )
+    monkeypatch.setattr(
+        generate_task_module,
+        "ClipGenerator",
+        lambda **_k: SimpleNamespace(generate=lambda **_kwargs: {}),
+    )
+    monkeypatch.setattr(generate_task_module, "needs_whisper_retranscription", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        generate_task_module,
+        "resolve_source_video",
+        lambda **_kwargs: SimpleNamespace(
+            video_path="C:/tmp/video.mp4",
+            width=1080,
+            height=1920,
+            strategy="reused_existing",
+            wait_seconds=0.0,
+            download_seconds=0.0,
+        ),
+    )
+    monkeypatch.setattr(
+        generate_task_module,
+        "build_caption_ass",
+        lambda **_kwargs: (_ for _ in ()).throw(_StopAfterCleanup("stop after captions")),
+    )
+
+    def _fake_transcribe(**_kwargs):
+        transcript_calls["count"] += 1
+        return _transcript_from_words([("hola", 10.0, 10.9), ("mundo", 11.0, 12.0)])
+
+    monkeypatch.setattr(generate_task_module, "transcribe_clip_window_with_whisper", _fake_transcribe)
+
+    with pytest.raises(_StopAfterCleanup):
+        generate_task_module.generate_clip_task(
+            {
+                "jobId": "job-es",
+                "clipId": "clip-es",
+                "userId": "user-1",
+                "smartCleanupEnabled": False,
             }
         )
 
